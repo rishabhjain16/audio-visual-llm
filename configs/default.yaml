@@ -1,0 +1,116 @@
+# Default configuration for AVSR-LLM
+name: "default"
+description: "Default configuration for AVSR-LLM"
+
+# Model configuration
+model:
+  # Paths to pretrained models
+  av_encoder_path: "checkpoints/large_vox_iter5.pt"
+  llm_path: "/home/rishabh/Desktop/Experiments/AVSR-LLM/checkpoints/Llama-3.2-1B"  # Use smaller model
+  whisper_path: "openai/whisper-small"  # HuggingFace model ID for Whisper
+  
+  # Architecture
+  audio_encoder_type: "whisper"  # options: hubert, wav2vec2, whisper
+  video_encoder_type: "avhubert"  # options: avhubert, resnet, efficientnet
+  fusion_type: "concat"  # options: concat, cross_attention, multimodal_adapter
+  use_audio: true
+  use_video: true
+  
+  # Model dimensions
+  audio_dim: 80
+  video_dim: 512
+  fusion_dim: 1024
+  llm_dim: 2048  # 2048 for Llama-3.2-1B, 4096 for Llama-3.1-8B, 4096 for Llama-2-7B, 4096 for Mistral
+  
+  # Model parameters
+  dropout: 0.1
+  adapter_dim: 256
+  adapter_dropout: 0.1
+  num_adapter_layers: 2
+  
+  # AV-HuBERT parameters
+  avhubert_layer: -1  # Which transformer layer to extract features from (-1 for last)
+  finetune_avhubert_layers: []  # List of AV-HuBERT layers to finetune, e.g. [23, 24]
+  
+  # LoRA parameters
+  use_lora: true
+  lora_r: 8  # Reduced from 16
+  lora_alpha: 16  # Reduced from 32
+  lora_dropout: 0.05
+  lora_target_modules: ["q_proj", "v_proj"]
+  
+  # Training parameters
+  freeze_av_encoder: true
+  freeze_audio_encoder: true
+  freeze_llm: true
+  unfreeze_layer_norms: true
+  unfreeze_adapters: true
+  freeze_fusion: false
+  
+  # Generation parameters
+  max_length: 128  # Further reduced from 256
+  num_beams: 3  # Reduced from 5
+  prompt_template: "Transcribe the speech: "
+
+# Training configuration
+training:
+  checkpoint_dir: "checkpoints/trained"
+  log_dir: "logs"
+  num_epochs: 2
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 100
+  grad_accum_steps: 4
+  max_grad_norm: 1.0
+  num_workers: 2
+  seed: 42
+  log_interval: 10
+
+# Data configuration
+data:
+  path: "data/processed"
+  train_manifest: "train.tsv"
+  train_labels: "train.wrd"
+  val_manifest: "valid.tsv"
+  val_labels: "valid.wrd"
+  test_manifest: "test.tsv"
+  test_labels: "test.wrd"
+  max_video_length: 10  # Further reduced from 15
+  max_audio_length: 10  # Further reduced from 15
+  max_text_length: 128  # Reduced from 256
+  batch_size: 1
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: false  # Disabled for better memory usage
+  max_seq_len: 250
+
+audio:
+  sampling_rate: 16000
+  n_mels: 80
+  n_fft: 400
+  win_length: 400
+  hop_length: 160
+  fmax: 8000
+  mel_scale: "htk"
+  normalize: true
+  mean: 0.0
+  std: 1.0
+
+video:
+  resize: [224, 224]
+  crop_size: [224, 224]
+  fps: 25
+  normalize: true
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+  use_grayscale: false
+  face_detection_method: "dlib"  # options: dlib, mediapipe, mtcnn
+  use_mouth_roi: false
+  roi_scale: 1.5  # Scale factor for ROI extraction
+
+memory:
+  use_4bit: false  # Disable 4-bit quantization for better compatibility
+  use_8bit: false  # Don't use 8-bit quantization
+  device_map: null  # Don't use device map for better control
+  gradient_checkpointing: true  # Enable gradient checkpointing
+  torch_compile: false  # Disable torch.compile for now 
