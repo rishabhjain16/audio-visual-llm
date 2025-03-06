@@ -138,6 +138,12 @@ class AVHuBERTEncoder(nn.Module):
             return None
             
         device = video.device
+        dtype = video.dtype
+        
+        # Convert to float16 if needed
+        if self.use_fp16 and dtype != torch.float16:
+            video = video.to(torch.float16)
+            logging.debug(f"Converted video input from {dtype} to {video.dtype}")
         
         # Handle different input shapes
         if video.dim() == 5:  # [B, T, C, H, W]
@@ -158,30 +164,29 @@ class AVHuBERTEncoder(nn.Module):
         # Log the actual shapes for debugging
         logging.debug(f"Video shape: {video.shape}")
         
-        # Ensure we're working with consistent dimensions
-        if video.dim() == 5:  # [B, T, C, H, W]
-            # Reshape to [B*T, C, H, W] for consistent processing
-            video_reshaped = video.reshape(B*T, C, H, W)
-        else:
-            # If not 5D, reshape to match expected input
-            video_reshaped = video.reshape(B*T, C, H, W)
+        # Process the video tensor
+        flattened_video = video.reshape(B * T, C * H * W)
         
-        # Always ensure we have 96x96 frames using adaptive pooling
-        video_resized = F.adaptive_avg_pool2d(video_reshaped, (96, 96))
+        # Ensure the projection weights are the same dtype as the input
+        if self.video_projection[0].weight.dtype != flattened_video.dtype:
+            for module in self.video_projection.modules():
+                if isinstance(module, nn.Linear):
+                    module.weight.data = module.weight.data.to(flattened_video.dtype)
+                    if module.bias is not None:
+                        module.bias.data = module.bias.data.to(flattened_video.dtype)
         
-        # Reshape to [B, T, C*H*W] for projection
-        flattened_video = video_resized.reshape(B, T, -1)
+        video_embeddings = self.video_projection(flattened_video)  # [B*T, D]
+        video_embeddings = video_embeddings.reshape(B, T, -1)  # [B, T, D]
         
-        # The projection expects input shape [B, T, 9216] where 9216 = 96*96
-        video_embeddings = self.video_projection(flattened_video)  # [B, T, D]
-        
-        # Create or update padding mask
-        if padding_mask is None:
-            padding_mask = torch.zeros(B, T, dtype=torch.bool, device=device)
+        if padding_mask is not None:
+            # Apply self-attention using the transformer encoder
+            # The encoder expects padding_mask to be True for positions to mask
+            if padding_mask.dtype != torch.bool:
+                padding_mask = padding_mask.bool()
             
-        # Apply transformer
-        src_key_padding_mask = padding_mask if padding_mask is not None else None
-        video_output = self.encoder(video_embeddings, src_key_padding_mask=src_key_padding_mask)
+            video_output = self.encoder(video_embeddings, src_key_padding_mask=padding_mask)
+        else:
+            video_output = self.encoder(video_embeddings)
         
         return video_output
 

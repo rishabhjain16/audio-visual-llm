@@ -91,6 +91,10 @@ class AVSRLLM(nn.Module):
                             self.audio_encoder.embedding_dim, 
                             self.encoder_dim
                         )
+                        # Convert projection to float16 for memory efficiency
+                        self.audio_projection.weight.data = self.audio_projection.weight.data.to(torch.float16)
+                        if self.audio_projection.bias is not None:
+                            self.audio_projection.bias.data = self.audio_projection.bias.data.to(torch.float16)
                         logging.info(f"Created audio projection from {self.audio_encoder.embedding_dim} to {self.encoder_dim}")
                 else:
                     logging.error("No whisper_path provided in config. This is required for audio processing!")
@@ -156,6 +160,10 @@ class AVSRLLM(nn.Module):
                             self.video_encoder.embedding_dim,
                             self.encoder_dim
                         )
+                        # Convert projection to float16 for memory efficiency
+                        self.video_projection.weight.data = self.video_projection.weight.data.to(torch.float16)
+                        if self.video_projection.bias is not None:
+                            self.video_projection.bias.data = self.video_projection.bias.data.to(torch.float16)
                         logging.info(f"Created video projection from {self.video_encoder.embedding_dim} to {self.encoder_dim}")
                 else:
                     logging.error("No av_encoder_path provided in config. This is required!")
@@ -515,13 +523,54 @@ class AVSRLLM(nn.Module):
                 logging.warning("Encoder returned empty output, generating random features")
                 batch_size = 1
                 if labels is not None:
-                    batch_size = labels.size(0)
+                    # Handle labels that are lists
+                    if isinstance(labels, list):
+                        logging.debug(f"Converting labels from list to tensor")
+                        if self.llm_module and hasattr(self.llm_module, 'tokenizer'):
+                            try:
+                                # Try to tokenize the text
+                                tokenized = self.llm_module.tokenizer(labels, return_tensors='pt', padding=True)
+                                labels = tokenized['input_ids'].to(device)
+                                logging.debug(f"Tokenized labels to tensor: {labels.shape}")
+                            except Exception as e:
+                                logging.error(f"Error tokenizing labels: {e}")
+                                # Just use batch size 1 as fallback
+                                batch_size = 1
+                        else:
+                            # If no tokenizer is available, just use batch size 1
+                            batch_size = 1
+                    else:
+                        # If labels is already a tensor, use its batch size
+                        batch_size = labels.size(0)
+                
                 encoder_dim = self.encoder_dim
                 encoder_out = torch.randn(batch_size, 50, encoder_dim, device=device)
                 encoder_padding_mask = torch.zeros(batch_size, 50, dtype=torch.bool, device=device)
             
             # Pass encoded features to LLM
             if self.llm_module is not None:
+                # Check if the encoder output dimension matches the LLM's expected input dimension
+                llm_hidden_size = 0
+                if hasattr(self.llm_module, 'model') and hasattr(self.llm_module.model, 'config'):
+                    llm_hidden_size = getattr(self.llm_module.model.config, 'hidden_size', 0)
+                elif hasattr(self.llm_module, 'config'):
+                    llm_hidden_size = getattr(self.llm_module.config, 'hidden_size', 0)
+                
+                # Log the dimensions for debugging
+                logging.debug(f"Encoder output dimension: {encoder_out.size(-1)}, LLM hidden size: {llm_hidden_size}")
+                
+                # Resize encoder output if dimensions don't match
+                if llm_hidden_size > 0 and encoder_out.size(-1) != llm_hidden_size:
+                    logging.warning(f"Resizing encoder output from {encoder_out.size(-1)} to {llm_hidden_size}")
+                    # Create a projection on the fly if needed
+                    projection = nn.Linear(encoder_out.size(-1), llm_hidden_size, device=device)
+                    # Convert to float16 if needed
+                    projection.weight.data = projection.weight.data.to(encoder_out.dtype)
+                    if projection.bias is not None:
+                        projection.bias.data = projection.bias.data.to(encoder_out.dtype)
+                    # Apply projection
+                    encoder_out = projection(encoder_out)
+                
                 # Prepare inputs for the LLM module
                 llm_inputs = {
                     'inputs_embeds': encoder_out,  # Changed from encoder_out to inputs_embeds
@@ -530,7 +579,26 @@ class AVSRLLM(nn.Module):
                 
                 # Add labels if provided and return_loss is True
                 if labels is not None and return_loss:
-                    llm_inputs['labels'] = labels
+                    # Ensure labels is a tensor
+                    should_add_labels = True
+                    if isinstance(labels, list):
+                        if self.llm_module and hasattr(self.llm_module, 'tokenizer'):
+                            try:
+                                # Try to tokenize the text
+                                tokenized = self.llm_module.tokenizer(labels, return_tensors='pt', padding=True)
+                                labels = tokenized['input_ids'].to(device)
+                                logging.debug(f"Tokenized labels to tensor: {labels.shape}")
+                            except Exception as e:
+                                logging.error(f"Error tokenizing labels: {e}")
+                                # Skip labels if tokenization fails
+                                should_add_labels = False
+                        else:
+                            # Skip labels if no tokenizer is available
+                            logging.warning("Cannot convert text labels to tensors without tokenizer")
+                            should_add_labels = False
+                    
+                    if should_add_labels:
+                        llm_inputs['labels'] = labels
                 
                 # Add any additional kwargs
                 for k, v in kwargs.items():
