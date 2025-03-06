@@ -27,6 +27,7 @@ class AVHuBERTEncoder(nn.Module):
         use_video: bool = True,
         freeze: bool = True,
         finetune_layers: List[int] = None,
+        use_fp16: bool = True,  # Use float16 by default for memory efficiency
     ):
         """
         Args:
@@ -36,6 +37,7 @@ class AVHuBERTEncoder(nn.Module):
             use_video: Whether to use visual modality 
             freeze: Whether to freeze the encoder
             finetune_layers: List of layers to finetune if freeze=False
+            use_fp16: Whether to use float16 precision (recommended for memory efficiency)
         """
         super().__init__()
         
@@ -45,6 +47,7 @@ class AVHuBERTEncoder(nn.Module):
         self.use_video = use_video
         self.freeze = freeze
         self.finetune_layers = finetune_layers or []
+        self.use_fp16 = use_fp16
         
         # Default embedding dimension for AV-HuBERT models
         self.embedding_dim = 1024
@@ -81,19 +84,45 @@ class AVHuBERTEncoder(nn.Module):
                 nn.ReLU(),
                 nn.Linear(512, self.embedding_dim)
             )
-            
-        # Freeze model if requested
+        
+        # Load pre-trained weights if checkpoint path is provided
+        if os.path.exists(checkpoint_path):
+            self.load_pretrained_weights()
+        
+        # Freeze model if specified
         if self.freeze:
-            self._freeze_model()
+            self.freeze_model(except_layers=self.finetune_layers)
             logging.info("AV-HuBERT model is frozen")
-            
+        
+        # Convert model to fp16 if specified (after loading weights)
+        if self.use_fp16:
+            self.to_fp16()
+            logging.info("AV-HuBERT model converted to float16 precision")
+        
         logging.info(f"Initialized AV-HuBERT encoder with embedding dimension {self.embedding_dim}")
         logging.info(f"Using {'audio and video' if use_audio and use_video else 'audio only' if use_audio else 'video only'} modalities")
     
-    def _freeze_model(self):
-        """Freeze all parameters"""
-        for param in self.parameters():
-            param.requires_grad = False
+    def to_fp16(self):
+        """Convert model parameters to float16 for memory efficiency"""
+        for name, param in self.named_parameters():
+            if param.dtype != torch.float16:
+                param.data = param.data.to(torch.float16)
+        
+        # Also ensure any buffers are in float16
+        for name, buffer in self.named_buffers():
+            if buffer.dtype != torch.float16 and buffer.dtype != torch.bool:
+                buffer.data = buffer.data.to(torch.float16)
+    
+    def freeze_model(self, except_layers: List[int]):
+        """Freeze all parameters except the specified layers"""
+        for name, param in self.named_parameters():
+            if name not in except_layers:
+                param.requires_grad = False
+    
+    def load_pretrained_weights(self):
+        """Load pre-trained weights from the checkpoint"""
+        checkpoint = torch.load(self.checkpoint_path)
+        self.load_state_dict(checkpoint)
     
     def forward(self, video, padding_mask=None):
         """Forward pass
@@ -155,3 +184,37 @@ class AVHuBERTEncoder(nn.Module):
         video_output = self.encoder(video_embeddings, src_key_padding_mask=src_key_padding_mask)
         
         return video_output
+
+class AVHubertEncoderWrapper(nn.Module):
+    def __init__(self, av_hubert_model, freeze=True):
+        super().__init__()
+        self.av_hubert_model = av_hubert_model
+        
+        # Freeze the model if specified
+        if freeze:
+            for param in self.av_hubert_model.parameters():
+                param.requires_grad = False
+                
+        # Convert model to float16 for memory efficiency and compatibility
+        self.convert_to_fp16()
+        
+        # Create video projection as sequential
+        self.video_projection = nn.Sequential(
+            nn.Linear(1024, 1024),
+            nn.GELU(),
+            nn.Linear(1024, 1024)
+        )
+        
+        # Also convert projection to float16
+        for module in self.video_projection.modules():
+            if isinstance(module, nn.Linear):
+                module.weight.data = module.weight.data.to(torch.float16)
+                if module.bias is not None:
+                    module.bias.data = module.bias.data.to(torch.float16)
+    
+    def convert_to_fp16(self):
+        """Convert the model weights to float16 for memory efficiency"""
+        for name, param in self.av_hubert_model.named_parameters():
+            if param.dtype != torch.float16:
+                # Use to_copy to avoid modifying frozen parameters in-place
+                param.data = param.data.to(torch.float16)

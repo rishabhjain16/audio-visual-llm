@@ -254,8 +254,8 @@ class AVSRLLM(nn.Module):
         
         # Get device and dtype for consistent tensor properties
         device = next(self.parameters()).device
-        # Use float32 for consistency (avoid dtype mismatch errors)
-        dtype = torch.float32
+        # Use float16 for memory efficiency and speed
+        dtype = torch.float16
         
         # Initialize outputs
         audio_out = None

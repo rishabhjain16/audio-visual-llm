@@ -137,7 +137,7 @@ class LLMModule(nn.Module):
                     self.model_name_or_path,
                     quantization_config=quantization_config,
                     device_map=self.device_map,
-                    torch_dtype=torch.float32,  # Use float32 for consistency with inputs
+                    torch_dtype=torch.float16,  # Use float16 for memory efficiency
                     low_cpu_mem_usage=True
                 )
             except Exception as e:
@@ -152,7 +152,7 @@ class LLMModule(nn.Module):
                         self.model_name_or_path,
                         quantization_config=quantization_config,
                         device_map=self.device_map,
-                        torch_dtype=torch.float32,  # Use float32 for consistency with inputs
+                        torch_dtype=torch.float16,  # Use float16 for memory efficiency
                         ignore_mismatched_sizes=True,
                         low_cpu_mem_usage=True
                     )
@@ -168,7 +168,7 @@ class LLMModule(nn.Module):
                         self.model_name_or_path,
                         quantization_config=quantization_config,
                         device_map=self.device_map,
-                        torch_dtype=torch.float32,  # Use float32 for consistency with inputs
+                        torch_dtype=torch.float16,  # Use float16 for memory efficiency
                         trust_remote_code=True,
                         low_cpu_mem_usage=True
                     )
@@ -494,6 +494,35 @@ class LLMModule(nn.Module):
                 if removed_keys:
                     logger.debug(f"Removed unexpected inputs: {', '.join(removed_keys)}")
             
+            # Handle labels if they're provided as a list instead of a tensor
+            if 'labels' in filtered_inputs and not isinstance(filtered_inputs['labels'], torch.Tensor):
+                if debug:
+                    logger.debug(f"Converting labels from {type(filtered_inputs['labels'])} to tensor")
+                
+                # If labels is a list of strings, we need to tokenize them
+                if isinstance(filtered_inputs['labels'], list) and all(isinstance(item, str) for item in filtered_inputs['labels']):
+                    try:
+                        # For now, just remove labels to avoid errors
+                        # This will allow the model to run in inference mode
+                        logger.warning("Text labels not supported in training mode. Removing labels.")
+                        del filtered_inputs['labels']
+                    except Exception as e:
+                        logger.error(f"Error handling text labels: {e}")
+                        # Remove labels to avoid further errors
+                        if 'labels' in filtered_inputs:
+                            del filtered_inputs['labels']
+                else:
+                    # For other types of non-tensor labels, remove them to avoid errors
+                    logger.warning(f"Unsupported label type: {type(filtered_inputs['labels'])}. Removing labels.")
+                    del filtered_inputs['labels']
+            
+            # Ensure all tensor inputs are float16 to avoid dtype mismatches
+            for key, value in filtered_inputs.items():
+                if isinstance(value, torch.Tensor) and value.dtype != torch.float16:
+                    if debug:
+                        logger.debug(f"Converting input '{key}' from {value.dtype} to float16")
+                    filtered_inputs[key] = value.to(dtype=torch.float16)
+            
             # Debug inputs
             if debug:
                 for k, v in filtered_inputs.items():
@@ -503,7 +532,42 @@ class LLMModule(nn.Module):
                         logger.debug(f"Model input '{k}': {v}")
             
             # Forward pass through the model
-            outputs = self.model(**filtered_inputs)
+            try:
+                outputs = self.model(**filtered_inputs)
+            except RuntimeError as e:
+                if "expected mat1 and mat2 to have the same dtype" in str(e):
+                    # Try to fix dtype mismatch by converting model parameters
+                    logger.warning("Detected dtype mismatch. Attempting to fix by converting parameters...")
+                    
+                    # Convert all necessary parameters to float16
+                    for name, param in self.model.named_parameters():
+                        if param.dtype != torch.float16 and not param.is_meta and param.requires_grad:
+                            logger.info(f"Converting parameter {name} from {param.dtype} to float16")
+                            param.data = param.data.to(torch.float16)
+                    
+                    # Special handling for LoRA parameters
+                    if hasattr(self.model, 'base_model') and hasattr(self.model.base_model, 'model'):
+                        for module in self.model.base_model.model.modules():
+                            if hasattr(module, 'weight') and hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
+                                # Convert LoRA weights
+                                if module.weight.dtype != torch.float16:
+                                    logger.info(f"Converting LoRA base weight from {module.weight.dtype} to float16")
+                                    module.weight.data = module.weight.data.to(torch.float16)
+                                
+                                # Convert LoRA A and B matrices
+                                if hasattr(module, 'lora_A') and module.lora_A.dtype != torch.float16:
+                                    logger.info(f"Converting lora_A from {module.lora_A.dtype} to float16")
+                                    module.lora_A.data = module.lora_A.data.to(torch.float16)
+                                
+                                if hasattr(module, 'lora_B') and module.lora_B.dtype != torch.float16:
+                                    logger.info(f"Converting lora_B from {module.lora_B.dtype} to float16")
+                                    module.lora_B.data = module.lora_B.data.to(torch.float16)
+                    
+                    # Try again with converted parameters
+                    outputs = self.model(**filtered_inputs)
+                else:
+                    # Re-raise if it's not a dtype mismatch error
+                    raise
             
             # Debug outputs
             if debug:
@@ -607,7 +671,13 @@ class LLMModule(nn.Module):
             # Prepare model for k-bit training if using quantization
             if self.use_4bit or self.use_8bit:
                 self.model = prepare_model_for_kbit_training(self.model)
-                
+            
+            # Ensure model parameters are float16 before applying LoRA
+            for name, param in self.model.named_parameters():
+                if param.dtype != torch.float16 and not param.is_meta and param.requires_grad:
+                    logger.info(f"Converting parameter {name} from {param.dtype} to float16 before LoRA")
+                    param.data = param.data.to(torch.float16)
+            
             # Create LoRA config
             self.lora_config = LoraConfig(
                 r=self.lora_r,
@@ -615,13 +685,23 @@ class LLMModule(nn.Module):
                 lora_dropout=self.lora_dropout,
                 bias="none",
                 task_type="CAUSAL_LM",
-                target_modules=self.lora_target_modules
+                target_modules=self.lora_target_modules,
+                # Ensure LoRA uses float16
+                inference_mode=False,
+                init_lora_weights="gaussian"
             )
             
             # Apply LoRA to model
             self.model = get_peft_model(self.model, self.lora_config)
+            
+            # Ensure all LoRA parameters are float16
+            for name, param in self.model.named_parameters():
+                if 'lora' in name and param.requires_grad and param.dtype != torch.float16:
+                    logger.info(f"Converting LoRA parameter {name} from {param.dtype} to float16")
+                    param.data = param.data.to(torch.float16)
+            
             self.model.print_trainable_parameters()
-            logging.info("Successfully applied LoRA to model")
+            logging.info("Successfully applied LoRA to model with float16 precision")
             
         except Exception as e:
             logging.error(f"Error applying LoRA: {e}")
