@@ -1,0 +1,30 @@
+{
+  "components": {
+    "whisper": {
+      "allocated": 2914.27734375,
+      "reserved": 2924.0
+    },
+    "llm_standard": {
+      "allocated": 4727.25830078125,
+      "reserved": 4720.0
+    },
+    "projections": {
+      "allocated": 8.0078125,
+      "reserved": 20.0
+    },
+    "llm_4bit": {
+      "allocated": 993.97412109375,
+      "reserved": 1026.0
+    }
+  },
+  "total": {
+    "used": 7649.54345703125,
+    "available": 24117.9375
+  },
+  "modality": "audio",
+  "baseline": {
+    "allocated": 0.0,
+    "reserved": 0.0,
+    "total": 24117.9375
+  }
+}

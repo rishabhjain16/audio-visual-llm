@@ -1,0 +1,33 @@
+{
+  "components": {
+    "whisper": {
+      "allocated": 2914.27734375,
+      "reserved": 2924.0
+    },
+    "clip": {
+      "allocated": 577.8291015625,
+      "reserved": 608.0
+    },
+    "llm_standard": {
+      "allocated": 4727.50830078125,
+      "reserved": 4740.0
+    },
+    "projections": {
+      "allocated": 14.015625,
+      "reserved": 0.0
+    },
+    "llm_4bit": {
+      "allocated": 993.97412109375,
+      "reserved": 1006.0
+    }
+  },
+  "total": {
+    "used": 8233.63037109375,
+    "available": 24117.9375
+  },
+  "baseline": {
+    "allocated": 0.0,
+    "reserved": 0.0,
+    "total": 24117.9375
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "components": {
+    "clip": {
+      "allocated": 577.0791015625,
+      "reserved": 630.0
+    },
+    "llm_standard": {
+      "allocated": 4727.50830078125,
+      "reserved": 4714.0
+    },
+    "projections": {
+      "allocated": 6.0078125,
+      "reserved": 20.0
+    },
+    "llm_4bit": {
+      "allocated": 994.97412109375,
+      "reserved": 1026.0
+    }
+  },
+  "total": {
+    "used": 5310.59521484375,
+    "available": 24117.9375
+  },
+  "modality": "video",
+  "baseline": {
+    "allocated": 0.0,
+    "reserved": 0.0,
+    "total": 24117.9375
+  }
+}

@@ -10,7 +10,7 @@ data:
   batch_size: 2
   max_audio_length: 480000  # 30 seconds at 16kHz
   max_video_length: 100     # Maximum number of video frames
-  max_seq_len: 256          # Maximum sequence length for encoder output
+  max_seq_len: 1536          # Maximum sequence length for encoder output (increased from 256 to handle full 1500 audio frames)
   num_workers: 2            # Number of workers for dataloading
   
 # Model configuration
@@ -19,7 +19,8 @@ model:
   whisper_model: "openai/whisper-medium"     # Whisper model for audio encoding
   clip_model: "openai/clip-vit-base-patch32" # CLIP model for video encoding
   modality: "both"                          # Which modalities to use: "audio", "video", or "both"
-  use_fp16: false                           # Whether to use mixed precision (not recommended initially)
+  use_fp16: false                           # Whether to use mixed precision (FP16)
+  use_4bit: false                           # Whether to use 4-bit quantization for the LLM
   use_lora: true                            # Whether to use LoRA for efficient fine-tuning
   lora_r: 16                                # LoRA rank
   lora_alpha: 32                            # LoRA alpha
@@ -35,7 +36,7 @@ training:
   weight_decay: 0.01                        # Weight decay
   grad_accum_steps: 4                       # Gradient accumulation steps
   max_grad_norm: 0.5                        # Maximum gradient norm for clipping
-  warmup_ratio: 0.1                         # Portion of training steps for warmup
+  warmup_steps: 100                         # Number of warmup steps
   log_interval: 10                          # Log every N batches
   save_every: 1                             # Save checkpoint every N epochs
   save_steps: null                          # Save checkpoint every N steps (overrides save_every)

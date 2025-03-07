@@ -11,9 +11,26 @@ from .models import AVHuBERTEncoder, AVHuBERTWhisperModel, WhisperEncoder
 # Import trainer
 from .trainer import AVHuBERTWhisperTrainer
 
+# Import utils
+from .utils import (
+    set_seed,
+    setup_logging,
+    load_config,
+    AVHuBERTWhisperConfig
+)
+
 __all__ = [
+    # Models
     'AVHuBERTEncoder',
     'AVHuBERTWhisperModel',
     'WhisperEncoder',
-    'AVHuBERTWhisperTrainer'
+    
+    # Trainer
+    'AVHuBERTWhisperTrainer',
+    
+    # Utils
+    'set_seed',
+    'setup_logging',
+    'load_config',
+    'AVHuBERTWhisperConfig'
 ] 

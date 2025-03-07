@@ -11,9 +11,13 @@ from transformers import (
     CLIPVisionModel,
     CLIPProcessor,
     AutoTokenizer,
-    AutoModelForCausalLM
+    AutoModelForCausalLM,
+    LlamaForCausalLM,
+    BitsAndBytesConfig
 )
 import datetime
+import gc
+from peft import LoraConfig, get_peft_model
 from .modality_connector import ModalityConnector
 
 class ClipWhisperModel(nn.Module):
@@ -27,6 +31,57 @@ class ClipWhisperModel(nn.Module):
     - both: Uses both encoders and fuses the features
     """
     
+    def _get_gpu_memory_usage(self):
+        """Get current GPU memory usage in MB"""
+        if not torch.cuda.is_available():
+            return {"allocated": 0, "reserved": 0}
+            
+        return {
+            "allocated": torch.cuda.memory_allocated() / (1024 * 1024),
+            "reserved": torch.cuda.memory_reserved() / (1024 * 1024)
+        }
+    
+    def _log_memory_usage(self, stage):
+        """Log memory usage at a specific stage"""
+        if not torch.cuda.is_available():
+            return
+            
+        memory = self._get_gpu_memory_usage()
+        logging.info(f"GPU Memory [{stage}] - Allocated: {memory['allocated']:.2f} MB, Reserved: {memory['reserved']:.2f} MB")
+    
+    def _track_component_memory(self, component_name, callback):
+        """Track memory usage of a specific component"""
+        if not torch.cuda.is_available():
+            initial = {"allocated": 0, "reserved": 0}
+            result = callback()
+            final = {"allocated": 0, "reserved": 0}
+            diff = {"allocated": 0, "reserved": 0}
+        else:
+            # Clear cache and collect garbage to get more accurate measurements
+            torch.cuda.empty_cache()
+            gc.collect()
+            
+            # Measure initial memory
+            initial = self._get_gpu_memory_usage()
+            
+            # Execute the callback (load model component)
+            result = callback()
+            
+            # Measure final memory
+            final = self._get_gpu_memory_usage()
+            
+            # Calculate difference
+            diff = {
+                "allocated": final["allocated"] - initial["allocated"],
+                "reserved": final["reserved"] - initial["reserved"]
+            }
+        
+        # Log memory usage
+        logging.info(f"GPU Memory for {component_name}: +{diff['allocated']:.2f} MB allocated, " 
+                    f"+{diff['reserved']:.2f} MB reserved")
+        
+        return result
+    
     def __init__(
         self,
         llm_path: str = "meta-llama/Llama-2-7b-chat-hf",
@@ -34,8 +89,8 @@ class ClipWhisperModel(nn.Module):
         clip_model: str = "openai/clip-vit-base-patch32",
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         use_fp16: bool = False,
-        use_lora: bool = True,
         use_4bit: bool = False,
+        use_lora: bool = True,
         lora_r: int = 16,
         lora_alpha: int = 32,
         lora_dropout: float = 0.05,
@@ -45,113 +100,96 @@ class ClipWhisperModel(nn.Module):
         max_seq_len: int = 256,
         fusion_scale: float = 0.5,
     ):
-        """Initialize the AVSR model"""
+        """
+        Initialize the ClipWhisper model
+        
+        Args:
+            llm_path: Path to the LLM model (Llama)
+            whisper_model: Name or path of Whisper model
+            clip_model: Name or path of CLIP model
+            device: Device to use for inference
+            use_fp16: Whether to use mixed precision (FP16)
+            use_4bit: Whether to use 4-bit quantization for the LLM
+            use_lora: Whether to use LoRA for efficient fine-tuning
+            lora_r: LoRA rank
+            lora_alpha: LoRA alpha
+            lora_dropout: LoRA dropout rate
+            freeze_encoders: Whether to freeze encoders
+            freeze_llm: Whether to freeze the LLM
+            modality: Which modalities to use: "audio", "video", or "both"
+            max_seq_len: Maximum sequence length for encoder output
+            fusion_scale: Weight for audio in fusion (0.5 = equal weight)
+        """
         super().__init__()
         
-        # Set modality with clear logging
-        self.modality = modality
-        modality_banner = "=" * 80
-        logging.info(f"\n{modality_banner}")
-        if modality == "audio":
-            logging.info(f"USING AUDIO-ONLY MODALITY")
-            logging.info(f"Only audio encoder and audio connector will be used")
-        elif modality == "video":
-            logging.info(f"USING VIDEO-ONLY MODALITY")
-            logging.info(f"Only video encoder and video connector will be used")
-        elif modality == "both":
-            logging.info(f"USING COMBINED AUDIO+VIDEO MODALITY")
-            logging.info(f"Both encoders will be used with fusion_scale={fusion_scale}")
-        else:
-            logging.warning(f"Unknown modality: {modality}, defaulting to 'both'")
-            self.modality = "both"
-        logging.info(f"{modality_banner}\n")
-        
-        # Store configuration options
+        # Save parameters
         self.device = device
-        self.dtype = torch.float16 if use_fp16 else torch.float32
+        self.use_fp16 = use_fp16
+        self.use_4bit = use_4bit
         self.freeze_encoders = freeze_encoders
         self.freeze_llm = freeze_llm
+        self.modality = modality
         self.max_seq_len = max_seq_len
         self.fusion_scale = fusion_scale
         
-        # Store initialization parameters
-        self.use_fp16 = use_fp16
+        # Set modality with clear logging
+        modality_banner = "=" * 80
+        logging.info(f"\n{modality_banner}")
+        logging.info(f"INITIALIZING CLIP-WHISPER MODEL WITH MODALITY: {self.modality.upper()}")
+        logging.info(f"{modality_banner}")
+        
+        # Store configuration options
+        self.dtype = torch.float16 if use_fp16 else torch.float32
         self.use_lora = use_lora
-        self.use_4bit = use_4bit
         self.lora_r = lora_r
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
         
-        # Set dtype based on use_fp16
-        logging.info(f"Using dtype: {self.dtype}")
+        # Initialize memory tracking
+        self.memory_stats = {
+            'components': {},
+            'total_initial': self._get_gpu_memory_usage(),
+        }
         
-        # Load Whisper for audio encoding
-        self.whisper, self.whisper_processor = self._load_whisper_model(whisper_model)
-        self.audio_dim = 1024  # Fixed for now based on whisper-medium
-        logging.info(f"Loaded Whisper model: {whisper_model}")
-        logging.info(f"Audio encoder output dimension: {self.audio_dim}")
+        # Log initial GPU memory
+        self._log_memory_usage("Initial")
         
-        # Load CLIP for video encoding
-        self.clip, self.clip_processor = self._load_clip_model(clip_model)
-        self.video_dim = 768  # Default for CLIP ViT-B/32
-        logging.info(f"Loaded CLIP model: {clip_model}")
-        logging.info(f"Video encoder output dimension: {self.video_dim}")
+        # Initialize all sub-models
+        self.llm, self.tokenizer = self._track_component_memory("LLM",
+                    lambda: self._load_llm(llm_path, use_lora, lora_r, lora_alpha, lora_dropout, freeze_llm, use_4bit))
+        self.whisper, self.whisper_processor = self._track_component_memory("Whisper",
+                            lambda: self._load_whisper_model(whisper_model, freeze_encoders))
+        self.clip, self.clip_processor = self._track_component_memory("CLIP",
+                         lambda: self._load_clip_model(clip_model, freeze_encoders))
         
-        # Freeze encoders if specified
-        if freeze_encoders:
-            logging.info("Freezing Whisper and CLIP encoders")
-            self._freeze_model(self.whisper)
-            self._freeze_model(self.clip)
+        # Get dimensions of encoders and LLM
+        self.audio_dim = self.whisper.config.d_model  # Whisper dimension
+        self.video_dim = self.clip.config.hidden_size  # CLIP dimension
+        self.llm_dim = self._get_llm_dim()
         
-        # Load and potentially freeze LLM
-        self.llm, self.tokenizer = self._load_llm(llm_path)
-        # Get LLM embedding dimension
-        self.llm_dim = self.llm.get_input_embeddings().weight.shape[1]
-        logging.info(f"LLM dimension detected: {self.llm_dim}")
-
-        # Create connectors for each modality (directly to LLM dimension)
-        # Using consistent dtype (float32) for stability
-        connector_dtype = torch.float32
+        # Create projections for encoder outputs
+        self._setup_projections()
         
-        # Print detailed dimension table for all components
-        dim_banner = "-" * 80
-        logging.info(f"\n{dim_banner}")
-        logging.info(f"{'COMPONENT':<30} {'INPUT DIM':<15} {'OUTPUT DIM':<15} {'DTYPE':<10} {'ACTIVE IN MODALITY':<20}")
-        logging.info(f"{dim_banner}")
+        # Log the model architecture
+        self._log_model_architecture()
         
-        # Audio components
-        self.audio_connector = ModalityConnector(
-            input_dim=self.audio_dim,
-            output_dim=self.llm_dim,
-            device=self.device,
-            dtype=connector_dtype
-        )
-        logging.info(f"{'Audio Encoder (Whisper)':<30} {'-':<15} {self.audio_dim:<15} {next(self.whisper.parameters()).dtype} {'audio, both':<20}")
-        logging.info(f"{'Audio Connector':<30} {self.audio_dim:<15} {self.llm_dim:<15} {connector_dtype} {'audio, both':<20}")
-        
-        # Video components
-        self.video_connector = ModalityConnector(
-            input_dim=self.video_dim,
-            output_dim=self.llm_dim,
-            device=self.device,
-            dtype=connector_dtype
-        )
-        logging.info(f"{'Video Encoder (CLIP)':<30} {'-':<15} {self.video_dim:<15} {next(self.clip.parameters()).dtype} {'video, both':<20}")
-        logging.info(f"{'Video Connector':<30} {self.video_dim:<15} {self.llm_dim:<15} {connector_dtype} {'video, both':<20}")
-        
-        # LLM
-        logging.info(f"{'LLM':<30} {self.llm_dim:<15} {'-':<15} {next(self.llm.parameters()).dtype} {'all':<20}")
-        logging.info(f"{dim_banner}\n")
-        
-        # Freeze LLM if specified
-        if freeze_llm:
-            logging.info("Freezing LLM")
-            self._freeze_model(self.llm)
-            
         # Move model to the specified device
         self.to(device)
         
-        # Log model configuration
+        # Log final GPU memory after loading all components
+        self._log_memory_usage("Final (after loading all components)")
+        
+        # Calculate total memory usage
+        self.memory_stats['total_final'] = self._get_gpu_memory_usage()
+        self.memory_stats['total_used'] = {
+            "allocated": self.memory_stats['total_final']["allocated"] - self.memory_stats['total_initial']["allocated"],
+            "reserved": self.memory_stats['total_final']["reserved"] - self.memory_stats['total_initial']["reserved"]
+        }
+        
+        # Log total memory usage
+        logging.info(f"Total GPU memory used by model: {self.memory_stats['total_used']['allocated']:.2f} MB allocated")
+        
+        # Log the model configuration
         logging.info("Model initialization complete")
         logging.info(f"Model configuration: modality={modality}, "
                    f"freeze_encoders={freeze_encoders}, "
@@ -184,18 +222,60 @@ class ClipWhisperModel(nn.Module):
         # Count and log trainable parameters by component
         self._log_parameter_count()
 
-    def _pad_or_truncate(self, x, target_len):
-        """Pad or truncate sequence to target length"""
-        curr_len = x.size(1)
-        if curr_len > target_len:
-            return x[:, :target_len, :]
-        elif curr_len < target_len:
-            padding = torch.zeros(
-                (x.size(0), target_len - curr_len, x.size(2)),
-                dtype=x.dtype, device=x.device
-            )
-            return torch.cat([x, padding], dim=1)
-        return x
+    def _pad_or_truncate(self, features, target_len):
+        """Pad or truncate features to target length"""
+        if features is None:
+            return None
+        
+        current_len = features.size(1)
+        
+        # Return as is if already matching
+        if current_len == target_len:
+            return features
+            
+        # Truncate if longer
+        if current_len > target_len:
+            return features[:, :target_len, :]
+            
+        # Pad if shorter
+        padding_len = target_len - current_len
+        padding = torch.zeros(
+            (features.size(0), padding_len, features.size(2)),
+            dtype=features.dtype,
+            device=features.device
+        )
+        return torch.cat([features, padding], dim=1)
+
+    def _track_sequence_length(self, seq_len):
+        """Track sequence length statistics for monitoring"""
+        if not hasattr(self, '_seq_len_stats'):
+            self._seq_len_stats = {
+                'count': 0,
+                'min': float('inf'),
+                'max': 0,
+                'sum': 0,
+                'lengths': []
+            }
+        
+        # Update stats
+        self._seq_len_stats['count'] += 1
+        self._seq_len_stats['min'] = min(self._seq_len_stats['min'], seq_len)
+        self._seq_len_stats['max'] = max(self._seq_len_stats['max'], seq_len)
+        self._seq_len_stats['sum'] += seq_len
+        
+        # Keep only the last 1000 lengths to avoid memory issues
+        self._seq_len_stats['lengths'].append(seq_len)
+        if len(self._seq_len_stats['lengths']) > 1000:
+            self._seq_len_stats['lengths'] = self._seq_len_stats['lengths'][-1000:]
+        
+        # Log stats every 100 samples
+        if self._seq_len_stats['count'] % 100 == 0:
+            avg = self._seq_len_stats['sum'] / self._seq_len_stats['count']
+            recent_avg = sum(self._seq_len_stats['lengths']) / len(self._seq_len_stats['lengths'])
+            logging.info(f"Encoder sequence length stats - Min: {self._seq_len_stats['min']}, "
+                        f"Max: {self._seq_len_stats['max']}, "
+                        f"Avg (all): {avg:.2f}, "
+                        f"Avg (recent): {recent_avg:.2f}")
 
     def forward(
         self,
@@ -207,136 +287,147 @@ class ClipWhisperModel(nn.Module):
         return_loss=True,
         **kwargs
     ):
-        """Forward pass through the model"""
+        """Forward pass"""
+        # Save batch index for logging if provided
+        if 'batch_idx' in kwargs:
+            self._current_batch_idx = kwargs['batch_idx']
+        
+        batch_idx = getattr(self, '_current_batch_idx', 0)
+            
         try:
-            # Log the modality that's being used with a clear banner for easy identification
-            modality_banner = "#" * 50
-            logging.info(f"\n{modality_banner}")
-            logging.info(f"# FORWARD PASS USING MODALITY: {self.modality.upper()} #")
+            # Start memory tracking
+            fw_memory_start = self._get_gpu_memory_usage()
             
-            # Verify expected inputs based on modality for debugging
-            if self.modality == "audio" and audio is None:
-                logging.warning("Audio modality selected but no audio input provided")
-            elif self.modality == "video" and video is None:
-                logging.warning("Video modality selected but no video input provided")
-            elif self.modality == "both" and (audio is None or video is None):
-                if audio is None:
-                    logging.warning("Both modality selected but no audio input provided")
-                if video is None:
-                    logging.warning("Both modality selected but no video input provided")
+            # Log the modality that's being used 
+            if batch_idx % 25 == 0:
+                logging.info(f"[Batch {batch_idx}] Forward pass using modality: {self.modality}")
             
-            logging.info(f"{modality_banner}\n")
+            batch_size = audio.size(0) if audio is not None else video.size(0)
             
-            # Log input shapes for debugging
+            logging.debug(f"Forward pass with batch size {batch_size}")
+            
+            # Input validation
+            if audio is None and video is None:
+                raise ValueError("Both audio and video inputs cannot be None")
+                
             if audio is not None:
-                logging.info(f"Input audio shape: {audio.shape}, dtype: {audio.dtype}")
+                logging.debug(f"Audio input shape: {audio.shape}")
             if video is not None:
-                logging.info(f"Input video shape: {video.shape}, dtype: {video.dtype}")
-            if labels is not None:
-                logging.info(f"Input labels shape: {labels.shape}")
+                logging.debug(f"Video input shape: {video.shape}")
             
-            # Encode audio if provided
+            # Encode audio and/or video
             audio_features = None
-            if audio is not None and self.modality in ["audio", "both"]:
-                logging.info(f"Processing audio input for modality: {self.modality}")
-                # Handle NaN/Inf values
-                if torch.isnan(audio).any() or torch.isinf(audio).any():
-                    audio = torch.nan_to_num(audio)
-                
-                audio_features = self.encode_audio(audio)
-                
-                # Handle NaN/Inf values
-                if audio_features is not None and (torch.isnan(audio_features).any() or torch.isinf(audio_features).any()):
-                    audio_features = torch.nan_to_num(audio_features)
-            elif self.modality == "audio" and audio is None:
-                logging.warning("Audio modality selected but no audio input provided")
-            
-            # Encode video if provided
             video_features = None
-            if video is not None and self.modality in ["video", "both"]:
-                logging.info(f"Processing video input for modality: {self.modality}")
-                # Handle NaN/Inf values
-                if torch.isnan(video).any() or torch.isinf(video).any():
-                    video = torch.nan_to_num(video)
-                
+            
+            # Track memory before encoding
+            encoder_memory_start = self._get_gpu_memory_usage()
+            
+            # Audio encoding
+            if (self.modality == "audio" or self.modality == "both") and audio is not None:
+                audio_features = self.encode_audio(audio)
+                # Log initial audio features size before any truncation in fusion
+                if batch_idx % 25 == 0:
+                    logging.info(f"[Batch {batch_idx}] Pre-fusion audio features shape: {audio_features.shape}")
+            
+            # Video encoding
+            if (self.modality == "video" or self.modality == "both") and video is not None:
                 video_features = self.encode_video(video)
+                # Log initial video features size before any truncation in fusion
+                if batch_idx % 25 == 0:
+                    logging.info(f"[Batch {batch_idx}] Pre-fusion video features shape: {video_features.shape}")
+            
+            # Track memory after encoding
+            encoder_memory_end = self._get_gpu_memory_usage()
+            encoder_memory_used = encoder_memory_end["allocated"] - encoder_memory_start["allocated"]
+            if batch_idx % 50 == 0:
+                logging.info(f"[Batch {batch_idx}] Encoder memory usage: {encoder_memory_used:.2f} MB")
                 
-                # Handle NaN/Inf values
-                if video_features is not None and (torch.isnan(video_features).any() or torch.isinf(video_features).any()):
-                    video_features = torch.nan_to_num(video_features)
-            elif self.modality == "video" and video is None:
-                logging.warning("Video modality selected but no video input provided")
-            
-            # Determine which modality to use and project to LLM dimension
-            encoder_out = None
-            batch_size = None
-            seq_len = None
-            
-            # Audio only path
-            if audio_features is not None and (self.modality == "audio" or (self.modality == "both" and video_features is None)):
-                # Truncate to max_seq_len
-                audio_features = audio_features[:, :self.max_seq_len, :]
-                logging.info(f"Audio features before connector: shape={audio_features.shape}, dtype={audio_features.dtype}")
-                encoder_out = self.audio_connector(audio_features)
-                logging.info(f"Audio features after connector: shape={encoder_out.shape}, dtype={encoder_out.dtype}")
-                batch_size, seq_len = encoder_out.size(0), encoder_out.size(1)
-                path_banner = "=" * 80
-                logging.info(f"\n{path_banner}")
-                logging.info(f"USING AUDIO-ONLY PATH (modality={self.modality})")
-                logging.info(f"Encoder output shape: {encoder_out.shape}, dtype: {encoder_out.dtype}")
-                logging.info(f"{path_banner}")
-            
-            # Video only path
-            elif video_features is not None and (self.modality == "video" or (self.modality == "both" and audio_features is None)):
-                # Truncate to max_seq_len
-                video_features = video_features[:, :self.max_seq_len, :]
-                logging.info(f"Video features before connector: shape={video_features.shape}, dtype={video_features.dtype}")
-                encoder_out = self.video_connector(video_features)
-                logging.info(f"Video features after connector: shape={encoder_out.shape}, dtype={encoder_out.dtype}")
-                batch_size, seq_len = encoder_out.size(0), encoder_out.size(1)
-                path_banner = "=" * 80
-                logging.info(f"\n{path_banner}")
-                logging.info(f"USING VIDEO-ONLY PATH (modality={self.modality})")
-                logging.info(f"Encoder output shape: {encoder_out.shape}, dtype: {encoder_out.dtype}")
-                logging.info(f"{path_banner}")
-            
-            # Combined path (both audio and video)
-            elif audio_features is not None and video_features is not None and self.modality == "both":
-                # Determine a common sequence length for both features
-                audio_seq_len = audio_features.size(1)
-                video_seq_len = video_features.size(1)
-                common_seq_len = min(audio_seq_len, video_seq_len, self.max_seq_len)
+            # Combine features based on modality
+            if self.modality == "audio":
+                encoder_out = audio_features
+            elif self.modality == "video":
+                encoder_out = video_features
+            else:  # both modalities
+                # Log original sequence lengths before fusion
+                if batch_idx % 25 == 0 and audio_features is not None and video_features is not None:
+                    logging.info(f"[Batch {batch_idx}] Pre-fusion lengths - Audio: {audio_features.size(1)}, Video: {video_features.size(1)}")
                 
-                # Truncate both to common length
-                audio_features = audio_features[:, :common_seq_len, :]
-                video_features = video_features[:, :common_seq_len, :]
+                # Ensure both features have the same sequence length,
+                # but also respect the maximum sequence length limit
+                max_len = min(
+                    self.max_seq_len,
+                    max(
+                        audio_features.size(1) if audio_features is not None else 0,
+                        video_features.size(1) if video_features is not None else 0
+                    )
+                )
                 
-                # Project each to LLM dimension separately
-                logging.info(f"Audio features before connector: shape={audio_features.shape}, dtype={audio_features.dtype}")
-                audio_llm_features = self.audio_connector(audio_features)
-                logging.info(f"Audio features after connector: shape={audio_llm_features.shape}, dtype={audio_llm_features.dtype}")
+                # Log if we're truncating during fusion
+                if audio_features is not None and audio_features.size(1) > max_len:
+                    # Get the current batch index if available for logging
+                    batch_idx = getattr(self, '_current_batch_idx', 0)
+                    # Log less frequently to reduce clutter (only every 25 batches)
+                    if batch_idx % 25 == 0:
+                        logging.info(f"[Batch {batch_idx}] Audio features truncated during fusion from {audio_features.size(1)} to {max_len}")
                 
-                logging.info(f"Video features before connector: shape={video_features.shape}, dtype={video_features.dtype}")
-                video_llm_features = self.video_connector(video_features)
-                logging.info(f"Video features after connector: shape={video_llm_features.shape}, dtype={video_llm_features.dtype}")
+                if video_features is not None and video_features.size(1) > max_len:
+                    # Get the current batch index if available for logging
+                    batch_idx = getattr(self, '_current_batch_idx', 0)
+                    # Log less frequently to reduce clutter (only every 25 batches)
+                    if batch_idx % 25 == 0:
+                        logging.info(f"[Batch {batch_idx}] Video features truncated during fusion from {video_features.size(1)} to {max_len}")
                 
-                # Average both features (simple fusion)
-                encoder_out = audio_llm_features * self.fusion_scale + video_llm_features * (1 - self.fusion_scale)
-                batch_size, seq_len = encoder_out.size(0), encoder_out.size(1)
-                path_banner = "=" * 80
-                logging.info(f"\n{path_banner}")
-                logging.info(f"USING COMBINED (AUDIO+VIDEO) PATH (modality={self.modality})")
-                logging.info(f"Fusion scale: {self.fusion_scale}")
-                logging.info(f"Encoder output shape: {encoder_out.shape}, dtype: {encoder_out.dtype}")
-                logging.info(f"{path_banner}")
+                # Pad or truncate to match
+                audio_features = self._pad_or_truncate(audio_features, max_len)
+                video_features = self._pad_or_truncate(video_features, max_len)
+                
+                # Double-check that fusion result respects max_seq_len
+                if audio_features.size(1) != max_len or video_features.size(1) != max_len:
+                    logging.warning(f"Unexpected feature length after padding/truncation - Audio: {audio_features.size(1)}, Video: {video_features.size(1)}, Expected: {max_len}")
+                    audio_features = self._pad_or_truncate(audio_features, max_len)
+                    video_features = self._pad_or_truncate(video_features, max_len)
+                
+                # Weighted sum of features
+                encoder_out = (
+                    self.fusion_scale * audio_features +
+                    (1 - self.fusion_scale) * video_features
+                )
+                
+                # Double-check that fusion result respects max_seq_len
+                if encoder_out.size(1) != max_len:
+                    logging.warning(f"Unexpected encoder output length after fusion: {encoder_out.size(1)} (expected {max_len})")
+                    encoder_out = self._pad_or_truncate(encoder_out, max_len)
             
-            else:
-                raise ValueError("At least one of audio or video must be provided and match the specified modality")
+            # Log final encoder output size before any LLM processing
+            if batch_idx % 25 == 0:
+                logging.info(f"[Batch {batch_idx}] Final encoder output shape: {encoder_out.shape}")
             
-            # Final NaN check before LLM
-            if torch.isnan(encoder_out).any() or torch.isinf(encoder_out).any():
-                logging.warning(f"NaN/Inf detected in encoder output before LLM")
-                encoder_out = torch.nan_to_num(encoder_out)
+            # Ensure we respect max_seq_len
+            if encoder_out.size(1) > self.max_seq_len:
+                # Get the current batch index if available for logging
+                batch_idx = getattr(self, '_current_batch_idx', 0)
+                # Log less frequently to reduce clutter (only every 25 batches)
+                if batch_idx % 25 == 0:
+                    logging.info(f"[Batch {batch_idx}] Encoder output truncated from {encoder_out.size(1)} to {self.max_seq_len}")
+                encoder_out = encoder_out[:, :self.max_seq_len, :]
+                logging.debug(f"Truncated encoder output to {self.max_seq_len}")
+            
+            # Explicitly verify the sequence length after truncation
+            if encoder_out.size(1) != self.max_seq_len:
+                # Get the current batch index if available for logging
+                batch_idx = getattr(self, '_current_batch_idx', 0)
+                if batch_idx % 25 == 0:
+                    logging.info(f"[Batch {batch_idx}] After truncation, encoder output length ({encoder_out.size(1)}) doesn't match max_seq_len ({self.max_seq_len})")
+                # Force the correct sequence length if it still doesn't match
+                if encoder_out.size(1) > self.max_seq_len:
+                    encoder_out = encoder_out[:, :self.max_seq_len, :]
+                    logging.debug(f"Forcibly truncated encoder output to max_seq_len {self.max_seq_len}")
+            
+            # Store sequence length for masking
+            seq_len = encoder_out.size(1)
+            
+            # Track sequence length statistics
+            self._track_sequence_length(seq_len)
             
             # Ensure encoder output matches LLM's expected dtype
             llm_input_dtype = next(self.llm.parameters()).dtype
@@ -347,6 +438,9 @@ class ClipWhisperModel(nn.Module):
             # Create initial attention mask (all 1s)
             attention_mask = torch.ones((batch_size, seq_len), dtype=torch.long, device=self.device)
                 
+            # Track memory for LLM forward pass at the appropriate place
+            llm_memory_start = self._get_gpu_memory_usage()
+            
             # Handle prompt if provided
             if prompt is not None:
                 logging.info(f"Processing prompt with shape: {prompt.shape}")
@@ -376,35 +470,65 @@ class ClipWhisperModel(nn.Module):
             if return_loss and labels is not None:
                 # Adjust labels to match sequence length
                 if labels.size(1) != encoder_out.size(1):
+                    # Get the current global step from kwargs for logging
+                    batch_idx = kwargs.get('batch_idx', 0)
+                    
+                    # Log occasionally (every 25 batches) to reduce clutter but maintain visibility
+                    if batch_idx % 25 == 0:
+                        logging.info(f"[Batch {batch_idx}] Label sequence length ({labels.size(1)}) doesn't match encoder output ({encoder_out.size(1)})")
+                    else:
+                        logging.debug(f"Label sequence length ({labels.size(1)}) doesn't match encoder output ({encoder_out.size(1)})")
+                    
+                    # Must resize labels to match encoder output exactly
                     if labels.size(1) < encoder_out.size(1):
-                        # Pad labels with -100
+                        # Pad labels with -100 (ignored in loss calculation)
                         padding = torch.full(
-                            (batch_size, encoder_out.size(1) - labels.size(1)),
-                            -100,  # ignored in loss
-                            dtype=labels.dtype,
+                            (batch_size, encoder_out.size(1) - labels.size(1)), 
+                            -100,  # Padding token ID that is ignored in loss calculation
+                            dtype=labels.dtype, 
                             device=labels.device
                         )
                         labels = torch.cat([labels, padding], dim=1)
                     else:
-                        # Truncate labels
+                        # Truncate labels to match encoder output length
                         labels = labels[:, :encoder_out.size(1)]
-            
-            # Forward pass through LLM
-            if return_loss and labels is not None:
-                # For training with loss calculation
+                    
+                    # Log resizing at debug level
+                    logging.debug(f"Resized labels to match encoder output: {labels.shape}")
+                
+                # Check if batch sizes match
+                if labels.size(0) != encoder_out.size(0):
+                    raise ValueError(f"Label batch size ({labels.size(0)}) doesn't match encoder output ({encoder_out.size(0)})")
+                
+                # Forward pass with labels for loss computation
                 outputs = self.llm(
                     inputs_embeds=encoder_out,
                     attention_mask=attention_mask,
                     labels=labels,
                     return_dict=True
                 )
-                return outputs
             else:
-                # For inference/generation, return hidden states for later use
-                return type('obj', (object,), {
-                    'hidden_states': encoder_out,
-                    'attention_mask': attention_mask
-                })
+                # Forward pass without loss computation
+                outputs = self.llm(
+                    inputs_embeds=encoder_out,
+                    attention_mask=attention_mask,
+                    return_dict=True
+                )
+            
+            # Track memory after LLM forward pass
+            llm_memory_end = self._get_gpu_memory_usage()
+            llm_memory_used = llm_memory_end["allocated"] - llm_memory_start["allocated"]
+            
+            # Calculate total memory usage for the forward pass
+            fw_memory_end = self._get_gpu_memory_usage()
+            fw_memory_used = fw_memory_end["allocated"] - fw_memory_start["allocated"]
+            
+            # Log memory usage less frequently
+            if batch_idx % 50 == 0:
+                logging.info(f"[Batch {batch_idx}] GPU Memory - LLM forward: {llm_memory_used:.2f} MB, Encoder: {encoder_memory_used:.2f} MB, Total: {fw_memory_used:.2f} MB")
+            
+            return outputs
+        
         except Exception as e:
             logging.error(f"Error in forward pass: {e}")
             logging.error(traceback.format_exc())
@@ -532,23 +656,27 @@ class ClipWhisperModel(nn.Module):
         
         return model
     
-    def _load_whisper_model(self, whisper_model):
+    def _load_whisper_model(self, whisper_model, freeze_encoders):
         """Load the Whisper model for audio encoding"""
         logging.info(f"Loading Whisper model: {whisper_model}")
         try:
             processor = WhisperProcessor.from_pretrained(whisper_model)
             model = WhisperModel.from_pretrained(whisper_model)
+            if freeze_encoders:
+                self._freeze_model(model)
             return model, processor
         except Exception as e:
             logging.error(f"Error loading Whisper model: {e}")
             raise
 
-    def _load_clip_model(self, clip_model):
+    def _load_clip_model(self, clip_model, freeze_encoders):
         """Load the CLIP model for visual encoding"""
         logging.info(f"Loading CLIP model: {clip_model}")
         try:
             processor = CLIPProcessor.from_pretrained(clip_model)
             model = CLIPVisionModel.from_pretrained(clip_model)
+            if freeze_encoders:
+                self._freeze_model(model)
             return model, processor
         except Exception as e:
             logging.error(f"Error loading CLIP model: {e}")
@@ -559,65 +687,80 @@ class ClipWhisperModel(nn.Module):
         for param in model.parameters():
             param.requires_grad = False
 
-    def _load_llm(self, llm_path):
+    def _load_llm(self, llm_path, use_lora, lora_r, lora_alpha, lora_dropout, freeze_llm, use_4bit):
         """Load the language model"""
         logging.info(f"Loading LLM from {llm_path}")
         
-        try:
-            # First load the tokenizer
-            tokenizer = AutoTokenizer.from_pretrained(llm_path)
-            
-            # Set padding config for the tokenizer
-            tokenizer.pad_token = tokenizer.eos_token
-            tokenizer.padding_side = "right"
-            
-            # Set up model loading kwargs
-            load_kwargs = {
-                "torch_dtype": self.dtype,
-                "low_cpu_mem_usage": True,
-            }
-            
-            # Add LoRA config if enabled
-            if self.use_lora:
-                from peft import LoraConfig, get_peft_model, TaskType
-                
-                lora_config = LoraConfig(
-                    r=self.lora_r,
-                    lora_alpha=self.lora_alpha,
-                    target_modules=["q_proj", "v_proj"],
-                    lora_dropout=self.lora_dropout,
-                    bias="none",
-                    task_type=TaskType.CAUSAL_LM
+        # Configure 4-bit quantization if requested
+        if use_4bit:
+            try:
+                logging.info("Using 4-bit quantization for LLM")
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16 if self.use_fp16 else torch.float32,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4"
                 )
                 
-                load_kwargs["device_map"] = self.device
-            
-            # Add 4-bit quantization config if enabled
-            if self.use_4bit:
-                load_kwargs["load_in_4bit"] = True
-                load_kwargs["quantization_config"] = {
-                    "bnb_4bit_compute_dtype": torch.float16,
-                    "bnb_4bit_use_double_quant": True,
-                }
+                llm = AutoModelForCausalLM.from_pretrained(
+                    llm_path,
+                    device_map="auto",
+                    quantization_config=quantization_config,
+                )
                 
-            # Load the model with the specified configuration
-            model = AutoModelForCausalLM.from_pretrained(
-                llm_path,
-                **load_kwargs
+                logging.info("Successfully loaded LLM with 4-bit quantization")
+            except ImportError:
+                logging.warning("BitsAndBytes not available for 4-bit quantization, falling back to standard loading")
+                llm = AutoModelForCausalLM.from_pretrained(llm_path, device_map="auto")
+            except Exception as e:
+                logging.error(f"Error loading LLM with 4-bit quantization: {e}")
+                logging.warning("Falling back to standard loading")
+                llm = AutoModelForCausalLM.from_pretrained(llm_path, device_map="auto")
+        else:
+            # Standard loading without quantization
+            llm = AutoModelForCausalLM.from_pretrained(llm_path, device_map="auto")
+        
+        # Load tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(llm_path)
+        
+        # Apply LoRA if requested
+        if use_lora:
+            logging.info(f"Applying LoRA with r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}")
+            
+            # Configure target modules based on model type
+            if 'llama' in llm_path.lower():
+                target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+            else:
+                # Default target modules for other model types
+                target_modules = ["query", "key", "value", "dense"]
+                
+            # Create LoRA config
+            peft_config = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                bias="none",
+                task_type="CAUSAL_LM",
+                target_modules=target_modules,
             )
             
-            # Apply LoRA if enabled
-            if self.use_lora:
-                from peft import LoraConfig, get_peft_model, TaskType
-                model = get_peft_model(model, lora_config)
-                logging.info(f"Applied LoRA to model with config: r={self.lora_r}, alpha={self.lora_alpha}, dropout={self.lora_dropout}")
+            # Apply LoRA to model
+            llm = get_peft_model(llm, peft_config)
+            logging.info("LoRA applied successfully")
             
-            return model, tokenizer
-            
-        except Exception as e:
-            logging.error(f"Error loading LLM: {e}")
-            logging.error(traceback.format_exc())
-            raise
+        # Freeze LLM weights if requested
+        if freeze_llm:
+            logging.info("Freezing LLM weights (only LoRA weights will be trained)")
+            for param in llm.parameters():
+                param.requires_grad = False
+                
+            # If using LoRA, ensure LoRA weights are trainable
+            if use_lora:
+                for n, p in llm.named_parameters():
+                    if 'lora' in n:
+                        p.requires_grad = True
+                        
+        return llm, tokenizer
 
     def _log_parameter_count(self):
         """Log the number of parameters in each component"""
@@ -669,102 +812,295 @@ class ClipWhisperModel(nn.Module):
     
     def encode_audio(self, audio, attention_mask=None):
         """Encode audio using Whisper"""
-        with torch.no_grad():
-            try:
-                # Ensure audio is on the correct device
-                if audio.device != self.device:
-                    audio = audio.to(self.device)
-                
-                # IMPORTANT: Convert to the SAME dtype as the Whisper model
-                whisper_dtype = next(self.whisper.parameters()).dtype
-                if audio.dtype != whisper_dtype:
-                    audio = audio.to(whisper_dtype)
-                
-                # Check for NaN values
-                if torch.isnan(audio).any() or torch.isinf(audio).any():
-                    logging.warning("NaN/Inf values detected in audio input, replacing with zeros")
-                    audio = torch.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
-                
-                # Get Whisper features
-                whisper_output = self.whisper.encoder(audio)
-                
-                # Get the last hidden state from the output
-                if hasattr(whisper_output, "last_hidden_state"):
-                    features = whisper_output.last_hidden_state
-                else:
-                    features = whisper_output
-                
-                # Log the dimensionality of the audio features
-                logging.info(f"Audio encoder output shape: {features.shape}, dtype: {features.dtype}")
-                
-                return features
-                
-            except Exception as e:
-                logging.error(f"Error encoding audio: {e}")
-                logging.error(traceback.format_exc())
-                
-                # Return a dummy tensor with the expected shape and dtype
-                # This helps training continue even if there's an issue with this example
-                batch_size = audio.size(0)
-                expected_seq_len = audio.size(1) // 16
-                whisper_dtype = next(self.whisper.parameters()).dtype
-                return torch.zeros(
-                    (batch_size, expected_seq_len, self.audio_dim),
-                    device=self.device,
-                    dtype=whisper_dtype  # Match Whisper's dtype
-                )
+        if self.modality == "video":
+            logging.warning("Trying to encode audio in video-only mode, returning dummy tensor")
+            return torch.zeros((audio.size(0), 1, self.llm_dim), device=self.device, dtype=self.dtype)
+        
+        with torch.set_grad_enabled(not self.freeze_encoders):
+            # Check if we're using FP16 and ensure consistent types
+            if self.use_fp16 and audio.dtype != torch.float16:
+                logging.info(f"Converting audio input from {audio.dtype} to float16")
+                audio = audio.to(dtype=torch.float16)
+            
+            # If we're not using FP16 but the input is half precision, convert to float32
+            if not self.use_fp16 and audio.dtype == torch.float16:
+                logging.info(f"Converting audio input from float16 to float32")
+                audio = audio.to(dtype=torch.float32)
+            
+            # If Whisper's parameters are not the same dtype as input, convert Whisper
+            whisper_dtype = next(self.whisper.parameters()).dtype
+            if audio.dtype != whisper_dtype:
+                logging.warning(f"Type mismatch: audio is {audio.dtype} but Whisper is {whisper_dtype}. Converting Whisper.")
+                # Move the whole Whisper model to the same dtype as the input
+                self.whisper = self.whisper.to(dtype=audio.dtype)
+                logging.info(f"Whisper model converted to {audio.dtype}")
+            
+            # Prepare attention mask if not provided
+            if attention_mask is None:
+                # Create mask where all elements are attended to (all 1s)
+                attention_mask = torch.ones(audio.shape[0], audio.shape[1], dtype=torch.long, device=audio.device)
+            
+            # Ensure the attention mask has the correct device
+            attention_mask = attention_mask.to(device=audio.device)
+            
+            # Log original audio size if in debug mode
+            batch_idx = getattr(self, '_current_batch_idx', 0)
+            if batch_idx % 50 == 0:
+                logging.debug(f"[Batch {batch_idx}] Audio encoder input shape: {audio.shape}")
+            
+            # Get Whisper encoder output
+            encoder_outputs = self.whisper.encoder(
+                audio,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True
+            )
+            
+            # Get the last hidden state
+            last_hidden_state = encoder_outputs.last_hidden_state
+            
+            # Log raw encoder output size if in debug mode
+            if batch_idx % 50 == 0:
+                logging.debug(f"[Batch {batch_idx}] Raw Whisper encoder output shape: {last_hidden_state.shape}")
+            
+            # Project to LLM dimension
+            features = self.audio_connector(last_hidden_state)
+            
+            # Log audio features after projection if in debug mode
+            if batch_idx % 50 == 0:
+                logging.debug(f"[Batch {batch_idx}] Projected audio features shape: {features.shape}")
+            
+            # We don't truncate here - preserve full sequence for fusion
+            return features
     
     def encode_video(self, video, attention_mask=None):
-        """Encode video frames using CLIP"""
-        with torch.no_grad():
-            try:
-                # Ensure video is on the correct device
-                if video.device != self.device:
-                    video = video.to(self.device)
+        """Encode video using CLIP"""
+        if self.modality == "audio":
+            logging.warning("Trying to encode video in audio-only mode, returning dummy tensor")
+            return torch.zeros((video.size(0), 1, self.llm_dim), device=self.device, dtype=self.dtype)
+        
+        # Process all frames together
+        batch_size, seq_len = video.size(0), video.size(1)
+        
+        # Log original video size if in debug mode
+        batch_idx = getattr(self, '_current_batch_idx', 0)
+        if batch_idx % 50 == 0:
+            logging.debug(f"[Batch {batch_idx}] Video encoder input: {batch_size} batches x {seq_len} frames")
+        
+        # Reshape to process all frames at once
+        # CLIP expects input shape [batch_size, channels, height, width]
+        # Our video is [batch_size, seq_len, channels, height, width]
+        video_reshaped = video.view(batch_size * seq_len, video.size(2), video.size(3), video.size(4))
+        
+        with torch.set_grad_enabled(not self.freeze_encoders):
+            # Get CLIP vision encoder output
+            vision_outputs = self.clip(
+                video_reshaped,
+                output_hidden_states=True,
+                return_dict=True
+            )
+            
+            # Get the pooler output (or last hidden state)
+            if hasattr(vision_outputs, 'pooler_output') and vision_outputs.pooler_output is not None:
+                pooled_output = vision_outputs.pooler_output
+            else:
+                # Use the [CLS] token embedding or the last hidden state if pooler not available
+                pooled_output = vision_outputs.last_hidden_state[:, 0]
+            
+            # Reshape back to sequence form [batch_size, seq_len, feature_dim]
+            features = pooled_output.view(batch_size, seq_len, -1)
+            
+            # Project to LLM dimension
+            features = self.video_connector(features)
+            
+            # Log video features after projection if in debug mode
+            if batch_idx % 50 == 0:
+                logging.debug(f"[Batch {batch_idx}] Projected video features shape: {features.shape}")
+            
+            # We don't truncate here - preserve full sequence for fusion
+            return features
+
+    def _get_llm_dim(self):
+        """Get the input dimension of the LLM"""
+        # Get LLM input embedding dimension
+        if hasattr(self.llm, "get_input_embeddings"):
+            llm_dim = self.llm.get_input_embeddings().weight.shape[1]
+            logging.info(f"Detected LLM input dimension: {llm_dim}")
+            return llm_dim
+        else:
+            logging.warning("Could not detect LLM input dimension, using default 4096")
+            return 4096 
+
+    def _setup_projections(self):
+        """Create projections from encoder outputs to LLM input dimension"""
+        # Audio projection (Whisper -> LLM)
+        self.audio_connector = ModalityConnector(
+            input_dim=self.audio_dim,
+            output_dim=self.llm_dim,
+            device=self.device,
+            dtype=self.dtype
+        )
+        logging.info(f"Created audio projection: {self.audio_dim} -> {self.llm_dim}")
+        
+        # Video projection (CLIP -> LLM)
+        self.video_connector = ModalityConnector(
+            input_dim=self.video_dim,
+            output_dim=self.llm_dim,
+            device=self.device,
+            dtype=self.dtype
+        )
+        logging.info(f"Created video projection: {self.video_dim} -> {self.llm_dim}")
+        
+    def _log_model_architecture(self):
+        """Log model architecture details"""
+        # Print detailed dimension table for all components
+        dim_banner = "-" * 80
+        logging.info(f"\n{dim_banner}")
+        logging.info(f"{'COMPONENT':<30} {'INPUT DIM':<15} {'OUTPUT DIM':<15} {'ACTIVE IN MODALITY':<20}")
+        logging.info(f"{dim_banner}")
+        
+        # Audio components
+        logging.info(f"{'Audio Encoder (Whisper)':<30} {'-':<15} {self.audio_dim:<15} {'audio, both':<20}")
+        logging.info(f"{'Audio Connector':<30} {self.audio_dim:<15} {self.llm_dim:<15} {'audio, both':<20}")
+        
+        # Video components
+        logging.info(f"{'Video Encoder (CLIP)':<30} {'-':<15} {self.video_dim:<15} {'video, both':<20}")
+        logging.info(f"{'Video Connector':<30} {self.video_dim:<15} {self.llm_dim:<15} {'video, both':<20}")
+        
+        # LLM
+        logging.info(f"{'LLM':<30} {self.llm_dim:<15} {'-':<15} {'all':<20}")
+        logging.info(f"{dim_banner}\n")
+
+    def generate(
+        self,
+        audio=None,
+        video=None,
+        prompt=None,
+        max_length=100,
+        temperature=0.7,
+        do_sample=True,
+        **kwargs
+    ):
+        """Generate text from audio/video embeddings"""
+        try:
+            logging.info("Starting generation process")
+            
+            # Create inputs_embeds and attention_mask using our encoders
+            if self.modality == "audio":
+                if audio is None:
+                    raise ValueError("Audio modality selected but no audio input provided")
+                encoder_output = self.encode_audio(audio)
+            elif self.modality == "video":
+                if video is None:
+                    raise ValueError("Video modality selected but no video input provided")
+                encoder_output = self.encode_video(video)
+            else:  # both modalities
+                if audio is None or video is None:
+                    raise ValueError("Both modalities selected but inputs are missing")
                 
-                # Get the batch size and number of frames
-                batch_size, num_frames = video.shape[0], video.shape[1]
+                audio_features = self.encode_audio(audio)
+                video_features = self.encode_video(video)
                 
-                # Flatten the video for CLIP processing
-                # CLIP expects (batch_size, channels, height, width)
-                # Our video is (batch_size, num_frames, channels, height, width)
-                clip_input = video.view(batch_size * num_frames, *video.shape[2:])
+                # Ensure both features have the same sequence length
+                max_len = min(
+                    self.max_seq_len,
+                    max(audio_features.size(1), video_features.size(1))
+                )
                 
-                # IMPORTANT: Convert to the SAME dtype as the CLIP model
-                clip_dtype = next(self.clip.parameters()).dtype
-                if clip_input.dtype != clip_dtype:
-                    clip_input = clip_input.to(clip_dtype)
+                # Log if we're truncating during fusion
+                if audio_features.size(1) > max_len:
+                    logging.debug(f"Truncating audio features from {audio_features.size(1)} to {max_len} during fusion")
                 
-                # Handle potential NaN values
-                if torch.isnan(clip_input).any() or torch.isinf(clip_input).any():
-                    logging.warning("NaN/Inf values detected in video input, replacing with zeros")
-                    clip_input = torch.nan_to_num(clip_input, nan=0.0, posinf=0.0, neginf=0.0)
+                if video_features.size(1) > max_len:
+                    logging.debug(f"Truncating video features from {video_features.size(1)} to {max_len} during fusion")
                 
-                # Get CLIP features
-                with torch.amp.autocast('cuda', enabled=False):  # Disable mixed precision for stability
-                    outputs = self.clip(clip_input, output_hidden_states=True)
+                audio_features = self._pad_or_truncate(audio_features, max_len)
+                video_features = self._pad_or_truncate(video_features, max_len)
                 
-                # Get the pooled output
-                clip_features = outputs.pooler_output  # [batch_size * num_frames, feature_dim]
+                # Apply fusion
+                encoder_output = (
+                    self.fusion_scale * audio_features +
+                    (1 - self.fusion_scale) * video_features
+                )
                 
-                # Reshape back to separate batch and frames dimensions
-                video_features = clip_features.view(batch_size, num_frames, -1)  # [batch_size, num_frames, feature_dim]
+                # Double-check that fusion result respects max_seq_len
+                if encoder_output.size(1) != max_len:
+                    logging.warning(f"Unexpected encoder output length after fusion: {encoder_output.size(1)} (expected {max_len})")
+                    encoder_output = self._pad_or_truncate(encoder_output, max_len)
+            
+            # Apply sequence length limit
+            if encoder_output.size(1) > self.max_seq_len:
+                # Get the current batch index if available for logging
+                batch_idx = getattr(self, '_current_batch_idx', 0)
+                # Log less frequently to reduce clutter (only every 25 batches)
+                if batch_idx % 25 == 0:
+                    logging.info(f"[Batch {batch_idx}] Encoder output truncated from {encoder_output.size(1)} to {self.max_seq_len}")
+                encoder_output = encoder_output[:, :self.max_seq_len, :]
+                logging.debug(f"Truncated encoder output to {self.max_seq_len}")
+            
+            # Explicitly verify the sequence length after truncation
+            if encoder_output.size(1) != self.max_seq_len:
+                # Get the current batch index if available for logging
+                batch_idx = getattr(self, '_current_batch_idx', 0)
+                if batch_idx % 25 == 0:
+                    logging.info(f"[Batch {batch_idx}] After truncation, encoder output length ({encoder_output.size(1)}) doesn't match max_seq_len ({self.max_seq_len})")
+                # Force the correct sequence length if it still doesn't match
+                if encoder_output.size(1) > self.max_seq_len:
+                    encoder_output = encoder_output[:, :self.max_seq_len, :]
+                    logging.debug(f"Forcibly truncated encoder output to max_seq_len {self.max_seq_len}")
+            
+            # Get batch size and sequence length
+            batch_size, seq_len = encoder_output.size(0), encoder_output.size(1)
+            
+            # Create attention mask
+            attention_mask = torch.ones((batch_size, seq_len), dtype=torch.long, device=self.device)
+            
+            # Handle prompt if provided
+            if prompt is not None:
+                embedding_layer = self.llm.get_input_embeddings()
+                prompt_embeds = embedding_layer(prompt.to(self.device))
                 
-                logging.info(f"Final video features shape: {video_features.shape}")
+                # Ensure batch dimensions match
+                if prompt_embeds.size(0) == 1 and encoder_output.size(0) > 1:
+                    prompt_embeds = prompt_embeds.expand(encoder_output.size(0), -1, -1)
                 
-                # Log the dimensionality of the video features
-                logging.info(f"Video encoder output shape: {video_features.shape}, dtype: {video_features.dtype}")
+                # Concatenate along sequence dimension
+                inputs_embeds = torch.cat([prompt_embeds, encoder_output], dim=1)
                 
-                return video_features
-                
-            except Exception as e:
-                logging.error(f"Error encoding video: {e}")
-                logging.error(traceback.format_exc())
-                
-                # Return a dummy tensor with the expected shape and dtype
-                clip_dtype = next(self.clip.parameters()).dtype
-                return torch.zeros(
-                    (batch_size, num_frames, self.video_dim),
-                    device=self.device,
-                    dtype=clip_dtype  # Match CLIP's dtype
-                ) 
+                # Update attention mask to include prompt tokens
+                attention_mask = torch.ones(
+                    (batch_size, inputs_embeds.size(1)), 
+                    dtype=torch.long, 
+                    device=self.device
+                )
+            else:
+                inputs_embeds = encoder_output
+            
+            # Ensure input embeddings match LLM's expected dtype
+            llm_dtype = next(self.llm.parameters()).dtype
+            if inputs_embeds.dtype != llm_dtype:
+                inputs_embeds = inputs_embeds.to(llm_dtype)
+            
+            # Set up generation parameters
+            generation_config = {
+                "max_length": max_length,
+                "temperature": temperature,
+                "do_sample": do_sample,
+                **kwargs
+            }
+            
+            logging.info(f"Generating with inputs shape: {inputs_embeds.shape}")
+            
+            # Generate text
+            outputs = self.llm.generate(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                **generation_config
+            )
+            
+            return outputs
+            
+        except Exception as e:
+            logging.error(f"Error in generate method: {e}")
+            logging.error(traceback.format_exc())
+            raise 

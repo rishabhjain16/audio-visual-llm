@@ -1,138 +1,183 @@
 #!/usr/bin/env python3
-# Copyright (c) 2023-2024 
-# All rights reserved.
+"""
+Training script for the AVHuBERT-Whisper model.
+"""
 
 import os
 import sys
 import logging
 import argparse
-from pathlib import Path
 import torch
+import yaml
+from pathlib import Path
+import traceback
 
-# Add the project root to the path
-project_root = Path(__file__).resolve().parent.parent
+# Add project root to path
+project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.append(str(project_root))
 
-from src.trainer.trainer import AVSRTrainer
-from src.utils.config import load_config
-from src.utils.setup import setup_logging, setup_environment, setup_seed
-from src.data.dataset import AVSRDataset, create_dataloader
-
+from src.avhubert_whisper.models import AVHuBERTWhisperModel
+from src.avhubert_whisper.trainer import AVHuBERTWhisperTrainer
+from src.avhubert_whisper.utils import setup_logging, load_config, set_seed, AVHuBERTWhisperConfig
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train AVSR-LLM model")
-    parser.add_argument("--config", type=str, required=True, 
+    parser = argparse.ArgumentParser(description="Train AVHuBERT-Whisper model")
+    parser.add_argument("--config", type=str, default="configs/avhubert_whisper.yaml",
                         help="Path to the configuration file")
-    parser.add_argument("--checkpoint_dir", type=str, default=None,
-                        help="Directory to save checkpoints (overrides config)")
-    parser.add_argument("--data_path", type=str, default=None,
-                        help="Path to dataset (overrides config)")
+    parser.add_argument("--output_dir", type=str, default="outputs/avhubert_whisper",
+                        help="Directory to save outputs")
+    parser.add_argument("--data_path", type=str, required=True,
+                        help="Path to dataset")
     parser.add_argument("--llm_path", type=str, default=None,
-                        help="Path to LLM model (overrides config)")
-    parser.add_argument("--av_encoder_path", type=str, default=None,
-                        help="Path to AV encoder model (overrides config)")
-    parser.add_argument("--gpu", type=int, default=0,
-                        help="GPU ID to use")
+                        help="Path or name of the LLM model")
+    parser.add_argument("--whisper_model", type=str, default=None,
+                        help="Name or path of Whisper model")
+    parser.add_argument("--avhubert_path", type=str, default=None,
+                        help="Path to the AVHuBERT checkpoint")
+    parser.add_argument("--batch_size", type=int, default=None, 
+                        help="Batch size for training")
+    parser.add_argument("--max_epochs", type=int, default=None,
+                        help="Maximum number of epochs to train")
+    parser.add_argument("--learning_rate", type=float, default=None,
+                        help="Learning rate")
+    parser.add_argument("--modality", type=str, default=None, 
+                        choices=["audio", "video", "both"],
+                        help="Which modalities to use")
+    parser.add_argument("--fp16", action="store_true", default=None,
+                        help="Use mixed precision training")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
-    parser.add_argument("--debug", action="store_true",
-                        help="Enable debug mode with more detailed logging and a smaller dataset")
-    parser.add_argument("--batch_size", type=int, default=None,
-                        help="Override batch size in config")
-    parser.add_argument("--max_epochs", type=int, default=None,
-                        help="Maximum number of epochs to train for")
+    parser.add_argument("--log_level", type=str, default="info",
+                        choices=["debug", "info", "warning", "error"],
+                        help="Logging level")
     parser.add_argument("--save_every", type=int, default=None,
                         help="Save checkpoint every N epochs")
     parser.add_argument("--save_steps", type=int, default=None,
-                        help="Save checkpoint every N training steps (overrides save_every)")
+                        help="Save checkpoint every N steps")
     parser.add_argument("--log_param_updates", action="store_true",
                         help="Log parameter updates during training")
-    parser.add_argument("--modality", type=str, choices=["audio", "video", "both"], default=None,
-                        help="Modality to use for training: audio-only, video-only, or both")
+    parser.add_argument("--resume_from", type=str, default=None,
+                        help="Resume training from checkpoint")
     return parser.parse_args()
 
-
 def main():
+    # Parse arguments
     args = parse_args()
     
-    # Setup environment
-    if args.gpu is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    # Setup logging
+    log_level = getattr(logging, args.log_level.upper())
+    setup_logging(level=log_level)
+    
+    # Set random seed
+    set_seed(args.seed)
     
     # Load configuration
     config = load_config(args.config)
     
-    # Override config with command line arguments
-    if args.checkpoint_dir:
-        config.training.checkpoint_dir = args.checkpoint_dir
+    # Override config with CLI arguments
+    if args.output_dir:
+        config["output_dir"] = args.output_dir
     if args.data_path:
-        config.data.path = args.data_path
+        config["data_path"] = args.data_path
     if args.llm_path:
-        config.model.llm_path = args.llm_path
-    if args.av_encoder_path:
-        config.model.av_encoder_path = args.av_encoder_path
-    if args.batch_size is not None:
-        config.data.batch_size = args.batch_size
-    if args.max_epochs is not None:
-        config.training.num_epochs = args.max_epochs
-    if args.save_every is not None:
-        config.training.save_every = args.save_every
-    if args.save_steps is not None:
-        config.training.save_steps = args.save_steps
-    if args.modality is not None:
-        config.model.modality = args.modality
-        logging.info(f"Setting training modality to: {args.modality}")
+        config["llm_path"] = args.llm_path
+    if args.whisper_model:
+        config["whisper_model"] = args.whisper_model
+    if args.avhubert_path:
+        config["avhubert_path"] = args.avhubert_path
+    if args.batch_size:
+        config["batch_size"] = args.batch_size
+    if args.max_epochs:
+        config["max_epochs"] = args.max_epochs
+    if args.learning_rate:
+        config["learning_rate"] = args.learning_rate
+    if args.modality:
+        config["modality"] = args.modality
+    if args.fp16 is not None:
+        config["use_fp16"] = args.fp16
     
-    # Set parameter update logging
-    config.log_param_updates = args.log_param_updates
+    # Create output directory
+    os.makedirs(config["output_dir"], exist_ok=True)
     
-    # Set debug mode
-    config.debug = args.debug
-    
-    # Setup logging
-    log_dir = Path(config.training.checkpoint_dir) / "logs"
-    os.makedirs(log_dir, exist_ok=True)
-    log_level = logging.DEBUG if args.debug else logging.INFO
-    setup_logging(log_dir / "train.log", level=log_level)
+    # Get device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    config["device"] = str(device)
     
     # Log configuration
-    logging.info(f"Training with configuration: {config}")
-    if args.debug:
-        logging.debug("Debug mode enabled - verbose logging and memory tracking enabled")
+    logging.info("STARTING AVHUBERT-WHISPER TRAINING")
+    logging.info("=" * 80)
+    logging.info(f"Data path: {config['data_path']}")
+    logging.info(f"Output directory: {config['output_dir']}")
+    logging.info(f"Device: {device}")
+    logging.info(f"Selected modality: {config['modality']}")
+    logging.info(f"Batch size: {config['batch_size']}")
+    logging.info(f"Max epochs: {config['max_epochs']}")
+    logging.info(f"FP16: {config['use_fp16']}")
+    logging.info(f"Log parameter updates: {args.log_param_updates}")
     
-    # Setup environment and seed
-    setup_environment()
-    setup_seed(args.seed)
-    
-    # Initialize trainer
-    device = f"cuda:{args.gpu}" if torch.cuda.is_available() and args.gpu >= 0 else "cpu"
-    config.device = device
-    
-    # Log GPU info before training
-    if torch.cuda.is_available():
-        gpu_props = torch.cuda.get_device_properties(args.gpu)
-        free_mem, total_mem = torch.cuda.mem_get_info(args.gpu)
-        free_mem_gb = free_mem / (1024 ** 3)
-        total_mem_gb = total_mem / (1024 ** 3)
-        used_mem_gb = total_mem_gb - free_mem_gb
+    try:
+        # Create dataset and dataloaders
+        # This part depends on your specific dataset implementation
+        # For simplicity, assuming you already have them implemented
+        train_dataloader = None  # Replace with your actual dataloader
+        val_dataloader = None    # Replace with your actual dataloader
         
-        logging.info(f"Using GPU: {gpu_props.name} with {total_mem_gb:.2f}GB memory")
-        logging.info(f"GPU memory usage before loading model: {used_mem_gb:.2f}GB used / {total_mem_gb:.2f}GB total")
-    
-    # Initialize trainer with updated interface
-    trainer = AVSRTrainer(config, gpu=args.gpu)
-    
-    # Train the model
-    results = trainer.train(debug_mode=args.debug)
-    
-    # Log final results
-    if isinstance(results, dict) and results.get('status') == 'success':
-        logging.info("Training completed successfully")
+        # Create model
+        logging.info("Creating AVHuBERT-Whisper model...")
+        model = AVHuBERTWhisperModel(
+            llm_path=config["llm_path"],
+            whisper_model=config["whisper_model"],
+            avhubert_path=config["avhubert_path"],
+            device=device,
+            use_fp16=config["use_fp16"],
+            use_lora=config.get("use_lora", True),
+            lora_r=config.get("lora_r", 16),
+            lora_alpha=config.get("lora_alpha", 32),
+            lora_dropout=config.get("lora_dropout", 0.05),
+            freeze_encoders=config.get("freeze_encoders", True),
+            freeze_llm=config.get("freeze_llm", False),
+            modality=config["modality"],
+            max_seq_len=config.get("max_seq_len", 256),
+            fusion_scale=config.get("fusion_scale", 0.5),
+        )
+        
+        # Create trainer
+        logging.info("Creating trainer...")
+        trainer = AVHuBERTWhisperTrainer(
+            model=model,
+            train_dataloader=train_dataloader,
+            val_dataloader=val_dataloader,
+            learning_rate=config["learning_rate"],
+            weight_decay=config.get("weight_decay", 0.01),
+            max_epochs=config["max_epochs"],
+            output_dir=config["output_dir"],
+            device=device,
+            fp16=config["use_fp16"],
+            grad_accum_steps=config.get("grad_accum_steps", 4),
+            log_interval=config.get("log_interval", 10),
+            save_every=args.save_every or config.get("save_every", 1),
+            save_steps=args.save_steps or config.get("save_steps", None),
+            max_grad_norm=config.get("max_grad_norm", 0.5),
+            warmup_steps=config.get("warmup_steps", 0),
+            log_param_updates=args.log_param_updates,
+        )
+        
+        # Resume from checkpoint if specified
+        start_epoch = 0
+        if args.resume_from:
+            start_epoch = trainer.resume_from_checkpoint(args.resume_from)
+        
+        # Train model
+        logging.info(f"Starting training from epoch {start_epoch}...")
+        trainer.train()
+        
+        logging.info("Training completed successfully!")
         return 0
-    else:
-        logging.error("Training failed")
+    
+    except Exception as e:
+        logging.error(f"Training failed: {e}")
+        logging.error(traceback.format_exc())
         return 1
-
 
 if __name__ == "__main__":
     sys.exit(main()) 

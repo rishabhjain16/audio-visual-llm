@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 import logging
 import numpy as np
@@ -10,6 +11,8 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 import json
 import traceback
+from contextlib import nullcontext
+from pathlib import Path
 
 class ClipWhisperTrainer:
     """
@@ -29,11 +32,33 @@ class ClipWhisperTrainer:
         fp16=False,
         grad_accum_steps=4,
         log_interval=10,
-        save_interval=1,
+        save_every=1,
+        save_steps=None,
         max_grad_norm=0.5,
-        warmup_ratio=0.1,
-        logging_steps=10
+        warmup_steps=0,
+        log_param_updates=False,
     ):
+        """
+        Initialize the trainer
+        
+        Args:
+            model: The model to train
+            train_dataloader: Training dataloader
+            val_dataloader: Validation dataloader (optional)
+            learning_rate: Learning rate for optimizer
+            weight_decay: Weight decay for optimizer
+            max_epochs: Maximum number of epochs to train
+            output_dir: Directory to save outputs
+            device: Device to train on ("cuda" or "cpu")
+            fp16: Whether to use mixed precision training
+            grad_accum_steps: Gradient accumulation steps
+            log_interval: Logging interval (in steps)
+            save_every: Save checkpoint every N epochs
+            save_steps: Save checkpoint every N steps (overrides save_every)
+            max_grad_norm: Maximum gradient norm for clipping
+            warmup_steps: Number of warmup steps for LR scheduler
+            log_param_updates: Whether to log parameter update statistics
+        """
         self.model = model
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
@@ -45,27 +70,34 @@ class ClipWhisperTrainer:
         self.fp16 = fp16
         self.grad_accum_steps = grad_accum_steps
         self.log_interval = log_interval
-        self.save_interval = save_interval
+        self.save_every = save_every
+        self.save_steps = save_steps
         self.max_grad_norm = max_grad_norm
-        self.warmup_ratio = warmup_ratio
+        self.warmup_steps = warmup_steps
+        self.log_param_updates = log_param_updates
         
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
         
-        # Set up optimizer with more stable settings
-        self._setup_optimizer()
+        # Setup model, optimizer and scheduler
+        self.optimizer = self._setup_optimizer()
+        self.scheduler = self._setup_scheduler()
         
-        # Log initialization
-        logging.info(f"Initialized ClipWhisperTrainer with:"
-                   f"\n  Learning rate: {learning_rate}"
-                   f"\n  Weight decay: {weight_decay}"
-                   f"\n  Max epochs: {max_epochs}"
-                   f"\n  Output dir: {output_dir}"
-                   f"\n  Device: {device}"
-                   f"\n  FP16: {fp16}"
-                   f"\n  Gradient accumulation steps: {grad_accum_steps}"
-                   f"\n  Max grad norm: {max_grad_norm}"
-                   f"\n  Warmup ratio: {warmup_ratio}")
+        # Setup gradient scaler for mixed precision training
+        if self.fp16:
+            # Use torch.amp.GradScaler instead of torch.cuda.amp.GradScaler
+            self.scaler = torch.amp.GradScaler('cuda')
+        else:
+            self.scaler = None
+        
+        # Initialize step counter
+        self.global_step = 0
+        
+        # Initialize validation loss tracking
+        self.best_val_loss = float('inf')
+        
+        # Setup logging
+        self._log_training_info()
         
         # Keep track of losses
         self.train_losses = []
@@ -83,27 +115,27 @@ class ClipWhisperTrainer:
         logging.info(f"Gradient accumulation steps: {grad_accum_steps}, Max grad norm: {max_grad_norm}")
     
     def _setup_optimizer(self):
-        """Setup optimizer and learning rate scheduler"""
-        # Get trainable parameters
-        trainable_params = []
+        """Set up the optimizer for training"""
+        # Separate parameters with and without weight decay
+        decay_params = []
         no_decay_params = []
         
         # Log which parts of the model have trainable parameters
         no_grad_count = 0
         trainable_count = 0
         
-        # First collect all trainable parameters
         for name, param in self.model.named_parameters():
+            # Skip frozen parameters
             if not param.requires_grad:
                 no_grad_count += param.numel()
                 continue
-            
-            # Track parameters without weight decay (bias, LayerNorm)
-            if 'bias' in name or 'norm' in name or 'ln' in name:
+                
+            # Don't apply weight decay to bias, LayerNorm, and embeddings
+            if any(nd in name for nd in ['bias', 'LayerNorm', 'layer_norm', 'embedding']):
                 no_decay_params.append(param)
             else:
-                trainable_params.append(param)
-            
+                decay_params.append(param)
+                
             trainable_count += param.numel()
         
         logging.info(f"Total parameters: {no_grad_count + trainable_count:,}")
@@ -111,36 +143,55 @@ class ClipWhisperTrainer:
         
         # Create parameter groups
         optim_groups = [
-            {"params": trainable_params, "weight_decay": self.weight_decay},
+            {"params": decay_params, "weight_decay": self.weight_decay},
             {"params": no_decay_params, "weight_decay": 0.0}
         ]
         
-        # Use a smaller initial learning rate
-        initial_lr = self.learning_rate * 0.1
+        # Ensure learning_rate is a float
+        try:
+            # Use a smaller initial learning rate (10% of base rate)
+            if isinstance(self.learning_rate, str):
+                # Convert string to float if needed
+                initial_lr = float(self.learning_rate) * 0.1
+            else:
+                initial_lr = float(self.learning_rate) * 0.1
+            
+            logging.info(f"Setting initial learning rate to {initial_lr:.2e}")
+        except (ValueError, TypeError) as e:
+            # Fallback to default if conversion fails
+            logging.warning(f"Error converting learning rate: {e}. Using default value.")
+            initial_lr = 5e-6  # Default fallback value
         
         # Create optimizer
-        self.optimizer = AdamW(
+        optimizer = AdamW(
             optim_groups,
             lr=initial_lr,
             betas=(0.9, 0.999),
             eps=1e-8
         )
         
+        logging.info(f"Optimizer: AdamW with initial LR: {initial_lr:.2e}")
+        
+        return optimizer
+    
+    def _setup_scheduler(self):
+        """Set up the learning rate scheduler"""
         # Calculate total steps
         num_training_steps = len(self.train_dataloader) * self.max_epochs // self.grad_accum_steps
         
         # Create scheduler with warmup
-        num_warmup_steps = int(num_training_steps * self.warmup_ratio)
+        num_warmup_steps = int(num_training_steps * 0.1) if self.warmup_steps is None else self.warmup_steps
         
-        self.scheduler = get_linear_schedule_with_warmup(
+        scheduler = get_linear_schedule_with_warmup(
             self.optimizer,
             num_warmup_steps=num_warmup_steps,
             num_training_steps=num_training_steps
         )
         
-        logging.info(f"Optimizer: AdamW with LR: {initial_lr} -> {self.learning_rate}")
-        logging.info(f"Total training steps: {num_training_steps}, Warmup steps: {num_warmup_steps}")
         logging.info(f"Scheduler: Linear warmup with decay")
+        logging.info(f"Total training steps: {num_training_steps}, Warmup steps: {num_warmup_steps}")
+        
+        return scheduler
     
     def train(self):
         """Train the model"""
@@ -191,7 +242,7 @@ class ClipWhisperTrainer:
                     logging.info(f"New best validation loss: {val_loss:.4f}")
             
             # Save checkpoint based on epoch if step-based saving is not enabled
-            if (epoch + 1) % self.save_interval == 0:
+            if (epoch + 1) % self.save_every == 0:
                 self._save_checkpoint()
                 logging.info(f"Checkpoint saved at epoch {epoch+1}")
             
@@ -355,64 +406,63 @@ class ClipWhisperTrainer:
         return avg_loss
     
     def _process_batch(self, batch, batch_idx=0, is_train=True):
-        """Process a batch of data"""
+        """Process a single batch of data"""
         try:
-            # Move batch to device and check for NaN inputs
-            audio = batch["audio"].to(self.device)
-            video = batch["video"].to(self.device)
-            labels = batch["labels"].to(self.device)
-            prompt = batch["prompt"].to(self.device) if "prompt" in batch else None
+            # Extract batch data
+            audio = batch.get("audio", None)
+            video = batch.get("video", None) 
+            labels = batch.get("labels", None)
+            prompt = batch.get("prompt", None)
             
-            # Log batch dimensions
-            if batch_idx % 50 == 0:  # Log every 50 batches to avoid overwhelming logs
-                modality = getattr(self.model, 'modality', 'unknown')
-                logging.info(f"Batch {batch_idx} dimensions [modality={modality}]:")
-                logging.info(f"  Audio: {audio.shape}, {audio.dtype}")
-                logging.info(f"  Video: {video.shape}, {video.dtype}")
-                logging.info(f"  Labels: {labels.shape}, {labels.dtype}")
-                if prompt is not None:
-                    logging.info(f"  Prompt: {prompt.shape}, {prompt.dtype}")
-            
-            # Check for NaN/Inf values in input
-            if torch.isnan(audio).any() or torch.isinf(audio).any():
-                logging.error(f"NaN/Inf in audio input at batch {batch_idx}")
-                audio = torch.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
-            
-            if torch.isnan(video).any() or torch.isinf(video).any():
-                logging.error(f"NaN/Inf in video input at batch {batch_idx}")
-                video = torch.nan_to_num(video, nan=0.0, posinf=0.0, neginf=0.0)
-            
-            # Log shapes for debugging
-            logging.debug(f"Audio shape: {audio.shape}, Video shape: {video.shape}, Labels shape: {labels.shape}")
+            # Move batch data to device if needed
+            if audio is not None:
+                audio = audio.to(self.device)
+            if video is not None:
+                video = video.to(self.device)
+            if labels is not None:
+                labels = labels.to(self.device)
             if prompt is not None:
-                logging.debug(f"Prompt shape: {prompt.shape}")
+                prompt = prompt.to(self.device)
+                
+            # Log batch sizes occasionally to track memory usage
+            if batch_idx % 50 == 0:
+                if audio is not None:
+                    logging.info(f"[Batch {batch_idx}] Audio input shape: {audio.shape}")
+                if video is not None:
+                    logging.info(f"[Batch {batch_idx}] Video input shape: {video.shape}")
+                if labels is not None:
+                    logging.info(f"[Batch {batch_idx}] Labels shape: {labels.shape}")
             
-            # Forward pass with gradient handling
+            # Forward pass through the model
             if is_train:
                 # Zero gradients for first accumulation step
                 if batch_idx % self.grad_accum_steps == 0:
                     self.optimizer.zero_grad()
                 
                 # Forward pass with gradient computation
-                outputs = self.model(
-                    audio=audio,
-                    video=video,
-                    labels=labels,
-                    prompt=prompt,
-                    return_loss=True,
-                )
-            else:
-                # Validation pass without gradients
-                with torch.no_grad():
+                with torch.amp.autocast('cuda') if self.fp16 else nullcontext():
                     outputs = self.model(
                         audio=audio,
                         video=video,
                         labels=labels,
                         prompt=prompt,
                         return_loss=True,
+                        batch_idx=batch_idx,  # Pass batch index for logging
                     )
+            else:
+                # Validation pass without gradients
+                with torch.no_grad():
+                    with torch.amp.autocast('cuda') if self.fp16 else nullcontext():
+                        outputs = self.model(
+                            audio=audio,
+                            video=video,
+                            labels=labels,
+                            prompt=prompt,
+                            return_loss=True,
+                            batch_idx=batch_idx  # Pass batch index for logging
+                        )
             
-            # Get loss with careful error handling
+            # Extract and process loss
             if hasattr(outputs, "loss"):
                 loss = outputs.loss
             elif isinstance(outputs, dict) and "loss" in outputs:
@@ -421,7 +471,7 @@ class ClipWhisperTrainer:
                 logging.info("No loss found in model outputs (expected when LLM is frozen)")
                 # Return a dummy loss of 0.0 that's a proper tensor for stability
                 return torch.tensor(0.0, device=self.device).item()
-            
+                
             # Additional check to handle None loss (when LLM is frozen)
             if loss is None:
                 logging.info("Loss is None (expected when LLM is frozen)")
@@ -437,17 +487,20 @@ class ClipWhisperTrainer:
                 else:
                     # During validation, skip this batch
                     return 0.0
-            
+                    
             # Scale loss for gradient accumulation
             if is_train and self.grad_accum_steps > 1:
                 loss = loss / self.grad_accum_steps
-            
+                
             # Backward pass with gradient handling
             if is_train:
                 try:
                     # Compute gradients
-                    loss.backward()
-                    
+                    if self.fp16:
+                        self.scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
+                        
                     # Check for NaN/Inf in gradients
                     has_bad_gradients = False
                     for name, param in self.model.named_parameters():
@@ -463,74 +516,174 @@ class ClipWhisperTrainer:
                                     # For non-LoRA parameters with bad gradients, skip the update
                                     has_bad_gradients = True
                                     break
-                    
+                                    
                     if has_bad_gradients:
                         logging.warning("Found bad gradients in non-LoRA parameters, skipping update")
                         self.optimizer.zero_grad()
                         return 1.0
-                    
-                    # Clip gradients more aggressively for stability
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), 
-                        max_norm=self.max_grad_norm
-                    )
-                    
-                    if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                        logging.error(f"NaN/Inf gradient norm at batch {batch_idx}")
-                        self.optimizer.zero_grad()
-                        return 1.0
-                    
-                    # Log gradient norm occasionally
-                    if batch_idx % 100 == 0:
-                        logging.info(f"Batch {batch_idx} gradient norm: {grad_norm:.4f}")
-                    
+                        
                     # Step optimizer and scheduler if needed
                     if (batch_idx + 1) % self.grad_accum_steps == 0 or \
                        (batch_idx + 1) == len(self.train_dataloader):
-                        self.optimizer.step()
+                        
+                        if self.fp16:
+                            # First unscale gradients, then clip them, then step optimizer
+                            self.scaler.unscale_(self.optimizer)
+                            
+                            # Clip gradients
+                            grad_norm = torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(), 
+                                max_norm=self.max_grad_norm
+                            )
+                            
+                            # Check for NaN in gradient norm
+                            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                                logging.error(f"NaN/Inf gradient norm at batch {batch_idx}")
+                                self.optimizer.zero_grad()
+                                return 1.0
+                                
+                            # Step optimizer with scaler
+                            self.scaler.step(self.optimizer)
+                            self.scaler.update()
+                        else:
+                            # For non-FP16 mode, clip gradients and step normally
+                            grad_norm = torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(), 
+                                max_norm=self.max_grad_norm
+                            )
+                            
+                            # Check for NaN in gradient norm
+                            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                                logging.error(f"NaN/Inf gradient norm at batch {batch_idx}")
+                                self.optimizer.zero_grad()
+                                return 1.0
+                                
+                            # Step optimizer normally
+                            self.optimizer.step()
+                        
+                        # Step scheduler
                         self.scheduler.step()
+                        
+                        # Log gradient norm occasionally
+                        if batch_idx % 100 == 0:
+                            logging.info(f"Batch {batch_idx} gradient norm: {grad_norm:.4f}")
                         
                 except RuntimeError as e:
                     logging.error(f"Runtime error in backward pass: {e}")
                     self.optimizer.zero_grad()
+                    if self.fp16:
+                        # Reset scaler state if there was an error
+                        self.scaler = torch.amp.GradScaler('cuda')
                     return 1.0
-            
+                    
             # Return loss value
             loss_value = loss.item()
             if np.isnan(loss_value) or np.isinf(loss_value):
                 logging.warning(f"NaN/Inf in final loss value: {loss_value}")
                 return 1.0
-            
+                
+            # Log additional sequence stats occasionally
+            if batch_idx % 100 == 0:
+                stats = getattr(self.model, '_seq_len_stats', None)
+                if stats:
+                    logging.info(f"[Batch {batch_idx}] Sequence length stats - Min: {stats.get('min', 'N/A')}, "
+                               f"Max: {stats.get('max', 'N/A')}, Avg: {stats.get('avg', 'N/A')}")
+                               
             return loss_value
             
         except Exception as e:
-            logging.error(f"Error processing batch: {e}")
+            logging.error(f"Error processing batch: {str(e)}")
             logging.error(traceback.format_exc())
-            return 1.0  # Return a safe value
+            return 1.0  # Default loss on error
     
     def _save_checkpoint(self, is_best=False, is_final=False):
-        """Save a checkpoint"""
-        # Determine path
+        """Save a checkpoint of the model and training state"""
+        checkpoint_dir = os.path.join(self.output_dir, f"checkpoint_step_{self.global_step}")
         if is_final:
-            path = os.path.join(self.output_dir, "final_model")
+            checkpoint_dir = os.path.join(self.output_dir, "final_model")
         elif is_best:
-            path = os.path.join(self.output_dir, "best_model")
-        else:
-            path = os.path.join(self.output_dir, f"model_epoch_{self.current_epoch+1}")
+            checkpoint_dir = os.path.join(self.output_dir, "best_model")
+            
+        os.makedirs(checkpoint_dir, exist_ok=True)
         
         # Save model
-        self.model.save_pretrained(path)
+        model_path = os.path.join(checkpoint_dir, "model")
+        os.makedirs(model_path, exist_ok=True)
+        self.model.save_pretrained(model_path)
         
-        # Save optimizer and scheduler
-        torch.save(
-            {
-                "optimizer": self.optimizer.state_dict(),
-                "scheduler": self.scheduler.state_dict() if self.scheduler else None,
-            },
-            os.path.join(path, "optimizer.pt")
-        )
+        # Save training state (optimizer, scheduler, etc.)
+        training_state = {
+            "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict() if self.scheduler else None,
+            "global_step": self.global_step,
+            "epoch": self.current_epoch,
+            "best_val_loss": self.best_val_loss,
+            "fp16": self.fp16
+        }
         
-        logging.info(f"Saved checkpoint to {path}")
+        # Save scaler state if using fp16
+        if self.fp16 and self.scaler:
+            training_state["scaler"] = self.scaler.state_dict()
+            
+        torch.save(training_state, os.path.join(checkpoint_dir, "training_state.pt"))
+        
+        logging.info(f"Saved checkpoint to {checkpoint_dir}")
+        return checkpoint_dir
+    
+    def load_checkpoint(self, checkpoint_dir):
+        """Load a checkpoint of the model and training state"""
+        try:
+            # Load model
+            model_path = os.path.join(checkpoint_dir, "model")
+            if os.path.exists(model_path):
+                self.model = self.model.__class__.from_pretrained(model_path)
+                self.model.to(self.device)
+                logging.info(f"Loaded model from {model_path}")
+            else:
+                logging.warning(f"No model found at {model_path}")
+                
+            # Load training state
+            training_state_path = os.path.join(checkpoint_dir, "training_state.pt")
+            if os.path.exists(training_state_path):
+                training_state = torch.load(training_state_path, map_location=self.device)
+                
+                # Load optimizer state
+                if "optimizer" in training_state:
+                    self.optimizer.load_state_dict(training_state["optimizer"])
+                    logging.info("Loaded optimizer state")
+                    
+                # Load scheduler state
+                if "scheduler" in training_state and training_state["scheduler"] and self.scheduler:
+                    self.scheduler.load_state_dict(training_state["scheduler"])
+                    logging.info("Loaded scheduler state")
+                    
+                # Load scaler state if using fp16
+                if self.fp16 and "scaler" in training_state and self.scaler:
+                    self.scaler.load_state_dict(training_state["scaler"])
+                    logging.info("Loaded gradient scaler state for mixed precision training")
+                    
+                # Load other training state variables
+                if "global_step" in training_state:
+                    self.global_step = training_state["global_step"]
+                    logging.info(f"Resuming from global step {self.global_step}")
+                    
+                if "epoch" in training_state:
+                    self.current_epoch = training_state["epoch"]
+                    logging.info(f"Resuming from epoch {self.current_epoch}")
+                    
+                if "best_val_loss" in training_state:
+                    self.best_val_loss = training_state["best_val_loss"]
+                    logging.info(f"Best validation loss: {self.best_val_loss:.4f}")
+                    
+                return True
+            else:
+                logging.warning(f"No training state found at {training_state_path}")
+                return False
+                
+        except Exception as e:
+            logging.error(f"Error loading checkpoint: {e}")
+            logging.error(traceback.format_exc())
+            return False
     
     def _plot_loss(self, train_losses, val_losses):
         """Plot loss curves"""
@@ -656,4 +809,33 @@ class ClipWhisperTrainer:
                 
         except Exception as e:
             logging.error(f"Error during dataloader setup: {e}")
-            logging.error(traceback.format_exc()) 
+            logging.error(traceback.format_exc())
+
+    def _log_training_info(self):
+        """Log information about the training configuration"""
+        logging.info("=" * 50)
+        logging.info("ClipWhisperTrainer Configuration:")
+        logging.info("-" * 50)
+        logging.info(f"Output directory: {self.output_dir}")
+        logging.info(f"Max epochs: {self.max_epochs}")
+        logging.info(f"Learning rate: {self.learning_rate}")
+        logging.info(f"Weight decay: {self.weight_decay}")
+        logging.info(f"Device: {self.device}")
+        logging.info(f"FP16 mixed precision: {self.fp16}")
+        logging.info(f"Gradient accumulation steps: {self.grad_accum_steps}")
+        logging.info(f"Log interval: {self.log_interval}")
+        logging.info(f"Save checkpoint every: {self.save_every} epochs")
+        if self.save_steps:
+            logging.info(f"Save checkpoint every: {self.save_steps} steps")
+        logging.info(f"Max gradient norm: {self.max_grad_norm}")
+        logging.info(f"Logging parameter updates: {self.log_param_updates}")
+        logging.info(f"Training samples: {len(self.train_dataloader.dataset) if hasattr(self.train_dataloader, 'dataset') else 'Unknown'}")
+        logging.info(f"Validation samples: {len(self.val_dataloader.dataset) if hasattr(self.val_dataloader, 'dataset') else 'Unknown'}")
+        logging.info(f"Training batches: {len(self.train_dataloader)}")
+        logging.info(f"Validation batches: {len(self.val_dataloader)}")
+        logging.info("-" * 50)
+        
+        # Log model architecture
+        if hasattr(self.model, "_log_model_architecture"):
+            self.model._log_model_architecture()
+        logging.info("=" * 50) 
