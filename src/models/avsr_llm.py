@@ -14,7 +14,7 @@ import time
 
 from .llm_module import LLMModule
 from ..avhubert_whisper.models.av_hubert import AVHuBERTEncoder
-from .whisper_encoder import WhisperEncoder
+from ..avhubert_whisper.models.whisper_encoder import WhisperEncoder
 
 class AVSRLLM(nn.Module):
     """
