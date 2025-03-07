@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # AVSR-LLM: Audio-Visual Speech Recognition with Large Language Models
 
 This repository contains the implementation of AVSR-LLM, a framework for Audio-Visual Speech Recognition using Large Language Models. The codebase is designed to be modular, easy to understand, and extensible for research purposes.
@@ -249,6 +248,3 @@ This code is based on the work from:
 - [VSR-LLM](https://github.com/rishabhjain16/VSR-LLM)
 - [AV-HuBERT](https://github.com/facebookresearch/av_hubert)
 - [Hugging Face Transformers](https://github.com/huggingface/transformers)
-=======
-# AVSR-LLM
->>>>>>> fab0530f1683af90799defa6ed455a7c2e49ac17

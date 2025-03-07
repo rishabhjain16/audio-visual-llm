@@ -5,10 +5,11 @@
 DATA_PATH="/home/rishabh/Desktop/Datasets/lrs3/433h_data"
 OUTPUT_PATH="checkpoints/trained/avsr_llm_output"
 AV_HUBERT_PATH="checkpoints/large_vox_iter5.pt"
-LLM_PATH="checkpoints/Llama-2-7b-hf"
-WHISPER_MODEL="openai/whisper-small"
+LLM_PATH="checkpoints/Llama-3.2-1B"
+WHISPER_MODEL="openai/whisper-medium"
 CONFIG_FILE="configs/default.yaml"
 GPU_ID=0
+DEBUG=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -41,6 +42,10 @@ while [[ $# -gt 0 ]]; do
       GPU_ID="$2"
       shift 2
       ;;
+    --debug)
+      DEBUG="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown option: $1"
       exit 1
@@ -56,6 +61,7 @@ echo "AV-HuBERT path: $AV_HUBERT_PATH"
 echo "LLM path: $LLM_PATH"
 echo "Whisper model: $WHISPER_MODEL"
 echo "Config file: $CONFIG_FILE"
+echo "Debug mode: $DEBUG"
 
 # Check paths exist
 if [ -f "$AV_HUBERT_PATH" ]; then
@@ -73,8 +79,17 @@ else
 fi
 
 # Ensure Whisper model is available
-echo "Ensuring Whisper model is downloaded: $WHISPER_MODEL"
-python -c "from transformers import AutoModel; print('Downloading $WHISPER_MODEL if not already cached...'); AutoModel.from_pretrained('$WHISPER_MODEL')"
+WHISPER_CACHE="checkpoints/whisper/whisper-medium"
+echo "Ensuring Whisper model is available: $WHISPER_MODEL"
+if [ -d "$WHISPER_CACHE" ]; then
+  echo "Using cached Whisper model from: $WHISPER_CACHE"
+else
+  echo "Downloading Whisper model to $WHISPER_CACHE"
+  # Create directory
+  mkdir -p "checkpoints/whisper"
+  # Download model (it will be saved to the checkpoints directory by the WhisperEncoder)
+  python -c "from transformers import WhisperModel, WhisperProcessor; model = WhisperModel.from_pretrained('$WHISPER_MODEL'); processor = WhisperProcessor.from_pretrained('$WHISPER_MODEL'); model.save_pretrained('$WHISPER_CACHE'); processor.save_pretrained('$WHISPER_CACHE'); print('Whisper model downloaded and saved')"
+fi
 echo "Whisper model ready."
 
 # Create output directory

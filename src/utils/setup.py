@@ -26,18 +26,22 @@ def setup_logging(log_file: Optional[Union[str, Path]] = None, level: int = logg
         datefmt="%Y-%m-%d %H:%M:%S"
     )
     
-    # Setup root logger
-    logger = logging.getLogger()
-    logger.setLevel(level)
+    # Setup loggers
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.WARNING)  # Set root logger to WARNING to reduce noise
+    
+    # Set up project logger
+    project_logger = logging.getLogger('src')
+    project_logger.setLevel(level)
     
     # Remove existing handlers
-    for handler in logger.handlers[:]:
-        logger.removeHandler(handler)
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
     
     # Add console handler
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
+    root_logger.addHandler(console_handler)
     
     # Add file handler if log_file is provided
     if log_file is not None:
@@ -46,9 +50,16 @@ def setup_logging(log_file: Optional[Union[str, Path]] = None, level: int = logg
         
         file_handler = logging.FileHandler(log_file)
         file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-        
-        logging.info(f"Logging to {log_file}")
+        root_logger.addHandler(file_handler)
+    
+    # Reduce logging for specific verbose modules
+    logging.getLogger('transformers').setLevel(logging.WARNING)
+    logging.getLogger('peft').setLevel(logging.WARNING)
+    
+    # Log configuration
+    project_logger.info(f"Logging initialized with level={level}")
+    if log_file is not None:
+        project_logger.info(f"Logging to {log_file}")
 
 
 def setup_seed(seed: int = 42):

@@ -39,12 +39,13 @@ class AVSRLLM(nn.Module):
         self.use_video = getattr(config, "use_video", True)
         self.debug = getattr(config, "debug", False)
         
-        # Initialize state
-        self.fusion_module = None
+        # Initialize components
         self.audio_encoder = None
         self.video_encoder = None
+        self.fusion_module = None
         self.audio_projection = None
         self.video_projection = None
+        self.llm_module = None
         
         # Get dimensions from config
         # Handle different config structures (direct attributes or nested under model)
@@ -107,17 +108,14 @@ class AVSRLLM(nn.Module):
                     )
                     logging.info(f"Audio encoder initialized with output dimension: {self.audio_encoder.embedding_dim}")
                     
-                    # Create projection for audio encoder output
-                    if hasattr(self, 'encoder_dim'):
-                        self.audio_projection = nn.Linear(
-                            self.audio_encoder.embedding_dim, 
-                            self.encoder_dim
-                        )
-                        # Convert projection to float16 for memory efficiency
-                        self.audio_projection.weight.data = self.audio_projection.weight.data.to(torch.float16)
-                        if self.audio_projection.bias is not None:
-                            self.audio_projection.bias.data = self.audio_projection.bias.data.to(torch.float16)
-                        logging.info(f"Created audio projection from {self.audio_encoder.embedding_dim} to {self.encoder_dim}")
+                    # Create projections if needed
+                    if self.audio_encoder is not None and hasattr(self.audio_encoder, 'embedding_dim'):
+                        audio_dim = self.audio_encoder.embedding_dim
+                        if audio_dim != self.encoder_dim:
+                            logging.info(f"Creating audio projection from {audio_dim} to {self.encoder_dim}")
+                            self.audio_projection = nn.Linear(audio_dim, self.encoder_dim)
+                            # Ensure it's float32
+                            self.audio_projection = self.audio_projection.to(torch.float32)
                 else:
                     logging.error("No whisper_path provided in config. This is required for audio processing!")
                     logging.error("Please set whisper_path in your config file")
@@ -133,64 +131,45 @@ class AVSRLLM(nn.Module):
                 logging.info("Initializing video encoder...")
                 
                 # Check if av_encoder_path is provided
-                if hasattr(config, "av_encoder_path") and config.av_encoder_path:
-                    av_encoder_path = config.av_encoder_path
-                    logging.info(f"Using AV-HuBERT model from: {av_encoder_path}")
-                    
-                    # Log the absolute path for debugging
-                    abs_path = os.path.abspath(av_encoder_path) if not os.path.isabs(av_encoder_path) else av_encoder_path
-                    logging.info(f"Absolute path to AV-HuBERT model: {abs_path}")
-                    
-                    # Check file permissions
-                    if os.path.exists(abs_path):
-                        try:
-                            with open(abs_path, 'rb') as f:
-                                # Just checking if we can read the file
-                                pass
-                            logging.info(f"Successfully verified read access to AV-HuBERT model file")
-                        except PermissionError:
-                            logging.error(f"Permission denied when accessing AV-HuBERT model file: {abs_path}")
-                            logging.error(f"Please check file permissions")
-                            raise
-                    else:
-                        # List files in the directory to help diagnose the issue
-                        parent_dir = os.path.dirname(abs_path)
-                        if os.path.exists(parent_dir):
-                            files = os.listdir(parent_dir)
-                            logging.error(f"AV-HuBERT model file not found: {abs_path}")
-                            logging.error(f"Files in parent directory ({parent_dir}): {files[:10]}")
-                            if len(files) > 10:
-                                logging.error(f"... and {len(files) - 10} more files")
-                        else:
-                            logging.error(f"AV-HuBERT model directory not found: {parent_dir}")
-                        raise FileNotFoundError(f"AV-HuBERT model file not found: {abs_path}")
-                    
-                    # Initialize AV-HuBERT for video
-                    logging.info(f"Initializing AV-HuBERT encoder from {av_encoder_path}")
-                    
-                    # Create AVHuBERT encoder with output dimension matching LLM dimension
-                    self.video_encoder = AVHuBERTEncoder(
-                        checkpoint_path=av_encoder_path,
-                        layer=getattr(config.model, "avhubert_layer", -1) if hasattr(config, 'model') else -1,
-                        use_audio=False,
-                        use_video=True,
-                        freeze=getattr(config, "freeze_av_encoder", True),
-                        finetune_layers=getattr(config, "finetune_avhubert_layers", []),
-                        output_dim=self.llm_dim  # Ensure output dimension matches LLM
-                    )
-                    logging.info(f"Video encoder initialized with output dimension: {self.video_encoder.embedding_dim}")
-                    
-                    # Create projection for video encoder output
-                    if hasattr(self, 'encoder_dim'):
-                        self.video_projection = nn.Linear(
-                            self.video_encoder.embedding_dim,
-                            self.encoder_dim
+                av_encoder_path = getattr(config, "av_encoder_path", None)
+                if av_encoder_path:
+                    try:
+                        from .av_hubert import AVHuBERTEncoder
+                        
+                        # Check if the model path exists
+                        if not os.path.exists(av_encoder_path):
+                            logging.error(f"AV-HuBERT model path does not exist: {av_encoder_path}")
+                            raise FileNotFoundError(f"AV-HuBERT model not found at {av_encoder_path}")
+                        
+                        # Log absolute path for debugging
+                        abs_path = os.path.abspath(av_encoder_path)
+                        logging.info(f"Initializing AV-HuBERT encoder from: {abs_path}")
+                        
+                        # Initialize the encoder
+                        self.video_encoder = AVHuBERTEncoder(
+                            checkpoint_path=av_encoder_path,
+                            use_audio=getattr(config, "use_avhubert_audio", False),  # Default to not using audio from AV-HuBERT
+                            use_video=True,
+                            freeze=getattr(config, "freeze_video_encoder", True),
+                            output_dim=self.llm_dim
                         )
-                        # Convert projection to float16 for memory efficiency
-                        self.video_projection.weight.data = self.video_projection.weight.data.to(torch.float16)
-                        if self.video_projection.bias is not None:
-                            self.video_projection.bias.data = self.video_projection.bias.data.to(torch.float16)
-                        logging.info(f"Created video projection from {self.video_encoder.embedding_dim} to {self.encoder_dim}")
+                        logging.info(f"Video encoder initialized with output dimension: {self.video_encoder.embedding_dim} (projected to {self.llm_dim})")
+                        
+                        # No need for additional projection since AVHuBERTEncoder handles projection internally
+                        self.video_projection = None
+                        
+                        # Create projections if needed
+                        if self.video_encoder is not None and hasattr(self.video_encoder, 'output_dim'):
+                            video_dim = self.video_encoder.output_dim
+                            if video_dim != self.encoder_dim:
+                                logging.info(f"Creating video projection from {video_dim} to {self.encoder_dim}")
+                                self.video_projection = nn.Linear(video_dim, self.encoder_dim)
+                                # Ensure it's float32
+                                self.video_projection = self.video_projection.to(torch.float32)
+                    except Exception as e:
+                        logging.error(f"Error initializing video encoder: {e}")
+                        logging.error(traceback.format_exc())
+                        self.use_video = False
                 else:
                     logging.error("No av_encoder_path provided in config. This is required!")
                     logging.error("Please set av_encoder_path in your config file to the path of your AV-HuBERT model")
@@ -204,8 +183,42 @@ class AVSRLLM(nn.Module):
         if not self.use_audio and not self.use_video:
             logging.error("Both audio and video encoders failed to initialize! Model will not function correctly.")
         
+        # Initialize fusion module
+        if self.use_audio and self.use_video:
+            try:
+                from .fusion import SimpleFusion
+                
+                # Get encoder dimensions
+                audio_dim = self.audio_encoder.embedding_dim if hasattr(self.audio_encoder, 'embedding_dim') else 1024
+                video_dim = self.video_encoder.embedding_dim if hasattr(self.video_encoder, 'embedding_dim') else 1024
+                
+                logging.info(f"Using encoder dims: audio_dim={audio_dim}, video_dim={video_dim}, output_dim={self.encoder_dim}")
+                
+                # Create fusion module with fp16 support
+                self.fusion_module = SimpleFusion(
+                    audio_dim=audio_dim, 
+                    video_dim=video_dim, 
+                    output_dim=self.encoder_dim, 
+                    use_fp16=True  # Use fp16 for better efficiency
+                )
+                
+                logging.info(f"Fusion module initialized: {type(self.fusion_module).__name__}")
+                
+                # Freeze fusion if specified
+                if getattr(config, "freeze_fusion", False):
+                    for param in self.fusion_module.parameters():
+                        param.requires_grad = False
+                    logging.info("Fusion module is frozen")
+                
+            except Exception as e:
+                logging.error(f"Error initializing fusion module: {e}")
+                logging.error(traceback.format_exc())
+                self.fusion_module = None
+        else:
+            logging.info("Only one modality is used, no fusion module needed")
+            self.fusion_module = None
+        
         # Initialize LLM module
-        self.llm_module = None
         if hasattr(config, "llm_path") and config.llm_path:
             try:
                 llm_path = config.llm_path
@@ -300,210 +313,204 @@ class AVSRLLM(nn.Module):
         Encode audio and video inputs
         
         Args:
-            audio: Audio input tensor [batch_size, seq_len, feat_dim]
-            video: Video input tensor [batch_size, seq_len, feat_dim]
+            audio: Audio tensor of shape [B, T]
+            video: Video tensor of shape [B, T, H, W, C]
             
         Returns:
-            encoder_out: Encoded features
-            encoder_padding_mask: Padding mask for encoded features
+            Tuple of (encoder_output, padding_mask)
+            encoder_output: Tensor of shape [B, T, D]
+            padding_mask: Tensor of shape [B, T] - True for padded positions
         """
-        # Get max sequence length setting from config or use default
-        max_seq_len = getattr(self.config, "max_seq_len", 250)  # Default to 250 if not specified
-        
-        # Get device and dtype for consistent tensor properties
-        device = next(self.parameters()).device
-        # Use float16 for memory efficiency and speed
-        dtype = torch.float16
-        
-        # Initialize outputs
-        audio_out = None
-        video_out = None
-        
-        # Process audio if available
-        if audio is not None and audio.size(0) > 0 and self.use_audio:
-            if self.audio_encoder is None:
-                logging.error("Audio encoder is not initialized! Make sure the whisper_path is correct.")
-            else:
+        try:
+            # Get device
+            device = next(self.parameters()).device
+            
+            # Process audio input
+            audio_out = None
+            if audio is not None and self.audio_encoder is not None:
+                # Move audio to the correct device if necessary
+                if audio.device != device:
+                    logging.info(f"Moving audio from {audio.device} (dtype: {audio.dtype}) to {device} (dtype: {audio.dtype})")
+                    audio = audio.to(device)
+                
+                # Convert audio to float32 for better compatibility
+                if audio.dtype != torch.float32:
+                    logging.info(f"Converting audio from {audio.dtype} to float32")
+                    audio = audio.to(dtype=torch.float32)
+                
+                # Encode audio
                 try:
-                    # Check audio dimensions
-                    if len(audio.shape) != 2:
-                        logging.error(f"Expected 2D audio [batch_size, time], got shape {audio.shape}")
-                        # Reshape if possible
-                        if len(audio.shape) == 3:  # [batch, time, features]
-                            audio = audio.mean(dim=2)
-                            logging.warning(f"Reshaped 3D audio to 2D: {audio.shape}")
-                    
-                    # Ensure audio is on the correct device and dtype
-                    if audio.device != device or audio.dtype != dtype:
-                        logging.info(f"Moving audio from {audio.device} (dtype: {audio.dtype}) to {device} (dtype: {dtype})")
-                        audio = audio.to(device=device, dtype=dtype)
-                    
-                    # Log audio stats for debugging
-                    logging.debug(f"Audio min: {audio.min().item()}, max: {audio.max().item()}, mean: {audio.mean().item()}")
-                    if torch.isnan(audio).any():
-                        logging.warning("Audio contains NaN values!")
-                        # Replace NaNs with zeros
-                        audio = torch.nan_to_num(audio, nan=0.0)
-                    
-                    # Encode audio
                     audio_out = self.audio_encoder(audio)
                     
-                    if audio_out is None:
-                        logging.warning("Audio encoder returned None. Using random features.")
-                        # Create random features
-                        batch_size = audio.size(0)
-                        seq_len = 4
-                        audio_out = torch.randn(
-                            batch_size, seq_len, self.audio_encoder.embedding_dim,
-                            device=device, dtype=dtype
-                        )
-                    else:
-                        logging.info(f"Audio encoded successfully: shape={audio_out.shape}")
-                    
-                    # Ensure consistent dtype
-                    if audio_out.dtype != dtype:
-                        audio_out = audio_out.to(dtype=dtype)
-                    
-                    # Limit sequence length if needed for VRAM management
-                    orig_seq_len = audio_out.size(1)
-                    if orig_seq_len > max_seq_len:
-                        logging.info(f"Truncating audio output from {orig_seq_len} to {max_seq_len}")
-                        logging.info(f"  (To use more context, increase max_seq_len in your config)")
-                        audio_out = audio_out[:, :max_seq_len, :]
-                    
-                    # Apply projection if needed
-                    if hasattr(self, 'audio_projection') and self.audio_projection is not None:
-                        try:
+                    if audio_out is not None:
+                        logging.info(f"Audio encoded successfully: shape={audio_out.shape}, dtype={audio_out.dtype}")
+                        
+                        # Convert to float32 if needed
+                        if audio_out.dtype != torch.float32:
+                            logging.info(f"Converting audio output from {audio_out.dtype} to float32")
+                            audio_out = audio_out.to(torch.float32)
+                        
+                        # Project audio features if necessary
+                        if hasattr(self, 'audio_projection') and self.audio_projection is not None and audio_out.size(-1) != self.encoder_dim:
+                            logging.info(f"Applying audio projection: {audio_out.size(-1)} -> {self.encoder_dim}")
+                            
+                            # Ensure projection weights are float32
+                            if self.audio_projection.weight.dtype != torch.float32:
+                                logging.info(f"Converting audio_projection from {self.audio_projection.weight.dtype} to float32")
+                                self.audio_projection = self.audio_projection.to(torch.float32)
+                                
                             audio_out = self.audio_projection(audio_out)
-                            logging.debug(f"Applied audio projection: {audio_out.shape}")
-                        except Exception as e:
-                            logging.error(f"Error in audio projection: {e}")
-                            # Try to handle dimension mismatch
-                            if "mat1 and mat2 shapes cannot be multiplied" in str(e) and hasattr(self, 'encoder_dim'):
-                                # Create a new projection on the fly
-                                logging.warning(f"Creating emergency projection from {audio_out.size(-1)} to {self.encoder_dim}")
-                                emergency_proj = nn.Linear(audio_out.size(-1), self.encoder_dim, device=device)
-                                audio_out = emergency_proj(audio_out)
-                            else:
-                                raise
+                            logging.debug(f"Audio features projected: shape={audio_out.shape}")
                 except Exception as e:
-                    logging.error(f"Error processing audio: {e}")
+                    logging.error(f"Error encoding audio: {e}")
                     logging.error(traceback.format_exc())
                     audio_out = None
-        
-        # Process video if available
-        if video is not None and video.size(0) > 0 and self.use_video:
-            if self.video_encoder is None:
-                logging.error("Video encoder is not initialized! Make sure the av_encoder_path is correct.")
-            else:
+            
+            # Process video input
+            video_out = None
+            if video is not None and self.video_encoder is not None:
+                # Move video to the correct device if necessary
+                if video.device != device:
+                    logging.info(f"Moving video from {video.device} (dtype: {video.dtype}) to {device} (dtype: {video.dtype})")
+                    video = video.to(device)
+                
+                logging.info(f"Video input shape: {video.shape}")
+                
+                # Convert video to float32 for better compatibility
+                if video.dtype != torch.float32:
+                    logging.info(f"Converting video from {video.dtype} to float32")
+                    video = video.to(dtype=torch.float32)
+                
+                # Encode video
                 try:
-                    # Ensure video is on the correct device and dtype
-                    if video.device != device or video.dtype != dtype:
-                        logging.info(f"Moving video from {video.device} (dtype: {video.dtype}) to {device} (dtype: {dtype})")
-                        video = video.to(device=device, dtype=dtype)
-                    
-                    # Encode video
                     video_out = self.video_encoder(video)
+                    logging.info(f"Video encoded successfully: shape={video_out.shape}, dtype={video_out.dtype}")
                     
-                    # Check if video encoding was successful
-                    if video_out is not None:
-                        logging.info(f"Video encoded successfully: shape={video_out.shape}")
-                        
-                        # Ensure consistent dtype
-                        if video_out.dtype != dtype:
-                            video_out = video_out.to(dtype=dtype)
-                        
-                        # Limit sequence length if needed for VRAM management
-                        orig_seq_len = video_out.size(1)
-                        if orig_seq_len > max_seq_len:
-                            logging.info(f"Truncating video output from {orig_seq_len} to {max_seq_len}")
-                            logging.info(f"  (To use more context, increase max_seq_len in your config)")
-                            video_out = video_out[:, :max_seq_len, :]
-                        
-                        # Apply projection if needed
-                        if hasattr(self, 'video_projection') and self.video_projection is not None:
-                            video_out = self.video_projection(video_out)
-                            # Ensure consistent dtype after projection
-                            if video_out.dtype != dtype:
-                                video_out = video_out.to(dtype=dtype)
-                        elif video_out is not None:
-                            logging.error("Video projection is missing but video is encoded! Check model initialization.")
-                    else:
-                        logging.warning("Video encoder returned None for video_out")
+                    # Convert to float32 if needed
+                    if video_out.dtype != torch.float32:
+                        logging.info(f"Converting video output from {video_out.dtype} to float32")
+                        video_out = video_out.to(torch.float32)
                     
+                    # Project video features if necessary
+                    if hasattr(self, 'video_projection') and self.video_projection is not None and video_out.size(-1) != self.encoder_dim:
+                        logging.info(f"Applying video projection: {video_out.size(-1)} -> {self.encoder_dim}")
+                        video_out = self.video_projection(video_out)
+                        logging.debug(f"Video features projected: shape={video_out.shape}")
                 except Exception as e:
                     logging.error(f"Error encoding video: {e}")
                     logging.error(traceback.format_exc())
                     video_out = None
-        
-        # Check if at least one modality was processed
-        if audio_out is None and video_out is None:
-            logging.warning("No valid inputs for encoder, returning None")
+            
+            # Check if at least one modality was processed
+            if audio_out is None and video_out is None:
+                logging.warning("No valid inputs for encoder, returning None, None")
+                return None, None
+            
+            # Return the appropriate output based on available modalities
+            if audio_out is not None and video_out is not None:
+                # Multimodal case - both audio and video available
+                
+                # Ensure both are float32
+                if audio_out.dtype != torch.float32:
+                    logging.info(f"Converting audio output from {audio_out.dtype} to float32")
+                    audio_out = audio_out.to(torch.float32)
+                
+                if video_out.dtype != torch.float32:
+                    logging.info(f"Converting video output from {video_out.dtype} to float32")
+                    video_out = video_out.to(torch.float32)
+                
+                # Check sequence length mismatch
+                if audio_out.size(1) != video_out.size(1):
+                    logging.warning(f"Sequence length mismatch: audio {audio_out.size(1)}, video {video_out.size(1)}")
+                    min_seq = min(audio_out.size(1), video_out.size(1))
+                    audio_out = audio_out[:, :min_seq, :]
+                    video_out = video_out[:, :min_seq, :]
+                
+                # Apply fusion module if available
+                if self.fusion_module is not None:
+                    try:
+                        encoder_out = self.fusion_module(audio_out, video_out)
+                        logging.info(f"Applied fusion module: output shape {encoder_out.shape}")
+                    except Exception as e:
+                        logging.error(f"Error in fusion module: {e}")
+                        logging.error(traceback.format_exc())
+                        # Fall back to simple concatenation
+                        logging.warning("Falling back to simple concatenation due to fusion error")
+                        try:
+                            # Ensure both tensors have the same data type (float32)
+                            if audio_out.dtype != torch.float32:
+                                audio_out = audio_out.to(torch.float32)
+                            if video_out.dtype != torch.float32:
+                                video_out = video_out.to(torch.float32)
+                                
+                            concat_out = torch.cat([audio_out, video_out], dim=-1)
+                            logging.info(f"Concatenated features: shape={concat_out.shape}, dtype={concat_out.dtype}")
+                            
+                            # Project to expected dimension if needed
+                            if concat_out.size(-1) != self.encoder_dim:
+                                if not hasattr(self, 'concat_proj') or self.concat_proj is None:
+                                    logging.info(f"Creating emergency concat projection from {concat_out.size(-1)} to {self.encoder_dim}")
+                                    self.concat_proj = nn.Linear(concat_out.size(-1), self.encoder_dim).to(device=concat_out.device, dtype=torch.float32)
+                                
+                                # Ensure projection is float32
+                                if self.concat_proj.weight.dtype != torch.float32:
+                                    logging.info(f"Converting concat_proj from {self.concat_proj.weight.dtype} to float32")
+                                    self.concat_proj = self.concat_proj.to(torch.float32)
+                                
+                                encoder_out = self.concat_proj(concat_out)
+                            else:
+                                encoder_out = concat_out
+                        except Exception as e:
+                            logging.error(f"Error in encode method: {e}")
+                            logging.error(traceback.format_exc())
+                            # Fall back to audio only as a last resort
+                            logging.warning("Concatenation failed, using audio features only")
+                            encoder_out = audio_out
+                else:
+                    # No fusion module, just concatenate and project if needed
+                    logging.warning("No fusion module defined, using simple concatenation")
+                    concat_out = torch.cat([audio_out, video_out], dim=-1)
+                    # Project to expected dimension if needed
+                    if concat_out.size(-1) != self.encoder_dim:
+                        if not hasattr(self, 'concat_proj'):
+                            logging.info(f"Creating emergency concat projection from {concat_out.size(-1)} to {self.encoder_dim}")
+                            self.concat_proj = nn.Linear(concat_out.size(-1), self.encoder_dim, device=concat_out.device)
+                        encoder_out = self.concat_proj(concat_out)
+                    else:
+                        encoder_out = concat_out
+                
+                # Create padding mask (all False if no padding)
+                encoder_padding_mask = torch.zeros(encoder_out.size(0), encoder_out.size(1), dtype=torch.bool, device=encoder_out.device)
+                
+                return encoder_out, encoder_padding_mask
+            
+            # Single modality case - only audio or only video
+            elif audio_out is not None:
+                # Only audio available
+                logging.info("Using audio modality only")
+                
+                # Create padding mask (all False if no padding)
+                encoder_padding_mask = torch.zeros(audio_out.size(0), audio_out.size(1), dtype=torch.bool, device=audio_out.device)
+                
+                return audio_out, encoder_padding_mask
+            
+            # Only video available
+            elif video_out is not None:
+                logging.info("Using video modality only")
+                
+                # Create padding mask (all False if no padding)
+                encoder_padding_mask = torch.zeros(video_out.size(0), video_out.size(1), dtype=torch.bool, device=video_out.device)
+                
+                return video_out, encoder_padding_mask
+            
+            # Fallback - should never reach here if checks above are correct
+            logging.error("Unexpected condition in encode method - no valid outputs but didn't return None, None")
             return None, None
             
-        # Combine features if both modalities are available
-        if audio_out is not None and video_out is not None:
-            # Ensure same batch size
-            if audio_out.size(0) != video_out.size(0):
-                logging.warning(f"Batch size mismatch: audio {audio_out.size(0)}, video {video_out.size(0)}")
-                # Use the smallest batch size
-                min_batch = min(audio_out.size(0), video_out.size(0))
-                audio_out = audio_out[:min_batch]
-                video_out = video_out[:min_batch]
-            
-            # Ensure same sequence length
-            if audio_out.size(1) != video_out.size(1):
-                # Use the smallest sequence length
-                min_seq = min(audio_out.size(1), video_out.size(1))
-                audio_out = audio_out[:, :min_seq, :]
-                video_out = video_out[:, :min_seq, :]
-            
-            # Ensure consistent dtype
-            if audio_out.dtype != dtype:
-                audio_out = audio_out.to(dtype=dtype)
-            if video_out.dtype != dtype:
-                video_out = video_out.to(dtype=dtype)
-            
-            # Apply fusion module if available
-            if self.fusion_module is not None:
-                encoder_out = self.fusion_module(audio_out, video_out)
-            else:
-                # Simple concatenation along feature dimension
-                encoder_out = torch.cat([audio_out, video_out], dim=2)
-            
-            # Ensure consistent dtype after fusion
-            if encoder_out.dtype != dtype:
-                encoder_out = encoder_out.to(dtype=dtype)
-            
-            # Create padding mask (all False if no padding)
-            encoder_padding_mask = torch.zeros(encoder_out.size(0), encoder_out.size(1), dtype=torch.bool, device=encoder_out.device)
-            
-            return encoder_out, encoder_padding_mask
-            
-        # Use only audio if available
-        elif audio_out is not None:
-            # Ensure consistent dtype
-            if audio_out.dtype != dtype:
-                audio_out = audio_out.to(dtype=dtype)
-            
-            # Create padding mask (all False if no padding)
-            encoder_padding_mask = torch.zeros(audio_out.size(0), audio_out.size(1), dtype=torch.bool, device=audio_out.device)
-            
-            return audio_out, encoder_padding_mask
-            
-        # Use only video if available
-        elif video_out is not None:
-            # Ensure consistent dtype
-            if video_out.dtype != dtype:
-                video_out = video_out.to(dtype=dtype)
-            
-            # Create padding mask (all False if no padding)
-            encoder_padding_mask = torch.zeros(video_out.size(0), video_out.size(1), dtype=torch.bool, device=video_out.device)
-            
-            return video_out, encoder_padding_mask
-            
-        # Should never reach here due to earlier check
-        return None, None
+        except Exception as e:
+            logging.error(f"Error in encode method: {e}")
+            logging.error(traceback.format_exc())
+            return None, None
     
     def forward(
         self,
@@ -602,14 +609,20 @@ class AVSRLLM(nn.Module):
             
             # Add any additional kwargs
             for k, v in kwargs.items():
-                if k not in llm_inputs:
+                if k not in llm_inputs and k != 'debug':  # Filter out 'debug' parameter
                     llm_inputs[k] = v
             
             # Forward pass through LLM
             if self.llm_module is None:
                 logging.error("LLM module is None! This could be due to initialization failure.")
                 dummy_loss = torch.tensor(float('nan'), device=device, requires_grad=True)
-                return {"loss": dummy_loss}
+                # Return a dictionary with dummy values to avoid breaking the training loop
+                return {
+                    "loss": dummy_loss,
+                    "logits": torch.randn(1, 1, 1000, device=device),  # Dummy logits
+                    "input_shape": encoder_out.shape if encoder_out is not None else (1, 1, self.fusion_dim),
+                    "dummy_output": True  # Flag to indicate this is a dummy output
+                }
                 
             outputs = self.llm_module(**llm_inputs)
             

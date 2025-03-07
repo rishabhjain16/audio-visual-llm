@@ -208,15 +208,34 @@ class AVSRTrainer:
     def _setup_trainer(self):
         """Setup any additional trainer configuration needed"""
         try:
-            logger.info("Setting up trainer configuration...")
+            # Create TensorBoard logger
+            self.tb_logger = TensorBoardLogger(
+                save_dir=self.log_dir,
+                name="tensorboard"
+            )
             
-            # Create output directory if it doesn't exist
-            if not os.path.exists(self.output_dir):
-                os.makedirs(self.output_dir)
-                logger.info(f"Created output directory: {self.output_dir}")
-                
-            # You can add more trainer setup code here
-                
+            # Create checkpoint callback
+            self.checkpoint_callback = ModelCheckpoint(
+                dirpath=self.checkpoint_dir,
+                filename="model-{epoch:02d}-{val_loss:.4f}",
+                monitor="val_loss",
+                save_top_k=3,
+                mode="min"
+            )
+            
+            # Create early stopping callback
+            patience = getattr(self.config.training, "early_stopping_patience", 5)
+            self.early_stopping_callback = EarlyStopping(
+                monitor="val_loss",
+                patience=patience,
+                mode="min"
+            )
+            
+            # Create learning rate monitor
+            self.lr_monitor = LearningRateMonitor(logging_interval="step")
+            
+            logger.info(f"Trainer setup complete with early stopping patience={patience}")
+            
         except Exception as e:
             logger.error(f"Error during trainer setup: {e}")
             logger.error(traceback.format_exc())
@@ -232,8 +251,8 @@ class AVSRTrainer:
                 return
             
             # Import dataset modules
-    from ..data.dataset import AVSRDataset, create_dataloader
-    
+            from ..data.dataset import AVSRDataset, create_dataloader
+            
             # Get configuration for data
             if hasattr(self.config, 'data'):
                 data_config = self.config.data
@@ -265,15 +284,15 @@ class AVSRTrainer:
                 else:
                     # Create training dataset
                     logger.info(f"Creating training dataset from {train_manifest}")
-    train_dataset = AVSRDataset(
+                    train_dataset = AVSRDataset(
                         manifest_path=train_manifest,
                         label_path=train_labels,
                         root_dir=data_path,
                         max_audio_length=max_audio_length,
                         max_video_length=max_video_length,
-        split="train"
-    )
-    
+                        split="train"
+                    )
+                    
                     # Create training dataloader
                     self.train_dataloader = create_dataloader(
                         train_dataset,
@@ -288,15 +307,15 @@ class AVSRTrainer:
                 # Create validation dataset if available
                 if os.path.exists(val_manifest) and os.path.exists(val_labels):
                     logger.info(f"Creating validation dataset from {val_manifest}")
-    val_dataset = AVSRDataset(
+                    val_dataset = AVSRDataset(
                         manifest_path=val_manifest,
                         label_path=val_labels,
                         root_dir=data_path,
                         max_audio_length=max_audio_length,
                         max_video_length=max_video_length,
-        split="val"
-    )
-    
+                        split="val"
+                    )
+                    
                     # Create validation dataloader
                     self.val_dataloader = create_dataloader(
                         val_dataset,
@@ -357,24 +376,48 @@ class AVSRTrainer:
                 if field in batch:
                     model_inputs[field] = batch[field]
             
-            # Ensure we're using batch size 1 for stability
+            # Get batch size from inputs
+            batch_size = None
             for field in ['audio', 'video']:
                 if field in model_inputs and model_inputs[field] is not None:
-                    if model_inputs[field].size(0) > 1:
-                        model_inputs[field] = model_inputs[field][:1]
+                    batch_size = model_inputs[field].size(0)
+                    break
+            
+            # If no batch size found, use 1
+            if batch_size is None:
+                batch_size = 1
+                logger.warning("Could not determine batch size from inputs, using batch_size=1")
+            
+            # Ensure all inputs have the same batch size
+            for field in ['audio', 'video']:
+                if field in model_inputs and model_inputs[field] is not None:
+                    if model_inputs[field].size(0) != batch_size:
+                        logger.warning(f"Batch size mismatch for {field}: got {model_inputs[field].size(0)}, expected {batch_size}")
+                        model_inputs[field] = model_inputs[field][:batch_size]
             
             # Get text labels if available for proper training
             if 'text' in batch and 'labels' not in model_inputs:
-                model_inputs['labels'] = batch['text']
+                # Ensure labels have the same batch size
+                if isinstance(batch['text'], torch.Tensor) and batch['text'].size(0) != batch_size:
+                    logger.warning(f"Batch size mismatch for labels: got {batch['text'].size(0)}, expected {batch_size}")
+                    model_inputs['labels'] = batch['text'][:batch_size]
+                else:
+                    model_inputs['labels'] = batch['text']
                 logger.debug(f"Using text field as labels: {batch['text']}")
+            elif 'labels' in model_inputs:
+                # Ensure labels have the same batch size
+                if isinstance(model_inputs['labels'], torch.Tensor) and model_inputs['labels'].size(0) != batch_size:
+                    logger.warning(f"Batch size mismatch for labels: got {model_inputs['labels'].size(0)}, expected {batch_size}")
+                    model_inputs['labels'] = model_inputs['labels'][:batch_size]
             
             # Set training flag
             model_inputs['return_loss'] = is_train
             
             # Add debug flag if needed
             if getattr(self, 'debug', False):
-                model_inputs['debug'] = True
-                
+                # Don't pass debug to the model, just log it
+                logger.debug("Running in debug mode")
+            
             # Forward pass
             outputs = self.model(**model_inputs)
             
@@ -411,17 +454,7 @@ class AVSRTrainer:
             if is_train and loss.requires_grad:
                 loss.backward()
                 
-            # Always use batch_size 1 for consistency
-            batch_size = 1
-                
-            # Log GPU memory
-            if torch.cuda.is_available() and is_train and getattr(self, 'debug', False):
-                free_mem, total_mem = torch.cuda.mem_get_info(self.device.index)
-                free_mem = free_mem / (1024 ** 3)  # Convert to GB
-                total_mem = total_mem / (1024 ** 3)  # Convert to GB
-                used_mem = total_mem - free_mem
-                logger.debug(f"GPU memory: {used_mem:.2f}GB used / {total_mem:.2f}GB total")
-                
+            # Return the actual batch size used
             return loss, batch_size
             
         except Exception as e:
@@ -541,65 +574,17 @@ class AVSRTrainer:
             # Set debug flag
             self.debug = debug_mode
             
-            # TEMPORARY: Run in inference-only mode for testing
-            logger.info("RUNNING IN INFERENCE-ONLY MODE FOR TESTING")
-            
-            # Run for a few steps in inference mode
-            try:
-                self.model.eval()  # Set model to evaluation mode
-                
-                with torch.no_grad():
-                    for batch_idx, batch in enumerate(self.train_dataloader):
-                        if batch_idx >= 5:  # Only run for 5 steps
-                            break
-                            
-                        # Log progress
-                        logger.info(f"Inference test | Batch {batch_idx}")
-                        
-                        # Process batch WITHOUT computing loss (inference mode)
-                        batch_inputs = {}
-                        # Extract audio and video inputs
-                        if isinstance(batch, dict):
-                            if 'audio' in batch:
-                                batch_inputs['audio'] = batch['audio'][:1]  # Use batch size 1
-                            if 'video' in batch:
-                                batch_inputs['video'] = batch['video'][:1]  # Use batch size 1
-                        
-                        # Add debug flag
-                        batch_inputs['debug'] = debug_mode
-                        
-                        # Forward pass with no labels
-                        outputs = self.model(**batch_inputs, return_loss=False)
-                        
-                        # Log the model outputs
-                        if hasattr(outputs, 'logits'):
-                            logger.info(f"Model produced logits with shape {outputs.logits.shape}")
-                        
-                        # Flush GPU memory
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                    
-                logger.info("Completed inference testing!")
-                
-                # Exit early after inference testing
-                return {"status": "completed_inference_test"}
-                
-            except Exception as e:
-                logger.error(f"Error during inference testing: {e}")
-                logger.error(traceback.format_exc())
-                return {"status": "failed_inference_test", "error": str(e)}
-            
             # Setup timers and state
             logger.info("Starting model training...")
             
             # Check if model and dataloaders exist
             if self.model is None:
                 logger.error("No model available for training")
-                return
+                return {"status": "error", "message": "No model available for training"}
                 
             if self.train_dataloader is None:
                 logger.error("No training dataloader available")
-                return
+                return {"status": "error", "message": "No training dataloader available"}
             
             # Set model to training mode
             self.model.train()
@@ -888,7 +873,7 @@ def train_avsr_llm(config):
                 logger.info("Training was successful")
                 if 'best_val_loss' in results:
                     logger.info(f"Best validation loss: {results['best_val_loss']:.4f}")
-    else:
+            else:
                 logger.error(f"Training failed: {results.get('message', 'Unknown error')}")
         
         return results

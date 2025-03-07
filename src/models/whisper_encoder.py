@@ -39,6 +39,23 @@ class WhisperEncoder(nn.Module):
         self.use_encoder_only = use_encoder_only
         self.use_fp16 = use_fp16
         
+        # Set the embedding dimension based on the model
+        if "tiny" in model_id:
+            self.embedding_dim = 384
+        elif "base" in model_id:
+            self.embedding_dim = 512
+        elif "small" in model_id:
+            self.embedding_dim = 768
+        elif "medium" in model_id:
+            self.embedding_dim = 1024
+        elif "large" in model_id:
+            self.embedding_dim = 1280
+        else:
+            # Default for unknown models
+            self.embedding_dim = 1024
+            
+        logging.info(f"Using Whisper model from: {model_id} with embedding_dim={self.embedding_dim}")
+        
         logging.info(f"Using Whisper model from: {model_id}")
         
         # Determine if loading from local path or HuggingFace
@@ -48,13 +65,38 @@ class WhisperEncoder(nn.Module):
             self.processor = WhisperProcessor.from_pretrained(model_id)
             self.model = WhisperModel.from_pretrained(model_id, torch_dtype=torch.float16 if use_fp16 else torch.float32)
         else:
-            logging.info(f"Using Whisper model from Hugging Face: {model_id}")
-            # Load the model from HuggingFace
-            self.processor = WhisperProcessor.from_pretrained(model_id)
-            self.model = WhisperModel.from_pretrained(model_id, torch_dtype=torch.float16 if use_fp16 else torch.float32)
+            # Create checkpoints directory if it doesn't exist
+            cache_dir = os.path.join("checkpoints", "whisper")
+            os.makedirs(cache_dir, exist_ok=True)
+            
+            # Check if model is already saved in our checkpoints directory
+            model_name = model_id.split('/')[-1]
+            local_model_path = os.path.join(cache_dir, model_name)
+            
+            if os.path.exists(local_model_path):
+                # Load from saved local path
+                logging.info(f"Using Whisper model from checkpoints: {local_model_path}")
+                self.processor = WhisperProcessor.from_pretrained(local_model_path)
+                self.model = WhisperModel.from_pretrained(
+                    local_model_path, 
+                    torch_dtype=torch.float16 if use_fp16 else torch.float32
+                )
+            else:
+                # Download and save
+                logging.info(f"Downloading Whisper model {model_id} to {local_model_path}")
+                self.processor = WhisperProcessor.from_pretrained(model_id)
+                self.model = WhisperModel.from_pretrained(
+                    model_id,
+                    torch_dtype=torch.float16 if use_fp16 else torch.float32
+                )
+                
+                # Save to our checkpoints directory
+                logging.info(f"Saving Whisper model to {local_model_path}")
+                self.processor.save_pretrained(local_model_path)
+                self.model.save_pretrained(local_model_path)
         
-        # Get embedding dimension
-        self.embedding_dim = self.model.config.d_model
+        # No custom projection - use original Whisper dimensions
+        self.output_proj = nn.Identity()
         
         # Freeze model if required
         if self.freeze:
@@ -99,51 +141,26 @@ class WhisperEncoder(nn.Module):
             )
             return random_features
         
-        # Process the audio input
         try:
-            # Create dummy audio that Whisper can process
-            # Whisper expects ~16000 samples for 1 second
-            # Create a 1-second dummy audio for processing
-            dummy_len = 16000
-            dummy_audio = torch.zeros(waveform.shape[0], dummy_len, device="cpu", dtype=torch.float32)
+            # Process audio with the Whisper processor
+            input_features = self.processor(
+                waveform.cpu().numpy(),
+                sampling_rate=16000,
+                return_tensors="pt"
+            ).input_features.to(device)
             
-            # Copy our actual audio into the beginning of the dummy audio
-            # This ensures we have a consistent shape for processing
-            for i in range(waveform.shape[0]):
-                # Make sure we don't go out of bounds
-                copy_len = min(waveform.shape[1], dummy_len)
-                dummy_audio[i, :copy_len] = waveform[i, :copy_len].cpu().float()
+            if self.use_fp16:
+                input_features = input_features.to(torch.float16)
             
-            logging.debug(f"Created dummy audio with shape {dummy_audio.shape} for Whisper processing")
+            # Get encoder output
+            with torch.no_grad() if self.freeze else torch.enable_grad():
+                outputs = self.model.encoder(input_features)
+                encoder_output = outputs.last_hidden_state
+                
+            return encoder_output
             
-            # Process the audio with the Whisper processor
-            try:
-                input_features = self.processor(
-                    dummy_audio,
-                    sampling_rate=16000,
-                    return_tensors="pt"
-                ).input_features.to(device)
-                
-                if self.use_fp16:
-                    input_features = input_features.to(torch.float16)
-                
-                # Get encoder output
-                with torch.no_grad() if self.freeze else torch.enable_grad():
-                    outputs = self.model.encoder(input_features)
-                    encoder_output = outputs.last_hidden_state
-                
-                # The encoder output will be longer than we need - keep only a small portion
-                # corresponding to our actual audio
-                encoder_output = encoder_output[:, :4, :]
-                
-                return encoder_output
-                
-            except Exception as e:
-                logging.error(f"Error processing audio with Whisper: {e}")
-                raise
-        
         except Exception as e:
-            logging.error(f"Error in Whisper encoder: {e}")
+            logging.error(f"Error processing audio with Whisper: {e}")
             
             # Fallback to random features with correct shape
             batch_size = waveform.size(0)
