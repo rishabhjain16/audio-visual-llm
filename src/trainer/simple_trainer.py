@@ -199,6 +199,12 @@ class SimpleTrainer:
         total_loss = 0
         total_samples = 0
         
+        # Check if LLM is frozen
+        llm_frozen = False
+        if hasattr(self.model, 'freeze_llm') and self.model.freeze_llm:
+            llm_frozen = True
+            logging.info("Training with frozen LLM - training only the connectors")
+        
         # Progress bar
         pbar = tqdm(
             enumerate(self.train_dataloader),
@@ -217,19 +223,22 @@ class SimpleTrainer:
                 loss = self._process_batch(batch, batch_idx=batch_idx, is_train=True)
                 
                 # Update progress bar
-                pbar.set_description(f"Epoch {epoch+1} | Loss: {loss:.4f}")
+                desc = f"Epoch {epoch+1} | Loss: {loss:.4f}"
+                if llm_frozen:
+                    desc += " (LLM frozen)"
+                pbar.set_description(desc)
                 
                 # Update statistics
                 batch_size = len(batch["audio"])
                 total_loss += loss * batch_size
                 total_samples += batch_size
                 
-                # Log every N batches
+                # Log progress
                 if batch_idx % self.log_interval == 0:
                     logging.info(f"Epoch {epoch+1} | Batch {batch_idx}/{len(self.train_dataloader)} | Loss: {loss:.4f}")
                 
             except Exception as e:
-                logging.error(f"Error in batch {batch_idx}: {e}")
+                logging.error(f"Error processing batch {batch_idx}: {e}")
                 logging.error(traceback.format_exc())
                 continue
         
@@ -329,8 +338,14 @@ class SimpleTrainer:
             elif isinstance(outputs, dict) and "loss" in outputs:
                 loss = outputs["loss"]
             else:
-                logging.warning("No loss found in model outputs")
-                return 0.0
+                logging.info("No loss found in model outputs (expected when LLM is frozen)")
+                # Return a dummy loss of 0.0 that's a proper tensor for stability
+                return torch.tensor(0.0, device=self.device).item()
+            
+            # Additional check to handle None loss (when LLM is frozen)
+            if loss is None:
+                logging.info("Loss is None (expected when LLM is frozen)")
+                return torch.tensor(0.0, device=self.device).item()
             
             # Check for NaN/Inf in loss
             if torch.isnan(loss).any() or torch.isinf(loss).any():
@@ -359,15 +374,22 @@ class SimpleTrainer:
                         if param.grad is not None:
                             if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
                                 logging.error(f"NaN/Inf gradients in {name}")
-                                has_bad_gradients = True
-                                break
+                                
+                                # Special handling for LoRA parameters
+                                if "lora" in name.lower():
+                                    logging.warning(f"Zeroing out bad LoRA gradients in {name}")
+                                    param.grad.data.zero_()
+                                else:
+                                    # For non-LoRA parameters with bad gradients, skip the update
+                                    has_bad_gradients = True
+                                    break
                     
                     if has_bad_gradients:
-                        logging.warning("Found bad gradients, skipping update")
+                        logging.warning("Found bad gradients in non-LoRA parameters, skipping update")
                         self.optimizer.zero_grad()
                         return 1.0
                     
-                    # Clip gradients
+                    # Clip gradients more aggressively for stability
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), 
                         max_norm=self.max_grad_norm

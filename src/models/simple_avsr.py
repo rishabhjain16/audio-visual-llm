@@ -16,57 +16,32 @@ from transformers import (
 import datetime
 
 class ModalityConnector(nn.Module):
-    """
-    Super simple connector module to project features from one dimension to another.
-    Uses a single linear layer with proper initialization to avoid numerical issues.
-    """
-    
-    def __init__(self, input_dim, output_dim, device="cuda", dtype=torch.float16):
+    """Linear projection for modality encoding to LLM dimension"""
+
+    def __init__(self, input_dim, output_dim, device="cuda", dtype=torch.float32):
         super().__init__()
-        
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.device = device
         self.dtype = dtype
         
-        # Create projection with improved initialization for stability
-        self.norm = nn.LayerNorm(input_dim).to(device=device, dtype=dtype)
-        self.proj = nn.Linear(input_dim, output_dim).to(device=device, dtype=dtype)
-        self.dropout = nn.Dropout(0.1)
+        logging.info(f"Creating ModalityConnector: input_dim={input_dim}, output_dim={output_dim}, dtype={dtype}")
+        self.linear = nn.Linear(input_dim, output_dim)
         
-        # Use more stable initialization - especially important for fusion
-        with torch.no_grad():
-            nn.init.normal_(self.proj.weight, mean=0.0, std=0.02)
-            nn.init.zeros_(self.proj.bias)
+        # Use standard PyTorch initialization 
+        nn.init.normal_(self.linear.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.linear.bias)
         
-        logging.info(f"Created stable ModalityConnector: {input_dim} → {output_dim}")
-    
+        # Move to specified device and dtype
+        self.linear = self.linear.to(device=device, dtype=dtype)
+        
+        logging.info(f"Created ModalityConnector with standard initialization")
+
     def forward(self, x):
-        """Forward pass with careful NaN handling"""
-        # Replace any NaN/Inf values with zeros
-        if torch.isnan(x).any() or torch.isinf(x).any():
-            logging.warning("NaN/Inf values detected in ModalityConnector input, replacing with zeros")
-            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        # Ensure correct device and dtype
-        if x.device != self.device:
-            x = x.to(self.device)
+        # Ensure input has correct dtype
         if x.dtype != self.dtype:
             x = x.to(self.dtype)
-        
-        # Apply normalization for stability
-        x = self.norm(x)
-        
-        # Apply projection and dropout
-        x = self.proj(x)
-        x = self.dropout(x)
-        
-        # Final NaN check (belt and suspenders)
-        if torch.isnan(x).any() or torch.isinf(x).any():
-            logging.warning("NaN/Inf values in ModalityConnector output, using zeros")
-            x = torch.zeros_like(x)
-        
-        return x
+        return self.linear(x)
 
 
 class SimpleAVSRModel(nn.Module):
@@ -88,9 +63,10 @@ class SimpleAVSRModel(nn.Module):
         lora_alpha: int = 32,
         lora_dropout: float = 0.05,
         freeze_encoders: bool = True,
-        modality: str = "both",  # "audio", "video", or "both"
-        max_seq_len: int = 256,  # Maximum sequence length for stability
-        fusion_scale: float = 0.5,  # Scaling factor for fusion (0.5 = equal weighting)
+        freeze_llm: bool = False,
+        modality: str = "both",
+        max_seq_len: int = 256,
+        fusion_scale: float = 0.5,
     ):
         """Initialize the AVSR model"""
         super().__init__()
@@ -103,6 +79,7 @@ class SimpleAVSRModel(nn.Module):
         self.modality = modality
         self.max_seq_len = max_seq_len
         self.freeze_encoders = freeze_encoders
+        self.freeze_llm = freeze_llm
         self.lora_r = lora_r
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
@@ -134,28 +111,26 @@ class SimpleAVSRModel(nn.Module):
         self.llm_dim = self.llm.config.hidden_size
         logging.info(f"LLM dimension detected: {self.llm_dim}")
         
-        # Create connectors with proper initialization
+        # Create connectors for each modality (directly to LLM dimension)
+        # Using consistent dtype (float32) for stability
+        connector_dtype = torch.float32
+        
         self.audio_connector = ModalityConnector(
-            self.audio_dim, self.llm_dim,
-            device=device, dtype=self.dtype
+            input_dim=self.audio_dim,
+            output_dim=self.llm_dim,
+            device=self.device,
+            dtype=connector_dtype
         )
         
         self.video_connector = ModalityConnector(
-            self.video_dim, self.llm_dim,
-            device=device, dtype=self.dtype
+            input_dim=self.video_dim,
+            output_dim=self.llm_dim,
+            device=self.device,
+            dtype=connector_dtype
         )
         
-        # For video: project to audio_dim for fusion
-        self.video_to_audio_dim = ModalityConnector(
-            self.video_dim, self.audio_dim,
-            device=device, dtype=self.dtype
-        )
-        
-        # For fusion: project combined features to LLM dim
-        self.fusion_connector = ModalityConnector(
-            self.audio_dim, self.llm_dim,
-            device=device, dtype=self.dtype
-        )
+        # We don't need the fusion connector or video_to_audio_dim anymore with this approach
+        # as we'll handle modalities separately
         
         # Freeze encoders if specified
         if self.freeze_encoders:
@@ -189,6 +164,7 @@ class SimpleAVSRModel(nn.Module):
             "lora_alpha": lora_alpha,
             "lora_dropout": lora_dropout,
             "freeze_encoders": freeze_encoders,
+            "freeze_llm": freeze_llm,
             "modality": modality,
             "max_seq_len": max_seq_len,
         }
@@ -223,87 +199,94 @@ class SimpleAVSRModel(nn.Module):
         try:
             # Log input shapes for debugging
             if audio is not None:
-                logging.info(f"Input audio shape: {audio.shape}")
+                logging.info(f"Input audio shape: {audio.shape}, dtype: {audio.dtype}")
             if video is not None:
-                logging.info(f"Input video shape: {video.shape}")
+                logging.info(f"Input video shape: {video.shape}, dtype: {video.dtype}")
             if labels is not None:
                 logging.info(f"Input labels shape: {labels.shape}")
             
             # Encode audio if provided
             audio_features = None
             if audio is not None and self.modality in ["audio", "both"]:
-                with torch.cuda.amp.autocast(enabled=False):  # Disable mixed precision for stability
-                    audio_features = self.encode_audio(audio)
-                    if audio_features is not None:
-                        # Check for NaN values
-                        if torch.isnan(audio_features).any() or torch.isinf(audio_features).any():
-                            logging.warning("NaN/Inf detected in audio features, replacing with zeros")
-                            audio_features = torch.nan_to_num(audio_features, nan=0.0, posinf=0.0, neginf=0.0)
-                logging.info(f"Audio features shape after encoding: {audio_features.shape if audio_features is not None else None}")
+                # Handle NaN/Inf values
+                if torch.isnan(audio).any() or torch.isinf(audio).any():
+                    audio = torch.nan_to_num(audio)
+                
+                audio_features = self.encode_audio(audio)
+                
+                # Handle NaN/Inf values
+                if audio_features is not None and (torch.isnan(audio_features).any() or torch.isinf(audio_features).any()):
+                    audio_features = torch.nan_to_num(audio_features)
             
             # Encode video if provided
             video_features = None
             if video is not None and self.modality in ["video", "both"]:
-                with torch.cuda.amp.autocast(enabled=False):  # Disable mixed precision for stability
-                    video_features = self.encode_video(video)
-                    if video_features is not None:
-                        # Check for NaN values
-                        if torch.isnan(video_features).any() or torch.isinf(video_features).any():
-                            logging.warning("NaN/Inf detected in video features, replacing with zeros")
-                            video_features = torch.nan_to_num(video_features, nan=0.0, posinf=0.0, neginf=0.0)
-                logging.info(f"Video features shape after encoding: {video_features.shape if video_features is not None else None}")
+                # Handle NaN/Inf values
+                if torch.isnan(video).any() or torch.isinf(video).any():
+                    video = torch.nan_to_num(video)
+                
+                video_features = self.encode_video(video)
+                
+                # Handle NaN/Inf values
+                if video_features is not None and (torch.isnan(video_features).any() or torch.isinf(video_features).any()):
+                    video_features = torch.nan_to_num(video_features)
             
-            # Combine features if both are available
-            if audio_features is not None and video_features is not None:
-                # First, determine a common sequence length (use minimum of both)
-                seq_len = min(audio_features.size(1), video_features.size(1))
-                seq_len = min(seq_len, self.max_seq_len)  # Also respect max_seq_len
-                
-                logging.info(f"Using common sequence length: {seq_len}")
-                
-                # Truncate both to this common length
-                audio_features = audio_features[:, :seq_len, :]
-                video_features = video_features[:, :seq_len, :]
-                
-                # Project video to audio dimension
-                video_features_audio_dim = self.video_to_audio_dim(video_features)  # [batch, seq_len, audio_dim]
-                
-                # Combine features with scaling (defaults to equal weighting with 0.5)
-                combined_features = (
-                    audio_features * self.fusion_scale + 
-                    video_features_audio_dim * (1.0 - self.fusion_scale)
-                )  # [batch, seq_len, audio_dim]
-                
-                # Check for NaN values before projecting
-                if torch.isnan(combined_features).any() or torch.isinf(combined_features).any():
-                    logging.warning("NaN/Inf detected in combined features, replacing with zeros")
-                    combined_features = torch.nan_to_num(combined_features, nan=0.0, posinf=0.0, neginf=0.0)
-                
-                # Project combined features to LLM dim
-                encoder_out = self.fusion_connector(combined_features)  # [batch, seq_len, llm_dim]
-                
-            elif audio_features is not None:
-                # Audio-only path
+            # Determine which modality to use and project to LLM dimension
+            encoder_out = None
+            batch_size = None
+            seq_len = None
+            
+            # Audio only path
+            if audio_features is not None and (self.modality == "audio" or (self.modality == "both" and video_features is None)):
                 # Truncate to max_seq_len
                 audio_features = audio_features[:, :self.max_seq_len, :]
                 encoder_out = self.audio_connector(audio_features)
-                
-            elif video_features is not None:
-                # Video-only path
+                batch_size, seq_len = encoder_out.size(0), encoder_out.size(1)
+                logging.info(f"Using audio-only path, encoder_out shape: {encoder_out.shape}, dtype: {encoder_out.dtype}")
+            
+            # Video only path
+            elif video_features is not None and (self.modality == "video" or (self.modality == "both" and audio_features is None)):
                 # Truncate to max_seq_len
                 video_features = video_features[:, :self.max_seq_len, :]
                 encoder_out = self.video_connector(video_features)
+                batch_size, seq_len = encoder_out.size(0), encoder_out.size(1)
+                logging.info(f"Using video-only path, encoder_out shape: {encoder_out.shape}, dtype: {encoder_out.dtype}")
+            
+            # Combined path (both audio and video)
+            elif audio_features is not None and video_features is not None and self.modality == "both":
+                # Determine a common sequence length for both features
+                audio_seq_len = audio_features.size(1)
+                video_seq_len = video_features.size(1)
+                common_seq_len = min(audio_seq_len, video_seq_len, self.max_seq_len)
                 
+                # Truncate both to common length
+                audio_features = audio_features[:, :common_seq_len, :]
+                video_features = video_features[:, :common_seq_len, :]
+                
+                # Project each to LLM dimension separately
+                audio_llm_features = self.audio_connector(audio_features)
+                video_llm_features = self.video_connector(video_features)
+                
+                # Average both features (simple fusion)
+                encoder_out = audio_llm_features * self.fusion_scale + video_llm_features * (1 - self.fusion_scale)
+                batch_size, seq_len = encoder_out.size(0), encoder_out.size(1)
+                logging.info(f"Using combined path, encoder_out shape: {encoder_out.shape}, dtype: {encoder_out.dtype}")
+            
             else:
-                raise ValueError("At least one of audio or video must be provided")
+                raise ValueError("At least one of audio or video must be provided and match the specified modality")
             
             # Final NaN check before LLM
             if torch.isnan(encoder_out).any() or torch.isinf(encoder_out).any():
-                logging.warning("NaN/Inf detected in encoder output, replacing with zeros")
-                encoder_out = torch.nan_to_num(encoder_out, nan=0.0, posinf=0.0, neginf=0.0)
+                logging.warning(f"NaN/Inf detected in encoder output before LLM")
+                encoder_out = torch.nan_to_num(encoder_out)
+            
+            # Ensure encoder output matches LLM's expected dtype
+            llm_input_dtype = next(self.llm.parameters()).dtype
+            if encoder_out.dtype != llm_input_dtype:
+                logging.info(f"Converting encoder output from {encoder_out.dtype} to {llm_input_dtype}")
+                encoder_out = encoder_out.to(llm_input_dtype)
             
             # Create attention mask (all 1s)
-            batch_size, seq_len = encoder_out.size()[:2]
             attention_mask = torch.ones((batch_size, seq_len), dtype=torch.long, device=self.device)
             
             # Handle prompt if provided
@@ -312,8 +295,8 @@ class SimpleAVSRModel(nn.Module):
                 prompt_embeds = embedding_layer(prompt.to(self.device))
                 encoder_out = torch.cat([prompt_embeds, encoder_out], dim=1)
                 attention_mask = torch.ones((batch_size, encoder_out.size(1)), dtype=torch.long, device=self.device)
-            
-            # Prepare labels for loss computation
+                
+            # Prepare labels for loss computation if needed
             if return_loss and labels is not None:
                 # Adjust labels to match sequence length
                 if labels.size(1) != encoder_out.size(1):
@@ -330,41 +313,26 @@ class SimpleAVSRModel(nn.Module):
                         # Truncate labels
                         labels = labels[:, :encoder_out.size(1)]
             
-            # Forward pass through LLM with robust error handling
-            try:
-                with torch.cuda.amp.autocast(enabled=self.use_fp16):
-                    outputs = self.llm(
-                        inputs_embeds=encoder_out,
-                        attention_mask=attention_mask,
-                        labels=labels if return_loss and labels is not None else None,
-                        return_dict=True
-                    )
-                
-                # Check the loss for NaN/Inf before returning
-                if hasattr(outputs, "loss") and (torch.isnan(outputs.loss) or torch.isinf(outputs.loss)):
-                    logging.warning("NaN/Inf detected in LLM loss, returning dummy loss")
-                    outputs.loss = torch.tensor(0.5, device=self.device, requires_grad=True)
-                
+            # Forward pass through LLM
+            if return_loss and labels is not None:
+                # For training with loss calculation
+                outputs = self.llm(
+                    inputs_embeds=encoder_out,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    return_dict=True
+                )
                 return outputs
-            except Exception as e:
-                logging.error(f"Error in LLM forward pass: {e}")
-                if return_loss:
-                    # Return a dummy loss value
-                    dummy_loss = torch.tensor(0.5, device=self.device, requires_grad=True)
-                    return type('obj', (object,), {'loss': dummy_loss})
-                return {"error": f"LLM forward pass error: {e}"}
-            
+            else:
+                # For inference/generation, return hidden states for later use
+                return type('obj', (object,), {
+                    'hidden_states': encoder_out,
+                    'attention_mask': attention_mask
+                })
         except Exception as e:
             logging.error(f"Error in forward pass: {e}")
             logging.error(traceback.format_exc())
-            
-            # Return a dummy loss for training stability
-            if return_loss:
-                dummy_loss = torch.tensor(0.5, device=self.device, requires_grad=True)
-                return type('obj', (object,), {'loss': dummy_loss})
-            
-            # Return error message for generation
-            return {"generated_text": ["Error in model forward pass"], "error": str(e)}
+            raise
     
     def save_pretrained(self, output_dir):
         """Save model to output directory"""
@@ -375,8 +343,21 @@ class SimpleAVSRModel(nn.Module):
         try:
             torch.save(self.audio_connector.state_dict(), os.path.join(output_dir, "audio_connector.pt"))
             torch.save(self.video_connector.state_dict(), os.path.join(output_dir, "video_connector.pt"))
-            torch.save(self.video_to_audio_dim.state_dict(), os.path.join(output_dir, "video_to_audio_dim.pt"))
-            torch.save(self.fusion_connector.state_dict(), os.path.join(output_dir, "fusion_connector.pt"))
+            
+            # We don't need to save the video_to_audio_dim connector anymore
+            
+            torch.save({
+                "modality": self.modality,
+                "max_seq_len": self.max_seq_len,
+                "fusion_scale": self.fusion_scale,
+                "freeze_encoders": self.freeze_encoders,
+                "freeze_llm": self.freeze_llm,
+                "audio_dim": self.audio_dim,
+                "video_dim": self.video_dim,
+                "llm_dim": self.llm_dim,
+                "device": self.device,
+                "dtype": self.dtype,
+            }, os.path.join(output_dir, "model_config.json"))
         except Exception as e:
             logging.error(f"Error saving connectors: {e}")
             raise
@@ -398,6 +379,7 @@ class SimpleAVSRModel(nn.Module):
                 "lora_alpha": self.lora_alpha,
                 "lora_dropout": self.lora_dropout,
                 "freeze_encoders": self.freeze_encoders,
+                "freeze_llm": self.freeze_llm,
                 "modality": self.modality,
                 "max_seq_len": self.max_seq_len,
                 "device": str(self.device),
@@ -454,8 +436,7 @@ class SimpleAVSRModel(nn.Module):
         required_files = [
             "audio_connector.pt",
             "video_connector.pt",
-            "video_to_audio_dim.pt",
-            "fusion_connector.pt",
+            "model_config.json",
             "config.json",
             os.path.join("tokenizer", "tokenizer_config.json"),
             os.path.join("llm", "config.json"),
@@ -468,91 +449,43 @@ class SimpleAVSRModel(nn.Module):
 
     @classmethod
     def from_pretrained(cls, model_dir):
-        """Load model from a directory"""
-        try:
-            logging.info(f"Loading model from {model_dir}")
-            
-            # Load config
-            with open(os.path.join(model_dir, "config.json"), "r") as f:
-                config = json.load(f)
-            
-            # Create model
-            model = cls(
-                llm_path=config.get("llm_path", ""),
-                whisper_model=config.get("whisper_model", "openai/whisper-medium"),
-                clip_model=config.get("clip_model", "openai/clip-vit-base-patch32"),
-                device="cuda" if torch.cuda.is_available() else "cpu",
-                use_fp16=config.get("use_fp16", False),
-                use_lora=config.get("use_lora", True),
-                use_4bit=config.get("use_4bit", False),
-                lora_r=config.get("lora_r", 16),
-                lora_alpha=config.get("lora_alpha", 32),
-                lora_dropout=config.get("lora_dropout", 0.05),
-                freeze_encoders=config.get("freeze_encoders", True),
-                modality=config.get("modality", "both"),
-                max_seq_len=config.get("max_seq_len", 256),
-            )
-            
-            # Load projector weights
-            logging.info(f"Loading connector weights from {model_dir}")
-            model.audio_connector.load_state_dict(
-                torch.load(os.path.join(model_dir, "audio_connector.pt"))
-            )
-            model.video_connector.load_state_dict(
-                torch.load(os.path.join(model_dir, "video_connector.pt"))
-            )
-            model.video_to_audio_dim.load_state_dict(
-                torch.load(os.path.join(model_dir, "video_to_audio_dim.pt"))
-            )
-            model.fusion_connector.load_state_dict(
-                torch.load(os.path.join(model_dir, "fusion_connector.pt"))
-            )
-            
-            # Load tokenizer
-            tokenizer_dir = os.path.join(model_dir, "tokenizer")
-            if os.path.exists(tokenizer_dir):
-                logging.info(f"Loading tokenizer from {tokenizer_dir}")
-                model.tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
-            
-            # Load LLM if available
-            llm_dir = os.path.join(model_dir, "llm")
-            if os.path.exists(llm_dir):
-                logging.info(f"Loading LLM from {llm_dir}")
-                try:
-                    # Try loading the entire model
-                    model.llm = AutoModelForCausalLM.from_pretrained(
-                        llm_dir,
-                        torch_dtype=model.dtype,
-                        device_map=model.device,
-                    )
-                except Exception as e:
-                    logging.error(f"Error loading LLM: {e}")
-                    # Try loading just the state dict
-                    logging.warning("Trying to load state dict only")
-                    state_dict = torch.load(
-                        os.path.join(llm_dir, "pytorch_model.bin"),
-                        map_location=model.device
-                    )
-                    model.llm.load_state_dict(state_dict)
-            
-            # Validate the loaded model
-            logging.info("Validating loaded model")
-            if model.audio_dim != model.audio_connector.input_dim:
-                logging.warning(f"Audio dimensions mismatch: {model.audio_dim} vs {model.audio_connector.input_dim}")
-            
-            if model.video_dim != model.video_connector.input_dim:
-                logging.warning(f"Video dimensions mismatch: {model.video_dim} vs {model.video_connector.input_dim}")
-            
-            if model.llm_dim != model.audio_connector.output_dim:
-                logging.warning(f"LLM dimensions mismatch: {model.llm_dim} vs {model.audio_connector.output_dim}")
-            
-            logging.info(f"Model successfully loaded from {model_dir}")
-            return model
-            
-        except Exception as e:
-            logging.error(f"Error loading model: {e}")
-            logging.error(traceback.format_exc())
-            raise 
+        """Load model from saved checkpoint"""
+        if not os.path.exists(model_dir):
+            raise ValueError(f"Model directory {model_dir} does not exist")
+        
+        # Load model configuration
+        config_path = os.path.join(model_dir, "model_config.json")
+        if not os.path.exists(config_path):
+            raise ValueError(f"Model config {config_path} does not exist")
+        
+        with open(config_path, "rb") as f:
+            config = torch.load(f)
+        
+        # Create model with the saved configuration
+        model = cls(
+            llm_path=os.path.join(model_dir, "llm"),
+            whisper_model=os.path.join(model_dir, "whisper"),
+            clip_model=os.path.join(model_dir, "clip"),
+            device=config.get("device", "cuda" if torch.cuda.is_available() else "cpu"),
+            use_fp16=False,  # Default to stable settings when loading
+            use_lora=True,
+            freeze_encoders=config.get("freeze_encoders", True),
+            freeze_llm=config.get("freeze_llm", False),
+            modality=config.get("modality", "both"),
+            max_seq_len=config.get("max_seq_len", 256),
+            fusion_scale=config.get("fusion_scale", 0.5),
+        )
+        
+        # Load the projectors
+        model.audio_connector.load_state_dict(torch.load(os.path.join(model_dir, "audio_connector.pt")))
+        model.video_connector.load_state_dict(torch.load(os.path.join(model_dir, "video_connector.pt")))
+        
+        # The video_to_audio_dim connector is no longer needed
+        
+        logging.info(f"Model loaded from {model_dir}")
+        model._verify_save(model_dir)
+        
+        return model
 
     def _load_whisper_model(self, whisper_model):
         """Load Whisper model and processor"""
@@ -644,23 +577,52 @@ class SimpleAVSRModel(nn.Module):
             # Apply LoRA to the LLM if requested
             if self.use_lora:
                 try:
-                    from peft import get_peft_model, LoraConfig, TaskType
+                    from peft import prepare_model_for_kbit_training, get_peft_model, LoraConfig, TaskType
                     
-                    logging.info(f"Applying LoRA to LLM with r={self.lora_r}, alpha={self.lora_alpha}, dropout={self.lora_dropout}")
+                    # Use more stable LoRA settings while still allowing learning
+                    logging.info("Applying LoRA adapter with stable settings")
+                    
+                    # Prepare model for LoRA if needed
+                    if self.use_4bit:
+                        llm = prepare_model_for_kbit_training(llm)
+                    
+                    # Balanced settings for stability and learning capacity
                     peft_config = LoraConfig(
                         task_type=TaskType.CAUSAL_LM,
                         inference_mode=False,
-                        r=self.lora_r,
-                        lora_alpha=self.lora_alpha,
-                        lora_dropout=self.lora_dropout,
-                        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+                        r=8,  # Lower rank than default but still effective
+                        lora_alpha=16,  # Balanced alpha
+                        lora_dropout=0.05,  # Minimal dropout
+                        # Target key components for effectiveness
+                        target_modules=["q_proj", "v_proj"],
+                        bias="none",  # Don't train biases for stability
+                        # Better initialization
+                        init_lora_weights="gaussian"  # Small gaussian init
                     )
                     
                     # Apply LoRA to the model
                     llm = get_peft_model(llm, peft_config)
-                    llm.print_trainable_parameters()
+                    
+                    # Verify trainable parameters
+                    trainable_params = sum(p.numel() for p in llm.parameters() if p.requires_grad)
+                    all_params = sum(p.numel() for p in llm.parameters())
+                    logging.info(f"LoRA trainable params: {trainable_params} ({trainable_params/all_params:.4%})")
+                    
                 except ImportError:
                     logging.warning("PEFT not installed. Running without LoRA adaptation.")
+            
+            # Freeze the LLM if requested
+            if self.freeze_llm:
+                logging.info("Freezing the entire LLM for stability")
+                for param in llm.parameters():
+                    param.requires_grad = False
+                
+                # Verify LLM is frozen
+                trainable_params = sum(p.numel() for p in llm.parameters() if p.requires_grad)
+                if trainable_params == 0:
+                    logging.info("LLM successfully frozen - no trainable parameters")
+                else:
+                    logging.warning(f"LLM has {trainable_params} trainable parameters despite freezing attempt")
             
             return llm
         except Exception as e:
@@ -675,8 +637,6 @@ class SimpleAVSRModel(nn.Module):
         llm_params = sum(p.numel() for p in self.llm.parameters())
         audio_connector_params = sum(p.numel() for p in self.audio_connector.parameters())
         video_connector_params = sum(p.numel() for p in self.video_connector.parameters())
-        video_to_audio_dim_params = sum(p.numel() for p in self.video_to_audio_dim.parameters())
-        fusion_connector_params = sum(p.numel() for p in self.fusion_connector.parameters())
         
         # Count trainable parameters by component
         whisper_trainable = sum(p.numel() for p in self.whisper.parameters() if p.requires_grad)
@@ -684,17 +644,13 @@ class SimpleAVSRModel(nn.Module):
         llm_trainable = sum(p.numel() for p in self.llm.parameters() if p.requires_grad)
         audio_connector_trainable = sum(p.numel() for p in self.audio_connector.parameters() if p.requires_grad)
         video_connector_trainable = sum(p.numel() for p in self.video_connector.parameters() if p.requires_grad)
-        video_to_audio_dim_trainable = sum(p.numel() for p in self.video_to_audio_dim.parameters() if p.requires_grad)
-        fusion_connector_trainable = sum(p.numel() for p in self.fusion_connector.parameters() if p.requires_grad)
         
         # Total counts
         total_params = whisper_params + clip_params + llm_params + \
-                      audio_connector_params + video_connector_params + \
-                      video_to_audio_dim_params + fusion_connector_params
+                      audio_connector_params + video_connector_params
                       
         total_trainable = whisper_trainable + clip_trainable + llm_trainable + \
-                         audio_connector_trainable + video_connector_trainable + \
-                         video_to_audio_dim_trainable + fusion_connector_trainable
+                         audio_connector_trainable + video_connector_trainable
         
         # Log the counts in a nice table format
         logging.info("=" * 80)
@@ -707,8 +663,6 @@ class SimpleAVSRModel(nn.Module):
         logging.info(f"{'LLM':<20} {llm_params:,d} {llm_trainable:,d} {100*llm_trainable/max(1, llm_params):.2f}%")
         logging.info(f"{'Audio Connector':<20} {audio_connector_params:,d} {audio_connector_trainable:,d} {100*audio_connector_trainable/max(1, audio_connector_params):.2f}%")
         logging.info(f"{'Video Connector':<20} {video_connector_params:,d} {video_connector_trainable:,d} {100*video_connector_trainable/max(1, video_connector_params):.2f}%")
-        logging.info(f"{'Video to Audio':<20} {video_to_audio_dim_params:,d} {video_to_audio_dim_trainable:,d} {100*video_to_audio_dim_trainable/max(1, video_to_audio_dim_params):.2f}%")
-        logging.info(f"{'Fusion Connector':<20} {fusion_connector_params:,d} {fusion_connector_trainable:,d} {100*fusion_connector_trainable/max(1, fusion_connector_params):.2f}%")
         logging.info("-" * 80)
         logging.info(f"{'TOTAL':<20} {total_params:,d} {total_trainable:,d} {100*total_trainable/max(1, total_params):.2f}%")
         logging.info("=" * 80)
@@ -717,13 +671,15 @@ class SimpleAVSRModel(nn.Module):
         """Encode audio using Whisper with robust error handling"""
         with torch.no_grad():
             try:
-                # Ensure audio is on the correct device and dtype
+                # Ensure audio is on the correct device
                 if audio.device != self.device:
                     audio = audio.to(self.device)
                 
-                # Convert to the expected data type
-                if audio.dtype != self.dtype:
-                    audio = audio.to(self.dtype)
+                # IMPORTANT: Convert to the SAME dtype as the Whisper model
+                # This fixes the "Input type and bias type should be the same" error
+                whisper_dtype = next(self.whisper.parameters()).dtype
+                if audio.dtype != whisper_dtype:
+                    audio = audio.to(whisper_dtype)
                 
                 # Handle potential NaN values
                 if torch.isnan(audio).any() or torch.isinf(audio).any():
@@ -735,13 +691,10 @@ class SimpleAVSRModel(nn.Module):
                 input_length = audio.size(1)
                 expected_seq_len = input_length // 16  # Typical whisper downsampling
                 
-                # Use float32 for the whisper encoder regardless of the model's dtype
-                # This improves numerical stability significantly
-                audio_float32 = audio.to(torch.float32)
-                
-                # Run the encoder
-                with torch.cuda.amp.autocast(enabled=False):  # Disable mixed precision
-                    whisper_out = self.whisper.encoder(audio_float32)
+                # Run the encoder with explicit error handling
+                # Use the SAME precision as the model, don't force float32
+                with torch.amp.autocast('cuda', enabled=False):
+                    whisper_out = self.whisper.encoder(audio)
                     audio_features = whisper_out.last_hidden_state
                 
                 # Check for NaN values in the output
@@ -750,11 +703,10 @@ class SimpleAVSRModel(nn.Module):
                     audio_features = torch.zeros(
                         (batch_size, expected_seq_len, self.audio_dim),
                         device=self.device,
-                        dtype=torch.float32  # Use float32 for stability
+                        dtype=whisper_dtype  # Match Whisper's dtype
                     )
                 
-                # Convert to the model's dtype
-                audio_features = audio_features.to(self.dtype)
+                # Keep the output in the same dtype as Whisper
                 return audio_features
                 
             except Exception as e:
@@ -762,23 +714,25 @@ class SimpleAVSRModel(nn.Module):
                 logging.warning(f"Error in Whisper encoder: {e}")
                 batch_size = audio.size(0)
                 expected_seq_len = audio.size(1) // 16
+                whisper_dtype = next(self.whisper.parameters()).dtype
                 return torch.zeros(
                     (batch_size, expected_seq_len, self.audio_dim),
                     device=self.device,
-                    dtype=self.dtype
+                    dtype=whisper_dtype  # Match Whisper's dtype
                 )
     
     def encode_video(self, video, attention_mask=None):
         """Encode video frames using CLIP"""
         with torch.no_grad():
             try:
-                # Ensure video is on the correct device and dtype
+                # Ensure video is on the correct device
                 if video.device != self.device:
                     video = video.to(self.device)
                 
-                # Convert to the expected data type of the model
-                if video.dtype != self.dtype:
-                    video = video.to(self.dtype)
+                # IMPORTANT: Convert to the SAME dtype as the CLIP model
+                clip_dtype = next(self.clip.parameters()).dtype
+                if video.dtype != clip_dtype:
+                    video = video.to(clip_dtype)
                 
                 # Check for NaN values
                 if torch.isnan(video).any() or torch.isinf(video).any():
@@ -804,12 +758,9 @@ class SimpleAVSRModel(nn.Module):
                 else:
                     raise ValueError(f"Unexpected video shape: {video.shape}. Expected [batch, frames, 3, height, width] or [frames, 3, height, width]")
                 
-                # Use float32 for CLIP encoding regardless of the model's dtype for stability
-                flat_video_float32 = flat_video.to(torch.float32)
-                
-                # Process with CLIP model
-                with torch.cuda.amp.autocast(enabled=False):  # Disable mixed precision for stability
-                    clip_output = self.clip(flat_video_float32)
+                # Process with CLIP model using the model's native dtype
+                with torch.amp.autocast('cuda', enabled=False):
+                    clip_output = self.clip(flat_video)
                     video_features = clip_output.last_hidden_state
                 
                 # Mean across sequence dimension to get single feature vector per frame
@@ -824,10 +775,7 @@ class SimpleAVSRModel(nn.Module):
                     logging.warning("NaN/Inf values in CLIP output, replacing with zeros")
                     video_features = torch.zeros_like(video_features)
                 
-                # Convert to the model's dtype
-                if video_features.dtype != self.dtype:
-                    video_features = video_features.to(self.dtype)
-                
+                # Keep the output in the same dtype as CLIP
                 return video_features
                 
             except Exception as e:
@@ -842,9 +790,10 @@ class SimpleAVSRModel(nn.Module):
                     else:
                         batch_size = 1
                         num_frames = video.size(0) if video.dim() == 4 else 1
-                        
+                
+                clip_dtype = next(self.clip.parameters()).dtype
                 return torch.zeros(
                     (batch_size, num_frames, self.video_dim),
                     device=self.device,
-                    dtype=self.dtype
+                    dtype=clip_dtype  # Match CLIP's dtype
                 )

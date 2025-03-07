@@ -248,3 +248,93 @@ This code is based on the work from:
 - [VSR-LLM](https://github.com/rishabhjain16/VSR-LLM)
 - [AV-HuBERT](https://github.com/facebookresearch/av_hubert)
 - [Hugging Face Transformers](https://github.com/huggingface/transformers)
+
+## Decoding (Inference)
+
+### Testing different modalities
+
+To test the model with different modalities, you can use the `simple_decode.py` script or the convenience shell script `simple_decode.sh`.
+
+#### 1. Audio-only mode:
+
+```bash
+./scripts/simple_decode.sh \
+  --model_path outputs/simple_avsr \
+  --test_data data/test.tsv \
+  --test_wrd data/test.wrd \
+  --modality audio \
+  --output_dir outputs/decoding_audio
+```
+
+For testing a single audio file:
+
+```bash
+./scripts/simple_decode.sh \
+  --model_path outputs/simple_avsr \
+  --single_file path/to/audio.wav \
+  --modality audio
+```
+
+#### 2. Video-only mode:
+
+```bash
+./scripts/simple_decode.sh \
+  --model_path outputs/simple_avsr \
+  --test_data data/test.tsv \
+  --test_wrd data/test.wrd \
+  --modality video \
+  --output_dir outputs/decoding_video
+```
+
+For testing a single video file:
+
+```bash
+./scripts/simple_decode.sh \
+  --model_path outputs/simple_avsr \
+  --single_file path/to/video.mp4 \
+  --modality video
+```
+
+#### 3. Combined mode (both audio and video):
+
+```bash
+./scripts/simple_decode.sh \
+  --model_path outputs/simple_avsr \
+  --test_data data/test.tsv \
+  --test_wrd data/test.wrd \
+  --modality both \
+  --output_dir outputs/decoding_combined
+```
+
+### Word Error Rate (WER) Evaluation
+
+The decode script automatically calculates Word Error Rate (WER) for both batch decoding and single file inference. For batch decoding with a test dataset, it will:
+
+1. Read reference transcriptions from the provided `test.wrd` file
+2. Generate hypotheses for each utterance
+3. Calculate per-utterance WER and overall WER
+4. Save detailed results to a file in the specified output directory
+
+## Training
+
+To train the model, run:
+
+```bash
+python scripts/train.py \
+  --train_data data/train.tsv \
+  --valid_data data/valid.tsv \
+  --output_dir outputs/simple_avsr \
+  --modality both \
+  --batch_size 2 \
+  --gradient_accumulation_steps 4 \
+  --learning_rate 5e-4 \
+  --num_train_epochs 5
+```
+
+## Troubleshooting
+
+If you encounter NaN or Inf values during training:
+1. Try reducing the learning rate
+2. Use a smaller batch size
+3. Set `use_fp16=False` in the model config for better stability
+4. Make sure the input data doesn't contain NaN or Inf values
