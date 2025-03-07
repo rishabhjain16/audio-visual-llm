@@ -39,6 +39,12 @@ def parse_args():
                         help="Enable debug mode with more detailed logging and a smaller dataset")
     parser.add_argument("--batch_size", type=int, default=None,
                         help="Override batch size in config")
+    parser.add_argument("--max_epochs", type=int, default=None,
+                        help="Maximum number of epochs to train for")
+    parser.add_argument("--save_every", type=int, default=None,
+                        help="Save checkpoint every N epochs")
+    parser.add_argument("--log_param_updates", action="store_true",
+                        help="Log parameter updates during training")
     return parser.parse_args()
 
 
@@ -63,6 +69,13 @@ def main():
         config.model.av_encoder_path = args.av_encoder_path
     if args.batch_size is not None:
         config.data.batch_size = args.batch_size
+    if args.max_epochs is not None:
+        config.training.num_epochs = args.max_epochs
+    if args.save_every is not None:
+        config.training.save_every = args.save_every
+        
+    # Set parameter update logging
+    config.log_param_updates = args.log_param_updates
     
     # Set debug mode
     config.debug = args.debug

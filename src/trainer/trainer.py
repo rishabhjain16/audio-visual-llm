@@ -61,9 +61,15 @@ class AVSRTrainer:
                                      getattr(config.training, 'num_epochs', 10) if hasattr(config, 'training') else 10)
             self.log_every = getattr(config, 'log_every', 
                                     getattr(config.training, 'log_interval', 10) if hasattr(config, 'training') else 10)
-            self.save_every = getattr(config, 'save_every', 1)
+            self.save_every = getattr(config, 'save_every', 
+                                     getattr(config.training, 'save_every', 1) if hasattr(config, 'training') else 1)
             self.output_dir = getattr(config, 'output_dir', 
                                      getattr(config.training, 'checkpoint_dir', 'outputs') if hasattr(config, 'training') else 'outputs')
+            
+            # Parameter update logging flag
+            self.log_param_updates = getattr(config, 'log_param_updates', False)
+            if self.log_param_updates:
+                logger.info("Parameter update logging is enabled")
             
             # Ensure output directory exists
             os.makedirs(self.output_dir, exist_ok=True)
@@ -641,12 +647,25 @@ class AVSRTrainer:
                             max_grad_norm = getattr(self.config.training, "max_grad_norm", 1.0) if hasattr(self.config, 'training') else 1.0
                             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
                             
+                            # Log parameter updates if requested
+                            if self.log_param_updates:
+                                for name, param in self.model.named_parameters():
+                                    if param.requires_grad and param.grad is not None:
+                                        grad_norm = param.grad.norm().item()
+                                        if grad_norm > 0:
+                                            logger.info(f"Param update - {name}: grad_norm={grad_norm:.6f}")
+                            
                             # Step optimizer
                             self.optimizer.step()
                             
                             # Step scheduler if it exists
                             if hasattr(self, 'scheduler') and self.scheduler is not None:
                                 self.scheduler.step()
+                        
+                        # Log learning rate
+                        current_lr = self.optimizer.param_groups[0]['lr']
+                        if batch_idx % (self.log_every * 10) == 0:
+                            logger.info(f"Current learning rate: {current_lr:.6f}")
                         
                         # Free up memory
                         torch.cuda.empty_cache()
@@ -672,10 +691,17 @@ class AVSRTrainer:
                         self._save_checkpoint(is_best=True)
                         logger.info(f"New best validation loss: {val_loss:.4f}")
                 
-                # Save checkpoint
+                # Save checkpoint based on save_every parameter
                 if (epoch + 1) % self.save_every == 0:
                     self._save_checkpoint()
                     logger.info(f"Checkpoint saved at epoch {epoch+1}")
+                    
+                    # Log trainable parameters after saving
+                    if self.log_param_updates:
+                        for name, param in self.model.named_parameters():
+                            if param.requires_grad:
+                                param_norm = param.data.norm().item()
+                                logger.info(f"Parameter stats - {name}: norm={param_norm:.6f}")
             
             # Save final model
             self._save_checkpoint(is_final=True)
