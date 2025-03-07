@@ -345,12 +345,19 @@ class ClipWhisperModel(nn.Module):
             # Combine features based on modality
             if self.modality == "audio":
                 encoder_out = audio_features
+                # Log audio-only mode sequence info
+                if batch_idx % 10 == 0:
+                    logging.info(f"[Batch {batch_idx}] AUDIO-ONLY MODE: Using audio features with shape {audio_features.shape}")
             elif self.modality == "video":
                 encoder_out = video_features
+                # Log video-only mode sequence info
+                if batch_idx % 10 == 0:
+                    logging.info(f"[Batch {batch_idx}] VIDEO-ONLY MODE: Using video features with shape {video_features.shape}")
             else:  # both modalities
                 # Log original sequence lengths before fusion
-                if batch_idx % 25 == 0 and audio_features is not None and video_features is not None:
-                    logging.info(f"[Batch {batch_idx}] Pre-fusion lengths - Audio: {audio_features.size(1)}, Video: {video_features.size(1)}")
+                if batch_idx % 10 == 0 and audio_features is not None and video_features is not None:
+                    logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Pre-fusion audio length = {audio_features.size(1)}, video length = {video_features.size(1)}")
+                    logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: max_seq_len = {self.max_seq_len}")
                 
                 # Ensure both features have the same sequence length,
                 # but also respect the maximum sequence length limit
@@ -362,20 +369,29 @@ class ClipWhisperModel(nn.Module):
                     )
                 )
                 
+                # Log the selected fusion length
+                if batch_idx % 10 == 0:
+                    if max_len < self.max_seq_len:
+                        logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Using natural max length {max_len} (< max_seq_len {self.max_seq_len})")
+                    else:
+                        logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Truncating to max_seq_len {max_len}")
+                
                 # Log if we're truncating during fusion
                 if audio_features is not None and audio_features.size(1) > max_len:
                     # Get the current batch index if available for logging
                     batch_idx = getattr(self, '_current_batch_idx', 0)
                     # Log less frequently to reduce clutter (only every 25 batches)
-                    if batch_idx % 25 == 0:
-                        logging.info(f"[Batch {batch_idx}] Audio features truncated during fusion from {audio_features.size(1)} to {max_len}")
+                    if batch_idx % 10 == 0:
+                        pct_kept = (max_len / audio_features.size(1)) * 100
+                        logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Audio truncated from {audio_features.size(1)} → {max_len} ({pct_kept:.1f}% kept)")
                 
                 if video_features is not None and video_features.size(1) > max_len:
                     # Get the current batch index if available for logging
                     batch_idx = getattr(self, '_current_batch_idx', 0)
                     # Log less frequently to reduce clutter (only every 25 batches)
-                    if batch_idx % 25 == 0:
-                        logging.info(f"[Batch {batch_idx}] Video features truncated during fusion from {video_features.size(1)} to {max_len}")
+                    if batch_idx % 10 == 0:
+                        pct_kept = (max_len / video_features.size(1)) * 100
+                        logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Video truncated from {video_features.size(1)} → {max_len} ({pct_kept:.1f}% kept)")
                 
                 # Pad or truncate to match
                 audio_features = self._pad_or_truncate(audio_features, max_len)
@@ -393,41 +409,21 @@ class ClipWhisperModel(nn.Module):
                     (1 - self.fusion_scale) * video_features
                 )
                 
+                # Log fusion result
+                if batch_idx % 10 == 0:
+                    logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Final fused features shape = {encoder_out.shape}")
+                
                 # Double-check that fusion result respects max_seq_len
                 if encoder_out.size(1) != max_len:
                     logging.warning(f"Unexpected encoder output length after fusion: {encoder_out.size(1)} (expected {max_len})")
                     encoder_out = self._pad_or_truncate(encoder_out, max_len)
             
             # Log final encoder output size before any LLM processing
-            if batch_idx % 25 == 0:
-                logging.info(f"[Batch {batch_idx}] Final encoder output shape: {encoder_out.shape}")
+            if batch_idx % 10 == 0:
+                logging.info(f"[Batch {batch_idx}] FINAL SEQ MONITOR: Encoder output before LLM = {encoder_out.shape}")
             
-            # Ensure we respect max_seq_len
-            if encoder_out.size(1) > self.max_seq_len:
-                # Get the current batch index if available for logging
-                batch_idx = getattr(self, '_current_batch_idx', 0)
-                # Log less frequently to reduce clutter (only every 25 batches)
-                if batch_idx % 25 == 0:
-                    logging.info(f"[Batch {batch_idx}] Encoder output truncated from {encoder_out.size(1)} to {self.max_seq_len}")
-                encoder_out = encoder_out[:, :self.max_seq_len, :]
-                logging.debug(f"Truncated encoder output to {self.max_seq_len}")
-            
-            # Explicitly verify the sequence length after truncation
-            if encoder_out.size(1) != self.max_seq_len:
-                # Get the current batch index if available for logging
-                batch_idx = getattr(self, '_current_batch_idx', 0)
-                if batch_idx % 25 == 0:
-                    logging.info(f"[Batch {batch_idx}] After truncation, encoder output length ({encoder_out.size(1)}) doesn't match max_seq_len ({self.max_seq_len})")
-                # Force the correct sequence length if it still doesn't match
-                if encoder_out.size(1) > self.max_seq_len:
-                    encoder_out = encoder_out[:, :self.max_seq_len, :]
-                    logging.debug(f"Forcibly truncated encoder output to max_seq_len {self.max_seq_len}")
-            
-            # Store sequence length for masking
-            seq_len = encoder_out.size(1)
-            
-            # Track sequence length statistics
-            self._track_sequence_length(seq_len)
+            # Track sequence length stats across all batches - only use the length value after all adjustments
+            self._track_sequence_length(encoder_out.size(1))
             
             # Ensure encoder output matches LLM's expected dtype
             llm_input_dtype = next(self.llm.parameters()).dtype
@@ -436,7 +432,7 @@ class ClipWhisperModel(nn.Module):
                 encoder_out = encoder_out.to(llm_input_dtype)
             
             # Create initial attention mask (all 1s)
-            attention_mask = torch.ones((batch_size, seq_len), dtype=torch.long, device=self.device)
+            attention_mask = torch.ones((batch_size, encoder_out.size(1)), dtype=torch.long, device=self.device)
                 
             # Track memory for LLM forward pass at the appropriate place
             llm_memory_start = self._get_gpu_memory_usage()
@@ -843,10 +839,10 @@ class ClipWhisperModel(nn.Module):
             # Ensure the attention mask has the correct device
             attention_mask = attention_mask.to(device=audio.device)
             
-            # Log original audio size if in debug mode
+            # Log original audio size 
             batch_idx = getattr(self, '_current_batch_idx', 0)
-            if batch_idx % 50 == 0:
-                logging.debug(f"[Batch {batch_idx}] Audio encoder input shape: {audio.shape}")
+            if batch_idx % 10 == 0:  # More frequent logging (every 10 batches)
+                logging.info(f"[Batch {batch_idx}] AUDIO SEQ MONITOR: Raw input shape = {audio.shape}")
             
             # Get Whisper encoder output
             encoder_outputs = self.whisper.encoder(
@@ -859,16 +855,44 @@ class ClipWhisperModel(nn.Module):
             # Get the last hidden state
             last_hidden_state = encoder_outputs.last_hidden_state
             
-            # Log raw encoder output size if in debug mode
-            if batch_idx % 50 == 0:
-                logging.debug(f"[Batch {batch_idx}] Raw Whisper encoder output shape: {last_hidden_state.shape}")
+            # Track audio sequence length statistics
+            audio_seq_len = last_hidden_state.size(1)
+            
+            # Create or update audio sequence length stats
+            if not hasattr(self, '_audio_seq_len_stats'):
+                self._audio_seq_len_stats = {
+                    'min': audio_seq_len,
+                    'max': audio_seq_len,
+                    'sum': audio_seq_len,
+                    'count': 1,
+                    'lengths': [audio_seq_len],
+                }
+            else:
+                self._audio_seq_len_stats['min'] = min(self._audio_seq_len_stats['min'], audio_seq_len)
+                self._audio_seq_len_stats['max'] = max(self._audio_seq_len_stats['max'], audio_seq_len)
+                self._audio_seq_len_stats['sum'] += audio_seq_len
+                self._audio_seq_len_stats['count'] += 1
+                self._audio_seq_len_stats['lengths'].append(audio_seq_len)
+                # Keep only the most recent 100 lengths to avoid memory growth
+                if len(self._audio_seq_len_stats['lengths']) > 100:
+                    self._audio_seq_len_stats['lengths'] = self._audio_seq_len_stats['lengths'][-100:]
+            
+            # Compute average sequence length
+            avg_len = self._audio_seq_len_stats['sum'] / self._audio_seq_len_stats['count']
+            
+            # Log detailed audio sequence length info
+            if batch_idx % 10 == 0:  # More frequent logging
+                logging.info(f"[Batch {batch_idx}] AUDIO SEQ MONITOR: Whisper encoder output length = {audio_seq_len}")
+                logging.info(f"[Batch {batch_idx}] AUDIO SEQ STATS: min={self._audio_seq_len_stats['min']}, "
+                           f"max={self._audio_seq_len_stats['max']}, avg={avg_len:.1f}, "
+                           f"recent={self._audio_seq_len_stats['lengths'][-5:]}")
             
             # Project to LLM dimension
             features = self.audio_connector(last_hidden_state)
             
-            # Log audio features after projection if in debug mode
-            if batch_idx % 50 == 0:
-                logging.debug(f"[Batch {batch_idx}] Projected audio features shape: {features.shape}")
+            # Log audio features after projection
+            if batch_idx % 10 == 0:
+                logging.info(f"[Batch {batch_idx}] AUDIO SEQ MONITOR: Projected features shape = {features.shape}")
             
             # We don't truncate here - preserve full sequence for fusion
             return features
