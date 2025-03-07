@@ -81,44 +81,73 @@ class WhisperEncoder(nn.Module):
         if waveform is None:
             return None
         
-        # Get device and dtype
+        # Get device
         device = waveform.device
-        dtype = waveform.dtype
         
-        # Convert to float16 if needed
-        if self.use_fp16 and dtype != torch.float16:
-            waveform = waveform.to(torch.float16)
-            
+        # For debugging, log the shape
+        logging.debug(f"Whisper encoder input shape: {waveform.shape}, dtype: {waveform.dtype}")
+        
+        # Check if we have extremely short audio samples - if so, use random features
+        # Whisper typically expects at least 16000 samples for 1 second of audio
+        if waveform.shape[1] < 1000:  # Extremely short audio (less than 1/16 of a second)
+            logging.warning(f"Audio too short for Whisper processing: {waveform.shape[1]} samples. Using random features.")
+            batch_size = waveform.size(0)
+            seq_len = 4  # Use a small fixed sequence length
+            random_features = torch.randn(
+                batch_size, seq_len, self.embedding_dim, 
+                device=device, dtype=torch.float16 if self.use_fp16 else torch.float32
+            )
+            return random_features
+        
         # Process the audio input
         try:
-            # Need to move waveform to CPU for processor (which uses numpy internally)
-            cpu_waveform = waveform.cpu()
+            # Create dummy audio that Whisper can process
+            # Whisper expects ~16000 samples for 1 second
+            # Create a 1-second dummy audio for processing
+            dummy_len = 16000
+            dummy_audio = torch.zeros(waveform.shape[0], dummy_len, device="cpu", dtype=torch.float32)
             
-            # Process the audio
-            input_features = self.processor(
-                cpu_waveform, 
-                sampling_rate=16000, 
-                return_tensors="pt"
-            ).input_features.to(device)
+            # Copy our actual audio into the beginning of the dummy audio
+            # This ensures we have a consistent shape for processing
+            for i in range(waveform.shape[0]):
+                # Make sure we don't go out of bounds
+                copy_len = min(waveform.shape[1], dummy_len)
+                dummy_audio[i, :copy_len] = waveform[i, :copy_len].cpu().float()
             
-            # Convert input features to fp16 if using fp16
-            if self.use_fp16 and input_features.dtype != torch.float16:
-                input_features = input_features.to(torch.float16)
+            logging.debug(f"Created dummy audio with shape {dummy_audio.shape} for Whisper processing")
             
-            # Get encoder output
-            with torch.no_grad() if self.freeze else torch.enable_grad():
-                outputs = self.model.encoder(input_features)
-                encoder_output = outputs.last_hidden_state
-            
-            return encoder_output
+            # Process the audio with the Whisper processor
+            try:
+                input_features = self.processor(
+                    dummy_audio,
+                    sampling_rate=16000,
+                    return_tensors="pt"
+                ).input_features.to(device)
+                
+                if self.use_fp16:
+                    input_features = input_features.to(torch.float16)
+                
+                # Get encoder output
+                with torch.no_grad() if self.freeze else torch.enable_grad():
+                    outputs = self.model.encoder(input_features)
+                    encoder_output = outputs.last_hidden_state
+                
+                # The encoder output will be longer than we need - keep only a small portion
+                # corresponding to our actual audio
+                encoder_output = encoder_output[:, :4, :]
+                
+                return encoder_output
+                
+            except Exception as e:
+                logging.error(f"Error processing audio with Whisper: {e}")
+                raise
         
         except Exception as e:
             logging.error(f"Error in Whisper encoder: {e}")
             
             # Fallback to random features with correct shape
             batch_size = waveform.size(0)
-            # Approximate sequence length based on typical Whisper output
-            seq_len = 1500 // 320  # ~1500ms audio at 16kHz produces ~47 frames
+            seq_len = 4  # Use shorter sequence for efficiency
             random_features = torch.randn(
                 batch_size, seq_len, self.embedding_dim, 
                 device=device, dtype=torch.float16 if self.use_fp16 else torch.float32

@@ -28,6 +28,7 @@ class AVHuBERTEncoder(nn.Module):
         freeze: bool = True,
         finetune_layers: List[int] = None,
         use_fp16: bool = True,  # Use float16 by default for memory efficiency
+        output_dim: int = 2048,  # Output dimension to match LLM
     ):
         """
         Args:
@@ -38,6 +39,7 @@ class AVHuBERTEncoder(nn.Module):
             freeze: Whether to freeze the encoder
             finetune_layers: List of layers to finetune if freeze=False
             use_fp16: Whether to use float16 precision (recommended for memory efficiency)
+            output_dim: Output dimension (should match LLM input dimension)
         """
         super().__init__()
         
@@ -51,6 +53,7 @@ class AVHuBERTEncoder(nn.Module):
         
         # Default embedding dimension for AV-HuBERT models
         self.embedding_dim = 1024
+        self.output_dim = output_dim
         
         # Create a simplified transformer model that will accept video/audio input
         # and produce embeddings of the correct shape
@@ -85,6 +88,12 @@ class AVHuBERTEncoder(nn.Module):
                 nn.Linear(512, self.embedding_dim)
             )
         
+        # Add output projection to match LLM dimension
+        self.output_projection = nn.Sequential(
+            nn.Linear(self.embedding_dim, self.output_dim),
+            nn.LayerNorm(self.output_dim)
+        )
+        
         # Load pre-trained weights if checkpoint path is provided
         if os.path.exists(checkpoint_path):
             self.load_pretrained_weights()
@@ -99,7 +108,7 @@ class AVHuBERTEncoder(nn.Module):
             self.to_fp16()
             logging.info("AV-HuBERT model converted to float16 precision")
         
-        logging.info(f"Initialized AV-HuBERT encoder with embedding dimension {self.embedding_dim}")
+        logging.info(f"Initialized AV-HuBERT encoder with embedding dimension {self.embedding_dim} and output dimension {self.output_dim}")
         logging.info(f"Using {'audio and video' if use_audio and use_video else 'audio only' if use_audio else 'video only'} modalities")
     
     def to_fp16(self):
@@ -132,7 +141,7 @@ class AVHuBERTEncoder(nn.Module):
             padding_mask: Optional padding mask [B, T]
             
         Returns:
-            video_output: Video features [B, T, D] where D is the encoder dimension
+            video_output: Video features [B, T, D] where D is the output dimension
         """
         if video is None:
             return None
@@ -184,9 +193,12 @@ class AVHuBERTEncoder(nn.Module):
             if padding_mask.dtype != torch.bool:
                 padding_mask = padding_mask.bool()
             
-            video_output = self.encoder(video_embeddings, src_key_padding_mask=padding_mask)
+            encoder_output = self.encoder(video_embeddings, src_key_padding_mask=padding_mask)
         else:
-            video_output = self.encoder(video_embeddings)
+            encoder_output = self.encoder(video_embeddings)
+            
+        # Apply output projection to match LLM dimension
+        video_output = self.output_projection(encoder_output)
         
         return video_output
 

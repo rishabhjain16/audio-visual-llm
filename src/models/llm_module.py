@@ -73,20 +73,23 @@ class LLMModule(nn.Module):
         # Load the model
         self.model = self._load_model()
         
+        # Load tokenizer
+        self.tokenizer = self._load_tokenizer()
+        
         # Set up LoRA if specified
         if self.use_lora and not hasattr(self.model, "peft_config"):
             self._setup_lora()
             
-        # Initialize encoder projection if needed
-        if self.encoder_dim > 0 and not hasattr(self, "encoder_proj"):
+        # Initialize encoder projection if needed - this is critical for dimension matching
+        if self.encoder_dim > 0:
             logger.info(f"Creating encoder projection from {self.encoder_dim} to {self.model.config.hidden_size}")
             self.encoder_proj = nn.Linear(self.encoder_dim, self.model.config.hidden_size)
-            # Initialize with small values
+            # Initialize with small values for stability
             nn.init.normal_(self.encoder_proj.weight, std=0.02)
             nn.init.zeros_(self.encoder_proj.bias)
             
         # Create an alias for encoder_proj for backwards compatibility
-        self.encoder_projection = self.encoder_proj if hasattr(self, "encoder_proj") else None
+        self.encoder_projection = getattr(self, "encoder_proj", None)
         
         # Enable gradient checkpointing for memory efficiency
         if hasattr(self.model, "gradient_checkpointing_enable"):
@@ -126,113 +129,16 @@ class LLMModule(nn.Module):
                     bnb_4bit_quant_type="nf4"
                 )
             
-            # Try different approaches to load the model
-            model = None
-            error_message = ""
-            
-            # Try loading with standard approach
-            try:
-                logger.info("Attempting to load model with default parameters")
-                model = AutoModelForCausalLM.from_pretrained(
-                    self.model_name_or_path,
-                    quantization_config=quantization_config,
-                    device_map=self.device_map,
-                    torch_dtype=torch.float16,  # Use float16 for memory efficiency
-                    low_cpu_mem_usage=True
-                )
-            except Exception as e:
-                error_message = str(e)
-                logger.warning(f"Failed to load model with default parameters: {e}")
-            
-            # Try loading with ignore_mismatched_sizes
-            if model is None:
-                try:
-                    logger.info("Attempting to load model with ignore_mismatched_sizes=True")
-                    model = AutoModelForCausalLM.from_pretrained(
-                        self.model_name_or_path,
-                        quantization_config=quantization_config,
-                        device_map=self.device_map,
-                        torch_dtype=torch.float16,  # Use float16 for memory efficiency
-                        ignore_mismatched_sizes=True,
-                        low_cpu_mem_usage=True
-                    )
-                except Exception as e:
-                    error_message += f"\nFailed to load model with ignore_mismatched_sizes: {e}"
-                    logger.warning(f"Failed to load model with ignore_mismatched_sizes: {e}")
-            
-            # Try loading with trust_remote_code
-            if model is None:
-                try:
-                    logger.info("Attempting to load model with trust_remote_code=True")
-                    model = AutoModelForCausalLM.from_pretrained(
-                        self.model_name_or_path,
-                        quantization_config=quantization_config,
-                        device_map=self.device_map,
-                        torch_dtype=torch.float16,  # Use float16 for memory efficiency
-                        trust_remote_code=True,
-                        low_cpu_mem_usage=True
-                    )
-                except Exception as e:
-                    error_message += f"\nFailed to load model with trust_remote_code: {e}"
-                    logger.warning(f"Failed to load model with trust_remote_code: {e}")
-            
-            # Try loading with safetensors
-            if model is None:
-                try:
-                    logger.info("Trying to load with safetensors format and ignore_mismatched_sizes=True")
-                    model = AutoModelForCausalLM.from_pretrained(
-                        self.model_name_or_path,
-                        quantization_config=quantization_config,
-                        device_map=self.device_map,
-                        torch_dtype=torch.float32,
-                        low_cpu_mem_usage=True,
-                        ignore_mismatched_sizes=True,
-                        use_safetensors=True
-                    )
-                except Exception as e:
-                    error_message = str(e)
-                    logger.error(f"Failed to load with safetensors: {e}")
-            
-            # If all attempts to load the specified model failed, try a fallback
-            if model is None:
-                # If the error contains 'lm_head.weight', it's likely an architecture mismatch
-                if 'lm_head.weight' in error_message:
-                    fallback_models = [
-                        "gpt2",  # Smallest model, should work on any GPU
-                        "facebook/opt-125m",  # Small OPT model
-                        "EleutherAI/pythia-70m"  # Small Pythia model
-                    ]
-                    
-                    for fallback in fallback_models:
-                        try:
-                            logger.warning(f"Specified model failed to load. Trying fallback model: {fallback}")
-                            model = AutoModelForCausalLM.from_pretrained(
-                                fallback,
-                                torch_dtype=torch.float32,
-                                low_cpu_mem_usage=True
-                            )
-                            if model is not None:
-                                logger.info(f"Successfully loaded fallback model: {fallback}")
-                                # Update model name to reflect what was actually loaded
-                                self.model_name_or_path = fallback
-                                break
-                        except Exception as e:
-                            logger.error(f"Failed to load fallback model {fallback}: {e}")
-            
-            # If we still couldn't load any model, raise an error
-            if model is None:
-                raise ValueError(f"Failed to load any model. Last error: {error_message}")
-            
-            # Load tokenizer
-            tokenizer = self._load_tokenizer()
-            
-            self.model = model
-            self.tokenizer = tokenizer
-            
-            # Print model details
-            model_params = sum(p.numel() for p in model.parameters())
-            logger.info(f"Loaded model with {model_params:,} parameters")
-            logger.info(f"Model type: {type(model).__name__}")
+            # Load model with ignore_mismatched_sizes to handle dimension mismatches
+            logger.info("Loading model with ignore_mismatched_sizes=True")
+            model = AutoModelForCausalLM.from_pretrained(
+                self.model_name_or_path,
+                quantization_config=quantization_config,
+                device_map=self.device_map,
+                torch_dtype=torch.float16,  # Use float16 for memory efficiency
+                low_cpu_mem_usage=True,
+                ignore_mismatched_sizes=True  # Critical for handling dimension mismatches
+            )
             
             return model
             
@@ -336,6 +242,22 @@ class LLMModule(nn.Module):
             if self.encoder_projection is not None and encoder_outputs is not None:
                 logger.debug("Applying encoder projection")
                 encoder_outputs = self.encoder_projection(encoder_outputs)
+            else:
+                # Check if dimensions match the LLM's expected input dimension
+                llm_hidden_size = self.model.config.hidden_size
+                if encoder_outputs.size(-1) != llm_hidden_size:
+                    logger.warning(f"Dimension mismatch: encoder={encoder_outputs.size(-1)}, llm={llm_hidden_size}. Creating projection on the fly.")
+                    # Create a projection on the fly
+                    projection = nn.Linear(encoder_outputs.size(-1), llm_hidden_size, device=encoder_outputs.device)
+                    # Initialize with small values
+                    nn.init.normal_(projection.weight, std=0.02)
+                    nn.init.zeros_(projection.bias)
+                    # Convert to the same dtype as encoder outputs
+                    projection.weight.data = projection.weight.data.to(encoder_outputs.dtype)
+                    projection.bias.data = projection.bias.data.to(encoder_outputs.dtype)
+                    # Apply projection
+                    encoder_outputs = projection(encoder_outputs)
+                    logger.info(f"Applied on-the-fly projection. New shape: {encoder_outputs.shape}")
             
             # Debug logging
             if os.environ.get("AVSR_DEBUG", "0") == "1":
@@ -364,9 +286,20 @@ class LLMModule(nn.Module):
                     # Truncate encoder outputs to match prompt batch size
                     encoder_outputs = encoder_outputs[:prompt_embeds.shape[0]]
             
-            # Ensure both tensors have same data type
-            if prompt_embeds.dtype != encoder_outputs.dtype:
-                encoder_outputs = encoder_outputs.to(prompt_embeds.dtype)
+            # Ensure all tensor inputs are float16 to avoid dtype mismatches
+            for key, value in inputs.items():
+                if isinstance(value, torch.Tensor):
+                    # Labels should remain as integers (long)
+                    if key == 'labels':
+                        if value.dtype != torch.long:
+                            if debug:
+                                logger.debug(f"Converting input '{key}' from {value.dtype} to long")
+                            inputs[key] = value.to(dtype=torch.long)
+                    # Other tensors should be float16
+                    elif value.dtype != torch.float16:
+                        if debug:
+                            logger.debug(f"Converting input '{key}' from {value.dtype} to float16")
+                        inputs[key] = value.to(dtype=torch.float16)
             
             # Combine prompt and encoder embeddings
             try:
@@ -464,138 +397,116 @@ class LLMModule(nn.Module):
         return texts
     
     def forward(self, **inputs):
-        """Forward pass through the LLM
+        """
+        Forward pass through the LLM model
         
         Args:
-            inputs: Dict of inputs to pass to the LLM
-            
-        Returns:
-            outputs: Dict of outputs from the LLM
-        """
-        # Get debug flag
-        debug = inputs.pop('debug', False)
-        
-        # Remove id field that might cause errors in the LLM forward
-        if 'id' in inputs:
-            inputs.pop('id')
-        
-        try:
-            # Set defaults
-            inputs.setdefault('return_dict', True)
-            
-            # Aggressively filter inputs to ONLY include expected keys
-            # Most LLMs expect only these keys
-            valid_keys = ['input_ids', 'inputs_embeds', 'attention_mask', 'labels', 'return_dict']
-            filtered_inputs = {k: v for k, v in inputs.items() if k in valid_keys}
-            
-            # Log the filtering process if debug is enabled
-            if debug:
-                removed_keys = set(inputs.keys()) - set(filtered_inputs.keys())
-                if removed_keys:
-                    logger.debug(f"Removed unexpected inputs: {', '.join(removed_keys)}")
-            
-            # Handle labels if they're provided as a list instead of a tensor
-            if 'labels' in filtered_inputs and not isinstance(filtered_inputs['labels'], torch.Tensor):
-                if debug:
-                    logger.debug(f"Converting labels from {type(filtered_inputs['labels'])} to tensor")
+            **inputs: Dict containing model inputs
+                - inputs_embeds: Encoded inputs [batch_size, seq_len, hidden_dim]
+                - attention_mask: Attention mask [batch_size, seq_len]
+                - labels: Optional labels for training [batch_size, seq_len]
                 
-                # If labels is a list of strings, we need to tokenize them
-                if isinstance(filtered_inputs['labels'], list) and all(isinstance(item, str) for item in filtered_inputs['labels']):
-                    try:
-                        # For now, just remove labels to avoid errors
-                        # This will allow the model to run in inference mode
-                        logger.warning("Text labels not supported in training mode. Removing labels.")
-                        del filtered_inputs['labels']
-                    except Exception as e:
-                        logger.error(f"Error handling text labels: {e}")
-                        # Remove labels to avoid further errors
-                        if 'labels' in filtered_inputs:
-                            del filtered_inputs['labels']
-                else:
-                    # For other types of non-tensor labels, remove them to avoid errors
-                    logger.warning(f"Unsupported label type: {type(filtered_inputs['labels'])}. Removing labels.")
-                    del filtered_inputs['labels']
+        Returns:
+            outputs: Model outputs
+        """
+        try:
+            # Check required inputs and ensure on correct device
+            if 'inputs_embeds' not in inputs:
+                logging.error("Missing required input: inputs_embeds")
+                raise ValueError("inputs_embeds is required for LLM forward pass")
             
-            # Ensure all tensor inputs are float16 to avoid dtype mismatches
-            for key, value in filtered_inputs.items():
-                if isinstance(value, torch.Tensor) and value.dtype != torch.float16:
-                    if debug:
-                        logger.debug(f"Converting input '{key}' from {value.dtype} to float16")
-                    filtered_inputs[key] = value.to(dtype=torch.float16)
+            # Get device from model parameters
+            device = next(self.model.parameters()).device
             
-            # Debug inputs
-            if debug:
+            # Move inputs to correct device
+            filtered_inputs = {}
+            
+            # Only pass valid arguments to the model
+            valid_inputs = [
+                'input_ids', 'inputs_embeds', 'attention_mask', 'labels', 
+                'position_ids', 'past_key_values', 'return_dict'
+            ]
+            
+            for k, v in inputs.items():
+                # Only include valid inputs
+                if k not in valid_inputs:
+                    continue
+                    
+                # Move tensors to the correct device
+                if isinstance(v, torch.Tensor) and v.device != device:
+                    v = v.to(device)
+                filtered_inputs[k] = v
+            
+            # We need to keep debug for logging purposes but not pass it to the model
+            debug_mode = inputs.get('debug', False)
+            
+            # Log input shapes for debugging
+            if debug_mode:
                 for k, v in filtered_inputs.items():
                     if isinstance(v, torch.Tensor):
-                        logger.debug(f"Model input '{k}': shape={v.shape}, device={v.device}, dtype={v.dtype}")
-                    else:
-                        logger.debug(f"Model input '{k}': {v}")
+                        logging.debug(f"Model input '{k}': shape={v.shape}, device={v.device}, dtype={v.dtype}")
             
-            # Forward pass through the model
-            try:
-                outputs = self.model(**filtered_inputs)
-            except RuntimeError as e:
-                if "expected mat1 and mat2 to have the same dtype" in str(e):
-                    # Try to fix dtype mismatch by converting model parameters
-                    logger.warning("Detected dtype mismatch. Attempting to fix by converting parameters...")
-                    
-                    # Convert all necessary parameters to float16
-                    for name, param in self.model.named_parameters():
-                        if param.dtype != torch.float16 and not param.is_meta and param.requires_grad:
-                            logger.info(f"Converting parameter {name} from {param.dtype} to float16")
-                            param.data = param.data.to(torch.float16)
-                    
-                    # Special handling for LoRA parameters
-                    if hasattr(self.model, 'base_model') and hasattr(self.model.base_model, 'model'):
-                        for module in self.model.base_model.model.modules():
-                            if hasattr(module, 'weight') and hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
-                                # Convert LoRA weights
-                                if module.weight.dtype != torch.float16:
-                                    logger.info(f"Converting LoRA base weight from {module.weight.dtype} to float16")
-                                    module.weight.data = module.weight.data.to(torch.float16)
-                                
-                                # Convert LoRA A and B matrices
-                                if hasattr(module, 'lora_A') and module.lora_A.dtype != torch.float16:
-                                    logger.info(f"Converting lora_A from {module.lora_A.dtype} to float16")
-                                    module.lora_A.data = module.lora_A.data.to(torch.float16)
-                                
-                                if hasattr(module, 'lora_B') and module.lora_B.dtype != torch.float16:
-                                    logger.info(f"Converting lora_B from {module.lora_B.dtype} to float16")
-                                    module.lora_B.data = module.lora_B.data.to(torch.float16)
-                    
-                    # Try again with converted parameters
-                    outputs = self.model(**filtered_inputs)
-                else:
-                    # Re-raise if it's not a dtype mismatch error
-                    raise
+            # Ensure inputs are in float16 for memory efficiency if supported
+            if 'inputs_embeds' in filtered_inputs and filtered_inputs['inputs_embeds'].dtype != torch.float16:
+                logging.debug(f"Converting input 'inputs_embeds' from {filtered_inputs['inputs_embeds'].dtype} to float16")
+                filtered_inputs['inputs_embeds'] = filtered_inputs['inputs_embeds'].to(torch.float16)
             
-            # Debug outputs
-            if debug:
-                if isinstance(outputs, dict):
-                    for k, v in outputs.items():
-                        if isinstance(v, torch.Tensor):
-                            logger.debug(f"Model output '{k}': shape={v.shape}, device={v.device}, dtype={v.dtype}")
-                else:
-                    logger.debug(f"Model output type: {type(outputs)}")
+            if 'attention_mask' in filtered_inputs and filtered_inputs['attention_mask'].dtype != torch.float16:
+                logging.debug(f"Converting input 'attention_mask' from {filtered_inputs['attention_mask'].dtype} to float16")
+                filtered_inputs['attention_mask'] = filtered_inputs['attention_mask'].to(torch.float16)
+            
+            # Ensure batch sizes are consistent
+            if 'labels' in filtered_inputs and 'inputs_embeds' in filtered_inputs:
+                input_batch_size = filtered_inputs['inputs_embeds'].size(0)
+                label_batch_size = filtered_inputs['labels'].size(0)
                 
-                # Log GPU memory usage after forward pass
-                if torch.cuda.is_available():
-                    device_idx = 0
-                    if next(self.model.parameters()).device.type == 'cuda':
-                        device_idx = next(self.model.parameters()).device.index
-                    free_mem, total_mem = torch.cuda.mem_get_info(device_idx)
-                    free_mem = free_mem / (1024 ** 3)  # Convert to GB
-                    total_mem = total_mem / (1024 ** 3)  # Convert to GB
-                    used_mem = total_mem - free_mem
-                    logger.debug(f"GPU memory after LLM forward: {used_mem:.2f}GB used / {total_mem:.2f}GB total")
+                if input_batch_size != label_batch_size:
+                    logging.warning(f"Input batch size ({input_batch_size}) doesn't match label batch size ({label_batch_size}). Using smaller one.")
+                    min_batch_size = min(input_batch_size, label_batch_size)
+                    
+                    # Adjust batch sizes
+                    filtered_inputs['inputs_embeds'] = filtered_inputs['inputs_embeds'][:min_batch_size]
+                    filtered_inputs['labels'] = filtered_inputs['labels'][:min_batch_size]
+                    
+                    if 'attention_mask' in filtered_inputs:
+                        filtered_inputs['attention_mask'] = filtered_inputs['attention_mask'][:min_batch_size]
+            
+            # Add return_dict for consistent output format
+            filtered_inputs['return_dict'] = True
+            
+            # Track GPU memory before forward pass if in debug mode
+            track_memory = debug_mode and torch.cuda.is_available()
+            if track_memory:
+                device_idx = 0 if isinstance(device, str) else device.index
+                free_mem, total_mem = torch.cuda.mem_get_info(device_idx)
+                free_mem = free_mem / (1024 ** 3)  # Convert to GB
+                total_mem = total_mem / (1024 ** 3)  # Convert to GB
+                used_mem = total_mem - free_mem
+                logging.debug(f"GPU memory before LLM forward: {used_mem:.2f}GB used / {total_mem:.2f}GB total")
+            
+            # Forward pass through model
+            with torch.cuda.amp.autocast(enabled=True):
+                outputs = self.model(**filtered_inputs)
+            
+            # Log output shapes for debugging
+            if debug_mode and hasattr(outputs, 'logits'):
+                logging.debug(f"Model output 'logits': shape={outputs.logits.shape}, device={outputs.logits.device}, dtype={outputs.logits.dtype}")
+            
+            # Track memory usage after forward pass
+            if track_memory:
+                torch.cuda.empty_cache()  # Free up any unused memory
+                free_mem, total_mem = torch.cuda.mem_get_info(device_idx)
+                free_mem = free_mem / (1024 ** 3)  # Convert to GB
+                total_mem = total_mem / (1024 ** 3)  # Convert to GB
+                used_mem = total_mem - free_mem
+                logging.debug(f"GPU memory after LLM forward: {used_mem:.2f}GB used / {total_mem:.2f}GB total")
             
             return outputs
             
         except Exception as e:
-            logger.error(f"Error in LLM forward: {e}")
-            logger.error(traceback.format_exc())
-            # Create a dummy output with NaN loss
-            return {"loss": torch.tensor(float('nan'), device=next(self.model.parameters()).device)}
+            logging.error(f"Error in LLM forward: {e}")
+            logging.error(traceback.format_exc())
+            raise
     
     def save_pretrained(self, output_dir):
         """Save the model and tokenizer"""

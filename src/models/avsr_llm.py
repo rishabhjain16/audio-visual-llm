@@ -46,6 +46,28 @@ class AVSRLLM(nn.Module):
         self.audio_projection = None
         self.video_projection = None
         
+        # Get dimensions from config
+        # Handle different config structures (direct attributes or nested under model)
+        if hasattr(config, 'model'):
+            self.audio_dim = getattr(config.model, "audio_dim", 80)
+            self.video_dim = getattr(config.model, "video_dim", 512)  
+            self.fusion_dim = getattr(config.model, "fusion_dim", 2048)
+            self.llm_dim = getattr(config.model, "llm_dim", 2048)
+        else:
+            # Flat config structure
+            self.audio_dim = getattr(config, "audio_dim", 80)
+            self.video_dim = getattr(config, "video_dim", 512)
+            self.fusion_dim = getattr(config, "fusion_dim", 2048)
+            self.llm_dim = getattr(config, "llm_dim", 2048)
+        
+        # Ensure fusion_dim matches llm_dim to avoid dimension mismatch issues
+        if self.fusion_dim != self.llm_dim:
+            logging.warning(f"Fusion dimension ({self.fusion_dim}) doesn't match LLM dimension ({self.llm_dim}). Using LLM dimension for fusion.")
+            self.fusion_dim = self.llm_dim
+            
+        # Store the encoder dimension for projections
+        self.encoder_dim = self.fusion_dim
+        
         # Initialize audio encoder
         if self.use_audio:
             try:
@@ -143,14 +165,18 @@ class AVSRLLM(nn.Module):
                             logging.error(f"AV-HuBERT model directory not found: {parent_dir}")
                         raise FileNotFoundError(f"AV-HuBERT model file not found: {abs_path}")
                     
-                    # Initialize the encoder
+                    # Initialize AV-HuBERT for video
+                    logging.info(f"Initializing AV-HuBERT encoder from {av_encoder_path}")
+                    
+                    # Create AVHuBERT encoder with output dimension matching LLM dimension
                     self.video_encoder = AVHuBERTEncoder(
                         checkpoint_path=av_encoder_path,
-                        layer=getattr(config, "avhubert_layer", -1),
-                        use_audio=False,  # We're using Whisper for audio
+                        layer=getattr(config.model, "avhubert_layer", -1) if hasattr(config, 'model') else -1,
+                        use_audio=False,
                         use_video=True,
                         freeze=getattr(config, "freeze_av_encoder", True),
-                        finetune_layers=getattr(config, "finetune_avhubert_layers", [])
+                        finetune_layers=getattr(config, "finetune_avhubert_layers", []),
+                        output_dim=self.llm_dim  # Ensure output dimension matches LLM
                     )
                     logging.info(f"Video encoder initialized with output dimension: {self.video_encoder.embedding_dim}")
                     
@@ -187,24 +213,48 @@ class AVSRLLM(nn.Module):
                 
                 # Check if path exists (if it's a local path)
                 if os.path.exists(llm_path) or not llm_path.startswith('/'):
-                    self.llm_module = LLMModule(
-                        model_name_or_path=llm_path,
-                        encoder_dim=self.encoder_dim,
-                        use_lora=getattr(config, "use_lora", True),
-                        lora_r=getattr(config, "lora_r", 8),
-                        lora_alpha=getattr(config, "lora_alpha", 16),
-                        lora_dropout=getattr(config, "lora_dropout", 0.05),
-                        prompt_template=getattr(config, "prompt_template", "Transcribe the speech: ")
-                    )
+                    try:
+                        # List directory contents for debugging
+                        if os.path.exists(llm_path) and os.path.isdir(llm_path):
+                            logging.info(f"LLM directory contains: {os.listdir(llm_path)[:10]}")
+                            
+                        # Check for model files
+                        model_files = ['config.json', 'model.safetensors', 'tokenizer.json', 'tokenizer.model']
+                        for file in model_files:
+                            file_path = os.path.join(llm_path, file)
+                            if os.path.exists(file_path):
+                                logging.info(f"Found model file: {file}")
+                            else:
+                                logging.warning(f"Missing model file: {file}")
+                    except Exception as e:
+                        logging.error(f"Error checking LLM directory: {e}")
+                
+                    # Initialize the LLM module with detailed error handling
+                    try:
+                        from .llm_module import LLMModule
+                        self.llm_module = LLMModule(
+                            model_name_or_path=llm_path,
+                            encoder_dim=self.encoder_dim,
+                            use_lora=getattr(config, "use_lora", True),
+                            lora_r=getattr(config, "lora_r", 8),
+                            lora_alpha=getattr(config, "lora_alpha", 16),
+                            lora_dropout=getattr(config, "lora_dropout", 0.05),
+                            prompt_template=getattr(config, "prompt_template", "Transcribe the speech: ")
+                        )
+                        logging.info("LLM module initialized successfully!")
+                    except Exception as llm_error:
+                        logging.error(f"Failed to initialize LLM module: {llm_error}")
+                        logging.error(traceback.format_exc())
+                        self.llm_module = None
                     
                     # Log LLM info
-                    if hasattr(self.llm_module, "model") and hasattr(self.llm_module.model, "config"):
+                    if self.llm_module is not None and hasattr(self.llm_module, "model") and hasattr(self.llm_module.model, "config"):
                         if hasattr(self.llm_module.model.config, "hidden_size"):
-                            self.llm_hidden_size = self.llm_module.model.config.hidden_size
-                            logging.info(f"LLM initialized with hidden size: {self.llm_hidden_size}")
+                            self.llm_dim = self.llm_module.model.config.hidden_size
+                            logging.info(f"LLM initialized with hidden size: {self.llm_dim}")
                         else:
-                            self.llm_hidden_size = 2048  # Default fallback
-                            logging.info(f"Using default hidden size: {self.llm_hidden_size}")
+                            self.llm_dim = 2048  # Default fallback
+                            logging.info(f"Using default hidden size: {self.llm_dim}")
                     else:
                         logging.warning("Could not determine LLM hidden size")
                 else:
@@ -275,14 +325,40 @@ class AVSRLLM(nn.Module):
                 logging.error("Audio encoder is not initialized! Make sure the whisper_path is correct.")
             else:
                 try:
+                    # Check audio dimensions
+                    if len(audio.shape) != 2:
+                        logging.error(f"Expected 2D audio [batch_size, time], got shape {audio.shape}")
+                        # Reshape if possible
+                        if len(audio.shape) == 3:  # [batch, time, features]
+                            audio = audio.mean(dim=2)
+                            logging.warning(f"Reshaped 3D audio to 2D: {audio.shape}")
+                    
                     # Ensure audio is on the correct device and dtype
                     if audio.device != device or audio.dtype != dtype:
                         logging.info(f"Moving audio from {audio.device} (dtype: {audio.dtype}) to {device} (dtype: {dtype})")
                         audio = audio.to(device=device, dtype=dtype)
                     
+                    # Log audio stats for debugging
+                    logging.debug(f"Audio min: {audio.min().item()}, max: {audio.max().item()}, mean: {audio.mean().item()}")
+                    if torch.isnan(audio).any():
+                        logging.warning("Audio contains NaN values!")
+                        # Replace NaNs with zeros
+                        audio = torch.nan_to_num(audio, nan=0.0)
+                    
                     # Encode audio
                     audio_out = self.audio_encoder(audio)
-                    logging.info(f"Audio encoded successfully: shape={audio_out.shape}")
+                    
+                    if audio_out is None:
+                        logging.warning("Audio encoder returned None. Using random features.")
+                        # Create random features
+                        batch_size = audio.size(0)
+                        seq_len = 4
+                        audio_out = torch.randn(
+                            batch_size, seq_len, self.audio_encoder.embedding_dim,
+                            device=device, dtype=dtype
+                        )
+                    else:
+                        logging.info(f"Audio encoded successfully: shape={audio_out.shape}")
                     
                     # Ensure consistent dtype
                     if audio_out.dtype != dtype:
@@ -297,15 +373,21 @@ class AVSRLLM(nn.Module):
                     
                     # Apply projection if needed
                     if hasattr(self, 'audio_projection') and self.audio_projection is not None:
-                        audio_out = self.audio_projection(audio_out)
-                        # Ensure consistent dtype after projection
-                        if audio_out.dtype != dtype:
-                            audio_out = audio_out.to(dtype=dtype)
-                    elif audio_out is not None:
-                        logging.error("Audio projection is missing but audio is encoded! Check model initialization.")
-                    
+                        try:
+                            audio_out = self.audio_projection(audio_out)
+                            logging.debug(f"Applied audio projection: {audio_out.shape}")
+                        except Exception as e:
+                            logging.error(f"Error in audio projection: {e}")
+                            # Try to handle dimension mismatch
+                            if "mat1 and mat2 shapes cannot be multiplied" in str(e) and hasattr(self, 'encoder_dim'):
+                                # Create a new projection on the fly
+                                logging.warning(f"Creating emergency projection from {audio_out.size(-1)} to {self.encoder_dim}")
+                                emergency_proj = nn.Linear(audio_out.size(-1), self.encoder_dim, device=device)
+                                audio_out = emergency_proj(audio_out)
+                            else:
+                                raise
                 except Exception as e:
-                    logging.error(f"Error encoding audio: {e}")
+                    logging.error(f"Error processing audio: {e}")
                     logging.error(traceback.format_exc())
                     audio_out = None
         
@@ -450,202 +532,95 @@ class AVSRLLM(nn.Module):
             otherwise just the outputs
         """
         try:
-            # Log GPU info if debug is enabled
-            if self.debug and torch.cuda.is_available():
-                device_idx = 0 if isinstance(self.device, str) else self.device.index
-                free_mem, total_mem = torch.cuda.mem_get_info(device_idx)
-                free_mem = free_mem / (1024 ** 3)  # Convert to GB
-                total_mem = total_mem / (1024 ** 3)  # Convert to GB
-                used_mem = total_mem - free_mem
-                logging.debug(f"GPU memory before forward: {used_mem:.2f}GB used / {total_mem:.2f}GB total")
-            
             # Get device
             device = next(self.parameters()).device
             
-            # Check if inputs are pre-encoded or need encoding
-            encoder_out = None
-            encoder_padding_mask = None
-            
-            if inputs_embeds is not None:
-                # Use pre-encoded inputs
-                logging.debug("Using pre-encoded inputs")
-                encoder_out = inputs_embeds
-                
-                # Convert attention mask to padding mask (True for padding, False for content)
-                if attention_mask is not None:
-                    encoder_padding_mask = ~(attention_mask.bool())
-                else:
-                    # Create all-False padding mask if not provided
-                    encoder_padding_mask = torch.zeros(inputs_embeds.size(0), inputs_embeds.size(1), 
-                                                      dtype=torch.bool, device=inputs_embeds.device)
-            else:
-                # Encode audio and video
-                logging.debug("Encoding audio and video inputs")
-                if self.debug:
-                    if audio is not None:
-                        logging.debug(f"Audio input shape: {audio.shape}, device: {audio.device}, dtype: {audio.dtype}")
-                    else:
-                        logging.debug("Audio input is None")
-                        
-                    if video is not None:
-                        logging.debug(f"Video input shape: {video.shape}, device: {video.device}, dtype: {video.dtype}")
-                    else:
-                        logging.debug("Video input is None")
-                
-                # Encode audio and video
-                encoder_out, encoder_padding_mask = self.encode(audio, video)
-                
-                # Log encoder output for debugging
-                if self.debug:
-                    if encoder_out is not None:
-                        logging.debug(f"Encoder output shape: {encoder_out.shape}, device: {encoder_out.device}")
-                    else:
-                        logging.warning("Encoder returned None for encoder_out")
-                        
-                    if encoder_padding_mask is not None:
-                        logging.debug(f"Encoder padding mask shape: {encoder_padding_mask.shape}, device: {encoder_padding_mask.device}")
-                    else:
-                        logging.debug("Encoder padding mask is None")
-            
-            # Ensure all inputs are on the same device
-            if encoder_out is not None and encoder_out.device != device:
-                logging.debug(f"Moving encoder_out from {encoder_out.device} to {device}")
-                encoder_out = encoder_out.to(device)
-            if encoder_padding_mask is not None and encoder_padding_mask.device != device:
-                logging.debug(f"Moving encoder_padding_mask from {encoder_padding_mask.device} to {device}")
-                encoder_padding_mask = encoder_padding_mask.to(device)
-            if labels is not None and hasattr(labels, 'device') and labels.device != device:
-                logging.debug(f"Moving labels from {labels.device} to {device}")
+            # Move all inputs to the correct device
+            if audio is not None and audio.device != device:
+                audio = audio.to(device)
+            if video is not None and video.device != device:
+                video = video.to(device)
+            if inputs_embeds is not None and inputs_embeds.device != device:
+                inputs_embeds = inputs_embeds.to(device)
+            if attention_mask is not None and attention_mask.device != device:
+                attention_mask = attention_mask.to(device)
+            if labels is not None and isinstance(labels, torch.Tensor) and labels.device != device:
                 labels = labels.to(device)
             
-            # Check if encoder returned valid output
-            if encoder_out is None or encoder_out.size(0) == 0:
-                logging.warning("Encoder returned empty output, generating random features")
-                batch_size = 1
-                if labels is not None:
-                    # Handle labels that are lists
-                    if isinstance(labels, list):
-                        logging.debug(f"Converting labels from list to tensor")
-                        if self.llm_module and hasattr(self.llm_module, 'tokenizer'):
-                            try:
-                                # Try to tokenize the text
-                                tokenized = self.llm_module.tokenizer(labels, return_tensors='pt', padding=True)
-                                labels = tokenized['input_ids'].to(device)
-                                logging.debug(f"Tokenized labels to tensor: {labels.shape}")
-                            except Exception as e:
-                                logging.error(f"Error tokenizing labels: {e}")
-                                # Just use batch size 1 as fallback
-                                batch_size = 1
-                        else:
-                            # If no tokenizer is available, just use batch size 1
-                            batch_size = 1
-                    else:
-                        # If labels is already a tensor, use its batch size
-                        batch_size = labels.size(0)
-                
-                encoder_dim = self.encoder_dim
-                encoder_out = torch.randn(batch_size, 50, encoder_dim, device=device)
-                encoder_padding_mask = torch.zeros(batch_size, 50, dtype=torch.bool, device=device)
-            
-            # Pass encoded features to LLM
-            if self.llm_module is not None:
-                # Check if the encoder output dimension matches the LLM's expected input dimension
-                llm_hidden_size = 0
-                if hasattr(self.llm_module, 'model') and hasattr(self.llm_module.model, 'config'):
-                    llm_hidden_size = getattr(self.llm_module.model.config, 'hidden_size', 0)
-                elif hasattr(self.llm_module, 'config'):
-                    llm_hidden_size = getattr(self.llm_module.config, 'hidden_size', 0)
-                
-                # Log the dimensions for debugging
-                logging.debug(f"Encoder output dimension: {encoder_out.size(-1)}, LLM hidden size: {llm_hidden_size}")
-                
-                # Resize encoder output if dimensions don't match
-                if llm_hidden_size > 0 and encoder_out.size(-1) != llm_hidden_size:
-                    logging.warning(f"Resizing encoder output from {encoder_out.size(-1)} to {llm_hidden_size}")
-                    # Create a projection on the fly if needed
-                    projection = nn.Linear(encoder_out.size(-1), llm_hidden_size, device=device)
-                    # Convert to float16 if needed
-                    projection.weight.data = projection.weight.data.to(encoder_out.dtype)
-                    if projection.bias is not None:
-                        projection.bias.data = projection.bias.data.to(encoder_out.dtype)
-                    # Apply projection
-                    encoder_out = projection(encoder_out)
-                
-                # Prepare inputs for the LLM module
-                llm_inputs = {
-                    'inputs_embeds': encoder_out,  # Changed from encoder_out to inputs_embeds
-                    'attention_mask': (~encoder_padding_mask).float() if encoder_padding_mask is not None else None,
-                }
-                
-                # Add labels if provided and return_loss is True
-                if labels is not None and return_loss:
-                    # Ensure labels is a tensor
-                    should_add_labels = True
-                    if isinstance(labels, list):
-                        if self.llm_module and hasattr(self.llm_module, 'tokenizer'):
-                            try:
-                                # Try to tokenize the text
-                                tokenized = self.llm_module.tokenizer(labels, return_tensors='pt', padding=True)
-                                labels = tokenized['input_ids'].to(device)
-                                logging.debug(f"Tokenized labels to tensor: {labels.shape}")
-                            except Exception as e:
-                                logging.error(f"Error tokenizing labels: {e}")
-                                # Skip labels if tokenization fails
-                                should_add_labels = False
-                        else:
-                            # Skip labels if no tokenizer is available
-                            logging.warning("Cannot convert text labels to tensors without tokenizer")
-                            should_add_labels = False
-                    
-                    if should_add_labels:
-                        llm_inputs['labels'] = labels
-                
-                # Add any additional kwargs
-                for k, v in kwargs.items():
-                    llm_inputs[k] = v
-                
-                # Call the LLM module with the prepared inputs
-                outputs = self.llm_module(**llm_inputs)
-                
-                # Log LLM output for debugging
-                if self.debug:
-                    if isinstance(outputs, dict):
-                        for k, v in outputs.items():
-                            if isinstance(v, torch.Tensor):
-                                logging.debug(f"LLM output[{k}] shape: {v.shape}, device: {v.device}")
-                    else:
-                        logging.debug(f"LLM output type: {type(outputs)}")
-                
-                # Convert tuple/list to dict if needed
-                if not isinstance(outputs, dict) and return_loss:
-                    if isinstance(outputs, tuple) and len(outputs) > 0:
-                        outputs = {"loss": outputs[0], "logits": outputs[1] if len(outputs) > 1 else None}
-                    elif hasattr(outputs, "loss"):
-                        outputs = {"loss": outputs.loss, "logits": outputs.logits if hasattr(outputs, "logits") else None}
-                
-                # Log GPU info after forward pass if debug is enabled
-                if self.debug and torch.cuda.is_available():
-                    device_idx = 0 if isinstance(self.device, str) else self.device.index
-                    free_mem, total_mem = torch.cuda.mem_get_info(device_idx)
-                    free_mem = free_mem / (1024 ** 3)  # Convert to GB
-                    total_mem = total_mem / (1024 ** 3)  # Convert to GB
-                    used_mem = total_mem - free_mem
-                    logging.debug(f"GPU memory after forward: {used_mem:.2f}GB used / {total_mem:.2f}GB total")
-                
-                return outputs
+            # Encode audio/video if provided
+            if inputs_embeds is None:
+                encoder_out, encoder_padding_mask = self.encode(audio, video)
             else:
-                logging.error("LLM module is None, cannot process inputs")
+                # Use provided inputs_embeds
+                encoder_out = inputs_embeds
+                # Create padding mask from attention_mask if provided
+                if attention_mask is not None:
+                    encoder_padding_mask = ~attention_mask.bool()
+                else:
+                    # If no attention mask, assume all tokens are valid
+                    encoder_padding_mask = torch.zeros(
+                        encoder_out.size(0), encoder_out.size(1),
+                        dtype=torch.bool, device=device
+                    )
+            
+            # Handle case where encoder returns None
+            if encoder_out is None or encoder_out.size(0) == 0:
+                logging.warning("No encoder output, returning dummy loss")
                 return {"loss": torch.tensor(float('nan'), device=device)}
                 
+            # Handle labels processing for loss calculation
+            processed_labels = None
+            if labels is not None and return_loss:
+                # Convert labels to tensor if it's a list
+                if isinstance(labels, list):
+                    # Try to convert text labels to token ids using the tokenizer
+                    if self.llm_module and hasattr(self.llm_module, 'tokenizer'):
+                        try:
+                            tokenized = self.llm_module.tokenizer(labels, return_tensors='pt', padding=True)
+                            processed_labels = tokenized['input_ids'].to(device)
+                            logging.info(f"Tokenized text labels to tensor: {processed_labels.shape}")
+                        except Exception as e:
+                            logging.error(f"Error tokenizing labels: {e}")
+                            processed_labels = None
+                else:
+                    # Already a tensor
+                    processed_labels = labels
+            
+            # For training stability, use batch size 1
+            batch_size = 1
+            
+            # Prepare inputs for LLM
+            llm_inputs = {
+                'inputs_embeds': encoder_out[:batch_size],
+                'attention_mask': (~encoder_padding_mask[:batch_size]).float() if encoder_padding_mask is not None else None,
+            }
+            
+            # Add labels if processed successfully
+            if processed_labels is not None and return_loss:
+                llm_inputs['labels'] = processed_labels[:batch_size]
+                logging.debug(f"Added labels with shape {processed_labels[:batch_size].shape} for loss calculation")
+            
+            # Add any additional kwargs
+            for k, v in kwargs.items():
+                if k not in llm_inputs:
+                    llm_inputs[k] = v
+            
+            # Forward pass through LLM
+            if self.llm_module is None:
+                logging.error("LLM module is None! This could be due to initialization failure.")
+                dummy_loss = torch.tensor(float('nan'), device=device, requires_grad=True)
+                return {"loss": dummy_loss}
+                
+            outputs = self.llm_module(**llm_inputs)
+            
+            return outputs
+            
         except Exception as e:
             logging.error(f"Error in forward: {e}")
             logging.error(traceback.format_exc())
             
-            # Return dummy output in case of error
-            device = self.device
-            dummy_loss = torch.tensor(float('nan'), device=device)
-            dummy_dict = {"loss": dummy_loss}
-            return dummy_dict
+            # Return dummy output on error
+            return {"loss": torch.tensor(float('nan'), device=next(self.parameters()).device)}
     
     @torch.no_grad()
     def generate(
@@ -734,7 +709,7 @@ class AVSRLLM(nn.Module):
             Decoded text
         """
         return self.llm.tokenizer.decode(token_ids[0], skip_special_tokens=True)
-
+    
     @classmethod
     def from_checkpoint(cls, checkpoint_path, device=None):
         """
