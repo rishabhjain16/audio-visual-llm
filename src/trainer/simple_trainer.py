@@ -149,6 +149,26 @@ class SimpleTrainer:
         val_losses = []
         best_val_loss = float('inf')
         
+        # Track step-wise losses for more detailed monitoring
+        step_train_losses = []
+        
+        # Set up a log file for tracking losses
+        loss_log_path = os.path.join(self.output_dir, "loss_log.txt")
+        with open(loss_log_path, "w") as f:
+            f.write("epoch,train_loss,val_loss\n")
+        
+        # Print header for console logging
+        print("\n" + "=" * 80)
+        print(f"{'Epoch':^10}|{'Train Loss':^20}|{'Val Loss':^20}|{'Best Val':^20}")
+        print("-" * 80)
+        
+        # Get modality information from model for logging
+        modality = getattr(self.model, 'modality', 'unknown')
+        logging.info(f"Training with modality: {modality}")
+        
+        # Display active component summary based on modality
+        self._display_active_components_summary(modality)
+        
         # Training loop
         for epoch in range(self.max_epochs):
             logging.info(f"Starting epoch {epoch+1}/{self.max_epochs}")
@@ -158,6 +178,7 @@ class SimpleTrainer:
             train_losses.append(train_loss)
             
             # Validate
+            val_loss = float('inf')
             if self.val_dataloader is not None:
                 val_loss = self._validate()
                 val_losses.append(val_loss)
@@ -172,14 +193,31 @@ class SimpleTrainer:
             if (epoch + 1) % self.save_interval == 0:
                 self._save_checkpoint()
             
-            # Log progress
+            # Log progress to file
+            with open(loss_log_path, "a") as f:
+                f.write(f"{epoch+1},{train_loss:.6f},{val_loss:.6f}\n")
+            
+            # Log progress to console with clear formatting
+            is_best = val_loss == best_val_loss
+            best_marker = " (BEST)" if is_best else ""
+            print(f"{epoch+1:^10}|{train_loss:^20.6f}|{val_loss:^20.6f}|{best_val_loss:^20.6f}{best_marker}")
+            
+            # Provide regular logging output
+            modality_info = f"[Modality: {modality}] "
             if self.val_dataloader is not None:
-                logging.info(f"Epoch {epoch+1}/{self.max_epochs} - "
-                           f"Train loss: {train_loss:.4f}, "
-                           f"Val loss: {val_loss:.4f}")
+                logging.info(f"{modality_info}Epoch {epoch+1}/{self.max_epochs} - "
+                           f"Train loss: {train_loss:.6f}, "
+                           f"Val loss: {val_loss:.6f}")
             else:
-                logging.info(f"Epoch {epoch+1}/{self.max_epochs} - "
-                           f"Train loss: {train_loss:.4f}")
+                logging.info(f"{modality_info}Epoch {epoch+1}/{self.max_epochs} - "
+                           f"Train loss: {train_loss:.6f}")
+        
+        # Print final summary
+        print("=" * 80)
+        print(f"Training completed after {self.max_epochs} epochs")
+        print(f"Best validation loss: {best_val_loss:.6f}")
+        print(f"Final training loss: {train_losses[-1]:.6f}")
+        print("=" * 80)
         
         # Save final model
         self._save_checkpoint(is_final=True)
@@ -205,6 +243,24 @@ class SimpleTrainer:
             llm_frozen = True
             logging.info("Training with frozen LLM - training only the connectors")
         
+        # Get modality information for logging
+        modality = getattr(self.model, 'modality', 'unknown')
+        
+        # Add periodic sanity check
+        logging.info(f"SANITY CHECK - EPOCH {epoch+1}:")
+        logging.info(f"  Current modality: {modality}")
+        if hasattr(self.model, 'audio_dim'):
+            logging.info(f"  Audio dimension: {self.model.audio_dim}")
+        if hasattr(self.model, 'video_dim'):
+            logging.info(f"  Video dimension: {self.model.video_dim}")
+        if hasattr(self.model, 'llm_dim'):
+            logging.info(f"  LLM dimension: {self.model.llm_dim}")
+        
+        # Force print to console as well
+        print(f"\nSANITY CHECK - EPOCH {epoch+1}:")
+        print(f"  Current modality: {modality}")
+        print(f"  Using {modality.upper()} modality for training\n")
+        
         # Progress bar
         pbar = tqdm(
             enumerate(self.train_dataloader),
@@ -223,9 +279,10 @@ class SimpleTrainer:
                 loss = self._process_batch(batch, batch_idx=batch_idx, is_train=True)
                 
                 # Update progress bar
-                desc = f"Epoch {epoch+1} | Loss: {loss:.4f}"
+                desc = f"Epoch {epoch+1} | Loss: {loss:.6f}"
                 if llm_frozen:
                     desc += " (LLM frozen)"
+                desc += f" | Modality: {modality}"
                 pbar.set_description(desc)
                 
                 # Update statistics
@@ -235,7 +292,7 @@ class SimpleTrainer:
                 
                 # Log progress
                 if batch_idx % self.log_interval == 0:
-                    logging.info(f"Epoch {epoch+1} | Batch {batch_idx}/{len(self.train_dataloader)} | Loss: {loss:.4f}")
+                    logging.info(f"Epoch {epoch+1} | Batch {batch_idx}/{len(self.train_dataloader)} | Loss: {loss:.6f} | Modality: {modality}")
                 
             except Exception as e:
                 logging.error(f"Error processing batch {batch_idx}: {e}")
@@ -252,6 +309,9 @@ class SimpleTrainer:
         self.model.eval()
         total_loss = 0
         total_samples = 0
+        
+        # Get modality information for logging
+        modality = getattr(self.model, 'modality', 'unknown')
         
         # Progress bar
         pbar = tqdm(
@@ -272,7 +332,7 @@ class SimpleTrainer:
                     loss = self._process_batch(batch, batch_idx=batch_idx, is_train=False)
                     
                     # Update progress bar
-                    pbar.set_description(f"Validation | Loss: {loss:.4f}")
+                    pbar.set_description(f"Validation | Loss: {loss:.6f} | Modality: {modality}")
                     
                     # Update statistics
                     batch_size = len(batch["audio"])
@@ -287,6 +347,9 @@ class SimpleTrainer:
         # Calculate average loss
         avg_loss = total_loss / total_samples if total_samples > 0 else float('inf')
         
+        # Log validation results
+        logging.info(f"Validation complete | Avg Loss: {avg_loss:.6f} | Modality: {modality}")
+        
         return avg_loss
     
     def _process_batch(self, batch, batch_idx=0, is_train=True):
@@ -296,6 +359,14 @@ class SimpleTrainer:
             audio = batch["audio"].to(self.device)
             video = batch["video"].to(self.device)
             labels = batch["labels"].to(self.device)
+            
+            # Log batch dimensions
+            if batch_idx % 50 == 0:  # Log every 50 batches to avoid overwhelming logs
+                modality = getattr(self.model, 'modality', 'unknown')
+                logging.info(f"Batch {batch_idx} dimensions [modality={modality}]:")
+                logging.info(f"  Audio: {audio.shape}, {audio.dtype}")
+                logging.info(f"  Video: {video.shape}, {video.dtype}")
+                logging.info(f"  Labels: {labels.shape}, {labels.dtype}")
             
             # Check for NaN/Inf values in input
             if torch.isnan(audio).any() or torch.isinf(audio).any():
@@ -478,4 +549,70 @@ class SimpleTrainer:
                     "val_losses": val_losses,
                 },
                 f
-            ) 
+            )
+    
+    def _display_active_components_summary(self, modality):
+        """Display a summary of active components based on modality"""
+        # Make sure we're using the actual model's modality, not the parameter
+        if hasattr(self.model, 'modality'):
+            modality = self.model.modality
+            logging.info(f"Using model's actual modality: {modality}")
+        
+        # Skip if model doesn't have the expected attributes
+        if not hasattr(self.model, 'audio_dim') or not hasattr(self.model, 'video_dim') or not hasattr(self.model, 'llm_dim'):
+            return
+            
+        # Get dimensions
+        audio_dim = self.model.audio_dim
+        video_dim = self.model.video_dim
+        llm_dim = self.model.llm_dim
+        
+        # Create a clear summary banner
+        summary_banner = "=" * 100
+        logging.info(f"\n{summary_banner}")
+        logging.info(f"ACTIVE COMPONENTS SUMMARY FOR MODALITY: {modality.upper()}")
+        logging.info(f"{'-' * 100}")
+        
+        # Component table header
+        logging.info(f"{'COMPONENT':<30} {'INPUT DIM':<15} {'OUTPUT DIM':<15} {'ACTIVE':<10}")
+        logging.info(f"{'-' * 100}")
+        
+        # List components based on modality
+        if modality in ["audio", "both"]:
+            logging.info(f"{'Audio Encoder (Whisper)':<30} {'Raw Audio':<15} {audio_dim:<15} {'YES':<10}")
+            logging.info(f"{'Audio Connector':<30} {audio_dim:<15} {llm_dim:<15} {'YES':<10}")
+        else:
+            logging.info(f"{'Audio Encoder (Whisper)':<30} {'Raw Audio':<15} {audio_dim:<15} {'NO':<10}")
+            logging.info(f"{'Audio Connector':<30} {audio_dim:<15} {llm_dim:<15} {'NO':<10}")
+            
+        if modality in ["video", "both"]:
+            logging.info(f"{'Video Encoder (CLIP)':<30} {'Raw Video':<15} {video_dim:<15} {'YES':<10}")
+            logging.info(f"{'Video Connector':<30} {video_dim:<15} {llm_dim:<15} {'YES':<10}")
+        else:
+            logging.info(f"{'Video Encoder (CLIP)':<30} {'Raw Video':<15} {video_dim:<15} {'NO':<10}")
+            logging.info(f"{'Video Connector':<30} {video_dim:<15} {llm_dim:<15} {'NO':<10}")
+            
+        if modality == "both":
+            logging.info(f"{'Fusion (weighted average)':<30} {llm_dim:<15} {llm_dim:<15} {'YES':<10}")
+        else:
+            logging.info(f"{'Fusion (weighted average)':<30} {llm_dim:<15} {llm_dim:<15} {'NO':<10}")
+            
+        logging.info(f"{'LLM':<30} {llm_dim:<15} {'Vocab Size':<15} {'YES':<10}")
+        
+        # End summary
+        logging.info(f"{summary_banner}\n")
+        
+        # Print to console as well for visibility
+        print(f"\nACTIVE COMPONENTS FOR MODALITY: {modality.upper()}")
+        if modality == "audio":
+            print("- Using WHISPER for audio encoding")
+            print("- Using audio connector to project to LLM dimension")
+        elif modality == "video":
+            print("- Using CLIP for video encoding")
+            print("- Using video connector to project to LLM dimension")
+        elif modality == "both":
+            print("- Using WHISPER for audio encoding")
+            print("- Using CLIP for video encoding")
+            print("- Using both connectors and fusion for combined features")
+        print(f"- All features projected to LLM dimension: {llm_dim}")
+        print("") 

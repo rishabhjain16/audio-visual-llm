@@ -71,22 +71,41 @@ class SimpleAVSRModel(nn.Module):
         """Initialize the AVSR model"""
         super().__init__()
         
-        # Store initialization parameters
+        # Set modality with clear logging
+        self.modality = modality
+        modality_banner = "=" * 80
+        logging.info(f"\n{modality_banner}")
+        if modality == "audio":
+            logging.info(f"USING AUDIO-ONLY MODALITY")
+            logging.info(f"Only audio encoder and audio connector will be used")
+        elif modality == "video":
+            logging.info(f"USING VIDEO-ONLY MODALITY")
+            logging.info(f"Only video encoder and video connector will be used")
+        elif modality == "both":
+            logging.info(f"USING COMBINED AUDIO+VIDEO MODALITY")
+            logging.info(f"Both encoders will be used with fusion_scale={fusion_scale}")
+        else:
+            logging.warning(f"Unknown modality: {modality}, defaulting to 'both'")
+            self.modality = "both"
+        logging.info(f"{modality_banner}\n")
+        
+        # Store configuration options
         self.device = device
+        self.dtype = torch.float16 if use_fp16 else torch.float32
+        self.freeze_encoders = freeze_encoders
+        self.freeze_llm = freeze_llm
+        self.max_seq_len = max_seq_len
+        self.fusion_scale = fusion_scale
+        
+        # Store initialization parameters
         self.use_fp16 = use_fp16
         self.use_lora = use_lora
         self.use_4bit = use_4bit
-        self.modality = modality
-        self.max_seq_len = max_seq_len
-        self.freeze_encoders = freeze_encoders
-        self.freeze_llm = freeze_llm
         self.lora_r = lora_r
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
-        self.fusion_scale = fusion_scale  # For controlling modality weighting
         
         # Set dtype based on use_fp16
-        self.dtype = torch.float16 if use_fp16 else torch.float32
         logging.info(f"Using dtype: {self.dtype}")
         
         # Load models and processors
@@ -115,22 +134,35 @@ class SimpleAVSRModel(nn.Module):
         # Using consistent dtype (float32) for stability
         connector_dtype = torch.float32
         
+        # Print detailed dimension table for all components
+        dim_banner = "-" * 80
+        logging.info(f"\n{dim_banner}")
+        logging.info(f"{'COMPONENT':<30} {'INPUT DIM':<15} {'OUTPUT DIM':<15} {'DTYPE':<10} {'ACTIVE IN MODALITY':<20}")
+        logging.info(f"{dim_banner}")
+        
+        # Audio components
         self.audio_connector = ModalityConnector(
             input_dim=self.audio_dim,
             output_dim=self.llm_dim,
             device=self.device,
             dtype=connector_dtype
         )
+        logging.info(f"{'Audio Encoder (Whisper)':<30} {'-':<15} {self.audio_dim:<15} {next(self.whisper.parameters()).dtype} {'audio, both':<20}")
+        logging.info(f"{'Audio Connector':<30} {self.audio_dim:<15} {self.llm_dim:<15} {connector_dtype} {'audio, both':<20}")
         
+        # Video components
         self.video_connector = ModalityConnector(
             input_dim=self.video_dim,
             output_dim=self.llm_dim,
             device=self.device,
             dtype=connector_dtype
         )
+        logging.info(f"{'Video Encoder (CLIP)':<30} {'-':<15} {self.video_dim:<15} {next(self.clip.parameters()).dtype} {'video, both':<20}")
+        logging.info(f"{'Video Connector':<30} {self.video_dim:<15} {self.llm_dim:<15} {connector_dtype} {'video, both':<20}")
         
-        # We don't need the fusion connector or video_to_audio_dim anymore with this approach
-        # as we'll handle modalities separately
+        # LLM
+        logging.info(f"{'LLM':<30} {self.llm_dim:<15} {'-':<15} {next(self.llm.parameters()).dtype} {'all':<20}")
+        logging.info(f"{dim_banner}\n")
         
         # Freeze encoders if specified
         if self.freeze_encoders:
@@ -197,6 +229,24 @@ class SimpleAVSRModel(nn.Module):
     ):
         """Forward pass through the model"""
         try:
+            # Log the modality that's being used with a clear banner for easy identification
+            modality_banner = "#" * 50
+            logging.info(f"\n{modality_banner}")
+            logging.info(f"# FORWARD PASS USING MODALITY: {self.modality.upper()} #")
+            
+            # Verify expected inputs based on modality for debugging
+            if self.modality == "audio" and audio is None:
+                logging.warning("Audio modality selected but no audio input provided")
+            elif self.modality == "video" and video is None:
+                logging.warning("Video modality selected but no video input provided")
+            elif self.modality == "both" and (audio is None or video is None):
+                if audio is None:
+                    logging.warning("Both modality selected but no audio input provided")
+                if video is None:
+                    logging.warning("Both modality selected but no video input provided")
+            
+            logging.info(f"{modality_banner}\n")
+            
             # Log input shapes for debugging
             if audio is not None:
                 logging.info(f"Input audio shape: {audio.shape}, dtype: {audio.dtype}")
@@ -208,6 +258,7 @@ class SimpleAVSRModel(nn.Module):
             # Encode audio if provided
             audio_features = None
             if audio is not None and self.modality in ["audio", "both"]:
+                logging.info(f"Processing audio input for modality: {self.modality}")
                 # Handle NaN/Inf values
                 if torch.isnan(audio).any() or torch.isinf(audio).any():
                     audio = torch.nan_to_num(audio)
@@ -217,10 +268,13 @@ class SimpleAVSRModel(nn.Module):
                 # Handle NaN/Inf values
                 if audio_features is not None and (torch.isnan(audio_features).any() or torch.isinf(audio_features).any()):
                     audio_features = torch.nan_to_num(audio_features)
+            elif self.modality == "audio" and audio is None:
+                logging.warning("Audio modality selected but no audio input provided")
             
             # Encode video if provided
             video_features = None
             if video is not None and self.modality in ["video", "both"]:
+                logging.info(f"Processing video input for modality: {self.modality}")
                 # Handle NaN/Inf values
                 if torch.isnan(video).any() or torch.isinf(video).any():
                     video = torch.nan_to_num(video)
@@ -230,6 +284,8 @@ class SimpleAVSRModel(nn.Module):
                 # Handle NaN/Inf values
                 if video_features is not None and (torch.isnan(video_features).any() or torch.isinf(video_features).any()):
                     video_features = torch.nan_to_num(video_features)
+            elif self.modality == "video" and video is None:
+                logging.warning("Video modality selected but no video input provided")
             
             # Determine which modality to use and project to LLM dimension
             encoder_out = None
@@ -240,17 +296,29 @@ class SimpleAVSRModel(nn.Module):
             if audio_features is not None and (self.modality == "audio" or (self.modality == "both" and video_features is None)):
                 # Truncate to max_seq_len
                 audio_features = audio_features[:, :self.max_seq_len, :]
+                logging.info(f"Audio features before connector: shape={audio_features.shape}, dtype={audio_features.dtype}")
                 encoder_out = self.audio_connector(audio_features)
+                logging.info(f"Audio features after connector: shape={encoder_out.shape}, dtype={encoder_out.dtype}")
                 batch_size, seq_len = encoder_out.size(0), encoder_out.size(1)
-                logging.info(f"Using audio-only path, encoder_out shape: {encoder_out.shape}, dtype: {encoder_out.dtype}")
+                path_banner = "=" * 80
+                logging.info(f"\n{path_banner}")
+                logging.info(f"USING AUDIO-ONLY PATH (modality={self.modality})")
+                logging.info(f"Encoder output shape: {encoder_out.shape}, dtype: {encoder_out.dtype}")
+                logging.info(f"{path_banner}")
             
             # Video only path
             elif video_features is not None and (self.modality == "video" or (self.modality == "both" and audio_features is None)):
                 # Truncate to max_seq_len
                 video_features = video_features[:, :self.max_seq_len, :]
+                logging.info(f"Video features before connector: shape={video_features.shape}, dtype={video_features.dtype}")
                 encoder_out = self.video_connector(video_features)
+                logging.info(f"Video features after connector: shape={encoder_out.shape}, dtype={encoder_out.dtype}")
                 batch_size, seq_len = encoder_out.size(0), encoder_out.size(1)
-                logging.info(f"Using video-only path, encoder_out shape: {encoder_out.shape}, dtype: {encoder_out.dtype}")
+                path_banner = "=" * 80
+                logging.info(f"\n{path_banner}")
+                logging.info(f"USING VIDEO-ONLY PATH (modality={self.modality})")
+                logging.info(f"Encoder output shape: {encoder_out.shape}, dtype: {encoder_out.dtype}")
+                logging.info(f"{path_banner}")
             
             # Combined path (both audio and video)
             elif audio_features is not None and video_features is not None and self.modality == "both":
@@ -264,13 +332,23 @@ class SimpleAVSRModel(nn.Module):
                 video_features = video_features[:, :common_seq_len, :]
                 
                 # Project each to LLM dimension separately
+                logging.info(f"Audio features before connector: shape={audio_features.shape}, dtype={audio_features.dtype}")
                 audio_llm_features = self.audio_connector(audio_features)
+                logging.info(f"Audio features after connector: shape={audio_llm_features.shape}, dtype={audio_llm_features.dtype}")
+                
+                logging.info(f"Video features before connector: shape={video_features.shape}, dtype={video_features.dtype}")
                 video_llm_features = self.video_connector(video_features)
+                logging.info(f"Video features after connector: shape={video_llm_features.shape}, dtype={video_llm_features.dtype}")
                 
                 # Average both features (simple fusion)
                 encoder_out = audio_llm_features * self.fusion_scale + video_llm_features * (1 - self.fusion_scale)
                 batch_size, seq_len = encoder_out.size(0), encoder_out.size(1)
-                logging.info(f"Using combined path, encoder_out shape: {encoder_out.shape}, dtype: {encoder_out.dtype}")
+                path_banner = "=" * 80
+                logging.info(f"\n{path_banner}")
+                logging.info(f"USING COMBINED (AUDIO+VIDEO) PATH (modality={self.modality})")
+                logging.info(f"Fusion scale: {self.fusion_scale}")
+                logging.info(f"Encoder output shape: {encoder_out.shape}, dtype: {encoder_out.dtype}")
+                logging.info(f"{path_banner}")
             
             else:
                 raise ValueError("At least one of audio or video must be provided and match the specified modality")
@@ -668,7 +746,7 @@ class SimpleAVSRModel(nn.Module):
         logging.info("=" * 80)
         
     def encode_audio(self, audio, attention_mask=None):
-        """Encode audio using Whisper with robust error handling"""
+        """Encode audio using Whisper"""
         with torch.no_grad():
             try:
                 # Ensure audio is on the correct device
@@ -676,42 +754,35 @@ class SimpleAVSRModel(nn.Module):
                     audio = audio.to(self.device)
                 
                 # IMPORTANT: Convert to the SAME dtype as the Whisper model
-                # This fixes the "Input type and bias type should be the same" error
                 whisper_dtype = next(self.whisper.parameters()).dtype
                 if audio.dtype != whisper_dtype:
                     audio = audio.to(whisper_dtype)
                 
-                # Handle potential NaN values
+                # Check for NaN values
                 if torch.isnan(audio).any() or torch.isinf(audio).any():
                     logging.warning("NaN/Inf values detected in audio input, replacing with zeros")
                     audio = torch.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
                 
-                # Get batch size and input length for fallback tensor creation
-                batch_size = audio.size(0)
-                input_length = audio.size(1)
-                expected_seq_len = input_length // 16  # Typical whisper downsampling
+                # Get Whisper features
+                whisper_output = self.whisper.encoder(audio)
                 
-                # Run the encoder with explicit error handling
-                # Use the SAME precision as the model, don't force float32
-                with torch.amp.autocast('cuda', enabled=False):
-                    whisper_out = self.whisper.encoder(audio)
-                    audio_features = whisper_out.last_hidden_state
+                # Get the last hidden state from the output
+                if hasattr(whisper_output, "last_hidden_state"):
+                    features = whisper_output.last_hidden_state
+                else:
+                    features = whisper_output
                 
-                # Check for NaN values in the output
-                if torch.isnan(audio_features).any() or torch.isinf(audio_features).any():
-                    logging.warning("NaN/Inf values in Whisper output, using zeros")
-                    audio_features = torch.zeros(
-                        (batch_size, expected_seq_len, self.audio_dim),
-                        device=self.device,
-                        dtype=whisper_dtype  # Match Whisper's dtype
-                    )
+                # Log the dimensionality of the audio features
+                logging.info(f"Audio encoder output shape: {features.shape}, dtype: {features.dtype}")
                 
-                # Keep the output in the same dtype as Whisper
-                return audio_features
+                return features
                 
             except Exception as e:
-                # Handle any errors in the Whisper encoder
-                logging.warning(f"Error in Whisper encoder: {e}")
+                logging.error(f"Error encoding audio: {e}")
+                logging.error(traceback.format_exc())
+                
+                # Return a dummy tensor with the expected shape and dtype
+                # This helps training continue even if there's an issue with this example
                 batch_size = audio.size(0)
                 expected_seq_len = audio.size(1) // 16
                 whisper_dtype = next(self.whisper.parameters()).dtype
@@ -770,12 +841,9 @@ class SimpleAVSRModel(nn.Module):
                 video_features = video_features.reshape(batch_size, num_frames, -1)
                 logging.info(f"Final video features shape: {video_features.shape}")
                 
-                # Check for NaN values in the output
-                if torch.isnan(video_features).any() or torch.isinf(video_features).any():
-                    logging.warning("NaN/Inf values in CLIP output, replacing with zeros")
-                    video_features = torch.zeros_like(video_features)
+                # Log the dimensionality of the video features
+                logging.info(f"Video encoder output shape: {video_features.shape}, dtype: {video_features.dtype}")
                 
-                # Keep the output in the same dtype as CLIP
                 return video_features
                 
             except Exception as e:

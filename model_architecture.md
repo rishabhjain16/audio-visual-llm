@@ -95,11 +95,17 @@ Our Audio-Visual Speech Recognition (AVSR) model integrates audio and video inpu
 
 ## Modality Handling
 
-Our model supports three modality modes:
+Our model supports three modality modes, which can be selected for both training and inference:
 
-1. **Audio-Only Mode**: Only processes audio inputs through the audio encoder and connector.
-2. **Video-Only Mode**: Only processes video inputs through the video encoder and connector.
+1. **Audio-Only Mode**: Only processes audio inputs through the audio encoder and connector. Fusion is skipped as there's no video input.
+2. **Video-Only Mode**: Only processes video inputs through the video encoder and connector. Fusion is skipped as there's no audio input.
 3. **Combined Mode (both)**: Processes both audio and video, fusing the features for improved performance.
+
+The model automatically detects whether to apply fusion based on:
+- The selected modality
+- The availability of inputs (audio and/or video)
+
+If the modality is set to "both" but only one input type is available, the model will process just that input without fusion.
 
 ## Decoding Process
 
@@ -158,16 +164,68 @@ The model saves checkpoints based on:
 2. **Best performance**: When validation loss improves
 3. **Final checkpoint**: At the end of training
 
-## Controlling Training Duration
+## Controlling Training
 
-You can control the number of training epochs with:
+### Modality Selection for Training
+
+You can control which modality to use during training with the `--modality` parameter:
 
 ```bash
 python scripts/train.py \
   --config configs/default.yaml \
-  --max_epochs 10 \
-  --save_every 2 \
-  --log_param_updates
+  --modality audio  # Use only audio for training
+```
+
+```bash
+python scripts/train.py \
+  --config configs/default.yaml \
+  --modality video  # Use only video for training
+```
+
+```bash
+python scripts/train.py \
+  --config configs/default.yaml \
+  --modality both   # Use both audio and video (default)
+```
+
+### Checkpoint Saving Control
+
+You can control checkpoint saving in two ways:
+
+1. **Epoch-based saving** - Save checkpoints every N epochs:
+```bash
+python scripts/train.py \
+  --config configs/default.yaml \
+  --save_every 2  # Save every 2 epochs
+```
+
+2. **Step-based saving** - Save checkpoints every N steps (parameter updates):
+```bash
+python scripts/train.py \
+  --config configs/default.yaml \
+  --save_steps 1000  # Save every 1000 training steps
+```
+
+When using step-based saving, it overrides the epoch-based saving behavior.
+
+### Training Duration Control
+
+You can control how long to train with:
+
+```bash
+python scripts/train.py \
+  --config configs/default.yaml \
+  --max_epochs 10  # Train for 10 epochs
+```
+
+### Parameter Update Monitoring
+
+To verify parameter updates are happening properly:
+
+```bash
+python scripts/train.py \
+  --config configs/default.yaml \
+  --log_param_updates  # Track and log parameter changes
 ```
 
 ## Memory Management

@@ -10,7 +10,12 @@ CLIP_MODEL="openai/clip-vit-base-patch32"
 CONFIG_FILE="configs/simple.yaml"
 GPU_ID=0
 DEBUG=false
-BATCH_SIZE=2  # Default to a small batch size for stability
+BATCH_SIZE=4  # Default to a small batch size for stability
+MODALITY="audio"  # Default to using both audio and video
+SAVE_EVERY=1  # Default to saving every epoch
+SAVE_STEPS=""  # Empty by default, won't be used unless specified
+LOG_PARAM_UPDATES=false  # Default to not logging parameter updates
+MAX_EPOCHS=10  # Default number of epochs
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -47,6 +52,26 @@ while [[ $# -gt 0 ]]; do
       BATCH_SIZE="$2"
       shift 2
       ;;
+    --modality)
+      MODALITY="$2"
+      shift 2
+      ;;
+    --save_every)
+      SAVE_EVERY="$2"
+      shift 2
+      ;;
+    --save_steps)
+      SAVE_STEPS="$2"
+      shift 2
+      ;;
+    --max_epochs)
+      MAX_EPOCHS="$2"
+      shift 2
+      ;;
+    --log_param_updates)
+      LOG_PARAM_UPDATES=true
+      shift
+      ;;
     --debug)
       DEBUG=true
       shift
@@ -68,6 +93,12 @@ echo "CLIP model: $CLIP_MODEL"
 echo "Config file: $CONFIG_FILE"
 echo "GPU ID: $GPU_ID"
 echo "Batch size: $BATCH_SIZE"
+echo "Modality: $MODALITY"
+echo "Max epochs: $MAX_EPOCHS"
+echo "Save every: $SAVE_EVERY epochs"
+if [ -n "$SAVE_STEPS" ]; then
+  echo "Save every: $SAVE_STEPS steps"
+fi
 
 # Check paths exist
 if [ -d "$LLM_PATH" ]; then
@@ -91,7 +122,19 @@ python_cmd="python scripts/train_simple.py \
   --clip_model $CLIP_MODEL \
   --gpu $GPU_ID \
   --batch_size $BATCH_SIZE \
-  --fp16"
+  --max_epochs $MAX_EPOCHS \
+  --modality $MODALITY \
+  --save_every $SAVE_EVERY"
+
+# Add save_steps if specified
+if [ -n "$SAVE_STEPS" ]; then
+  python_cmd="$python_cmd --save_steps $SAVE_STEPS"
+fi
+
+# Add log_param_updates if enabled
+if [ "$LOG_PARAM_UPDATES" = true ]; then
+  python_cmd="$python_cmd --log_param_updates"
+fi
 
 # Add debug flag if enabled
 if [ "$DEBUG" = true ]; then
@@ -99,6 +142,7 @@ if [ "$DEBUG" = true ]; then
 fi
 
 # Run the command
+echo "Executing: $python_cmd"
 eval $python_cmd
 
 # Check if training completed successfully

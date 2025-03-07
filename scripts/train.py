@@ -43,8 +43,12 @@ def parse_args():
                         help="Maximum number of epochs to train for")
     parser.add_argument("--save_every", type=int, default=None,
                         help="Save checkpoint every N epochs")
+    parser.add_argument("--save_steps", type=int, default=None,
+                        help="Save checkpoint every N training steps (overrides save_every)")
     parser.add_argument("--log_param_updates", action="store_true",
                         help="Log parameter updates during training")
+    parser.add_argument("--modality", type=str, choices=["audio", "video", "both"], default=None,
+                        help="Modality to use for training: audio-only, video-only, or both")
     return parser.parse_args()
 
 
@@ -73,7 +77,12 @@ def main():
         config.training.num_epochs = args.max_epochs
     if args.save_every is not None:
         config.training.save_every = args.save_every
-        
+    if args.save_steps is not None:
+        config.training.save_steps = args.save_steps
+    if args.modality is not None:
+        config.model.modality = args.modality
+        logging.info(f"Setting training modality to: {args.modality}")
+    
     # Set parameter update logging
     config.log_param_updates = args.log_param_updates
     

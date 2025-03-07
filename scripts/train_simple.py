@@ -44,6 +44,14 @@ def parse_args():
                         help="GPU ID to use")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug mode (more logging)")
+    parser.add_argument("--modality", type=str, choices=["audio", "video", "both"], default=None,
+                        help="Modality to use for training: audio-only, video-only, or both")
+    parser.add_argument("--save_every", type=int, default=None,
+                        help="Save checkpoint every N epochs")
+    parser.add_argument("--save_steps", type=int, default=None,
+                        help="Save checkpoint every N training steps (overrides save_every)")
+    parser.add_argument("--log_param_updates", action="store_true",
+                        help="Log parameter updates during training")
     return parser.parse_args()
 
 def load_config(config_path):
@@ -83,6 +91,11 @@ def main():
         config["model"]["clip_model"] = args.clip_model
     config["model"]["fp16"] = args.fp16 if args.fp16 else False  # Default to False
     
+    # Set modality if specified
+    if args.modality:
+        config["model"]["modality"] = args.modality
+        logging.info(f"Setting training modality to: {args.modality}")
+    
     # Training settings with stable defaults
     config["training"]["max_epochs"] = args.max_epochs if args.max_epochs else config["training"].get("max_epochs", 10)
     config["training"]["learning_rate"] = args.learning_rate if args.learning_rate else config["training"].get("learning_rate", 1e-5)
@@ -90,6 +103,19 @@ def main():
     config["training"]["grad_accum_steps"] = config["training"].get("grad_accum_steps", 4)
     config["training"]["max_grad_norm"] = config["training"].get("max_grad_norm", 0.5)
     config["training"]["warmup_ratio"] = config["training"].get("warmup_ratio", 0.1)
+    
+    # Checkpoint saving settings
+    if args.save_every:
+        config["training"]["save_every"] = args.save_every
+        logging.info(f"Will save checkpoint every {args.save_every} epochs")
+    if args.save_steps:
+        config["training"]["save_steps"] = args.save_steps
+        logging.info(f"Will save checkpoint every {args.save_steps} training steps")
+    
+    # Parameter update logging
+    config["log_param_updates"] = args.log_param_updates
+    if args.log_param_updates:
+        logging.info("Parameter update logging is enabled")
     
     # Set up output directory
     output_dir = args.output_dir
@@ -152,15 +178,22 @@ def main():
         
         # Create model with error handling
         logging.info("Creating model...")
+        # Get the modality from config (this was being ignored before!)
+        modality = config["model"].get("modality", "both")
+        logging.info(f"IMPORTANT: Creating model with modality: {modality}")
+        
         model = SimpleAVSRModel(
             llm_path=config["model"]["llm_path"],
             whisper_model=config["model"]["whisper_model"],
             clip_model=config["model"]["clip_model"],
             device=device,
             use_fp16=config["model"]["fp16"],
-            modality="both",  # Use both modalities by default
+            modality=modality,  # Use the modality from config instead of hardcoding "both"
             max_seq_len=config["data"].get("max_seq_len", 256),
         )
+        
+        # Double-check the model's modality to ensure it was set correctly
+        logging.info(f"VERIFICATION: Model's actual modality is: {model.modality}")
         
         # Create trainer with stable settings
         logging.info("Creating trainer...")

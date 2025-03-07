@@ -63,8 +63,20 @@ class AVSRTrainer:
                                     getattr(config.training, 'log_interval', 10) if hasattr(config, 'training') else 10)
             self.save_every = getattr(config, 'save_every', 
                                      getattr(config.training, 'save_every', 1) if hasattr(config, 'training') else 1)
+            
+            # Step-based saving (overrides epoch-based if provided)
+            self.save_steps = getattr(config, 'save_steps', 
+                                      getattr(config.training, 'save_steps', None) if hasattr(config, 'training') else None)
+            if self.save_steps is not None:
+                logger.info(f"Will save checkpoints every {self.save_steps} training steps")
+            else:
+                logger.info(f"Will save checkpoints every {self.save_every} epochs")
+            
             self.output_dir = getattr(config, 'output_dir', 
                                      getattr(config.training, 'checkpoint_dir', 'outputs') if hasattr(config, 'training') else 'outputs')
+            
+            # Keep track of global step count for step-based saving
+            self.global_step = 0
             
             # Parameter update logging flag
             self.log_param_updates = getattr(config, 'log_param_updates', False)
@@ -527,24 +539,30 @@ class AVSRTrainer:
             return float('inf')
 
     def _save_checkpoint(self, is_best=False, is_final=False):
-        """
-        Save a checkpoint of the model and optimizer
-
+        """Save a checkpoint of the model
+        
         Args:
             is_best: Whether this is the best model so far
-            is_final: Whether this is the final model
+            is_final: Whether this is the final checkpoint
         """
         try:
-            # Ensure output directory exists
+            if not hasattr(self, 'output_dir') or not self.output_dir:
+                logger.warning("No output directory specified, skipping checkpoint saving")
+                return
+                
             os.makedirs(self.output_dir, exist_ok=True)
             
-            # Determine checkpoint filename
+            # Determine checkpoint path
             if is_final:
-                checkpoint_path = os.path.join(self.output_dir, 'final_model.pt')
+                checkpoint_path = os.path.join(self.output_dir, "final_checkpoint.pt")
             elif is_best:
-                checkpoint_path = os.path.join(self.output_dir, 'best_model.pt')
+                checkpoint_path = os.path.join(self.output_dir, "best_checkpoint.pt")
             else:
-                checkpoint_path = os.path.join(self.output_dir, f'checkpoint_epoch_{self.current_epoch+1}.pt')
+                # Include step in filename if using step-based saving
+                if hasattr(self, 'global_step') and self.save_steps is not None:
+                    checkpoint_path = os.path.join(self.output_dir, f"checkpoint_step_{self.global_step}.pt")
+                else:
+                    checkpoint_path = os.path.join(self.output_dir, f"checkpoint_epoch_{self.current_epoch+1}.pt")
             
             # Create checkpoint dictionary
             checkpoint = {
@@ -604,6 +622,9 @@ class AVSRTrainer:
             
             # Get total epochs
             num_epochs = self.max_epochs
+            
+            # Track global step
+            self.global_step = 0
             
             # Main training loop
             for epoch in range(start_epoch, num_epochs):
@@ -670,6 +691,21 @@ class AVSRTrainer:
                         # Free up memory
                         torch.cuda.empty_cache()
                         
+                        # Increment global step counter (counting actual parameter updates)
+                        self.global_step += 1
+                        
+                        # Save model based on steps if required
+                        if self.save_steps is not None and self.global_step % self.save_steps == 0:
+                            self._save_checkpoint()
+                            logger.info(f"Checkpoint saved at step {self.global_step}")
+                            
+                            # Log trainable parameters after saving
+                            if self.log_param_updates:
+                                for name, param in self.model.named_parameters():
+                                    if param.requires_grad:
+                                        param_norm = param.data.norm().item()
+                                        logger.info(f"Parameter stats at step {self.global_step} - {name}: norm={param_norm:.6f}")
+                        
                     except Exception as e:
                         logger.error(f"Error in batch {batch_idx}: {e}")
                         logger.error(traceback.format_exc())
@@ -691,8 +727,8 @@ class AVSRTrainer:
                         self._save_checkpoint(is_best=True)
                         logger.info(f"New best validation loss: {val_loss:.4f}")
                 
-                # Save checkpoint based on save_every parameter
-                if (epoch + 1) % self.save_every == 0:
+                # Save checkpoint based on epoch if step-based saving is not enabled
+                if self.save_steps is None and (epoch + 1) % self.save_every == 0:
                     self._save_checkpoint()
                     logger.info(f"Checkpoint saved at epoch {epoch+1}")
                     
