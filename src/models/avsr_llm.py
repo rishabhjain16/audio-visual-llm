@@ -7,11 +7,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
+from transformers import WhisperModel, Wav2Vec2Model, HubertModel
 from typing import Dict, List, Optional, Tuple, Any
 import traceback
+import time
 
 from .llm_module import LLMModule
-from .av_hubert import AVHuBERTEncoder
+from ..avhubert_whisper.models.av_hubert import AVHuBERTEncoder
 from .whisper_encoder import WhisperEncoder
 
 class AVSRLLM(nn.Module):
@@ -134,7 +136,7 @@ class AVSRLLM(nn.Module):
                 av_encoder_path = getattr(config, "av_encoder_path", None)
                 if av_encoder_path:
                     try:
-                        from .av_hubert import AVHuBERTEncoder
+                        from ..avhubert_whisper.models.av_hubert import AVHuBERTEncoder
                         
                         # Check if the model path exists
                         if not os.path.exists(av_encoder_path):
