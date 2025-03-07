@@ -5,11 +5,11 @@
 DATA_PATH="/home/rishabh/Desktop/Datasets/lrs3/433h_data"
 EPOCHS=10
 BATCH_SIZE=2
-MODALITY="both"
-MODE="max"  # standard, fp16, 4bit, or max
-OUTPUT_DIR="outputs/clip_whisper"
-DEBUG="false"
-MAX_SEQ_LEN=256  # Default is now 1536 to capture more of the 1500 audio frames
+MODALITY="video"
+MODE="standard"  # standard, fp16, 4bit, or max
+OUTPUT_DIR="outputs/test_clip_whisper"
+DEBUG="true"
+MAX_SEQ_LEN=1536  # Default is now 1536 to capture more of the 1500 audio frames
 
 # ANSI color codes for prettier output
 RED='\033[0;31m'

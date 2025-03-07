@@ -2,23 +2,23 @@
 # Training script for the ClipWhisperModel
 
 # Default values
-DATA_PATH="/home/rishabh/Desktop/Datasets/lrs3/433h_data"
-OUTPUT_PATH="outputs/clip_whisper"
+DATA_PATH=""  # Must be specified by the user
+CONFIG="configs/clip_whisper.yaml"
+OUTPUT_DIR="outputs/clip_whisper"
 LLM_PATH="checkpoints/Llama-3.2-1B"
 WHISPER_MODEL="openai/whisper-medium"
 CLIP_MODEL="openai/clip-vit-base-patch32"
-CONFIG_FILE="configs/clip_whisper.yaml"
 BATCH_SIZE=2
-MODALITY="video"
-MAX_EPOCHS=10
+MAX_EPOCHS=5
+MODALITY="both"  # audio, video, or both
 SAVE_EVERY=1
-LOG_PARAMS="false"
-FP16="false"   # Default is off
-USE_4BIT="false"  # Default is off
-NO_LORA="false"
+FP16="false"
+USE_4BIT="false"
+NO_LORA="false"  # By default, use LoRA
 RESUME_FROM=""
 DEBUG_MODE="false"  # Debug logging mode
 MAX_SEQ_LEN=1536  # Default to 1536 (can be overridden via command line)
+LOG_LEVEL="info"  # Default log level
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -27,8 +27,12 @@ while [[ $# -gt 0 ]]; do
       DATA_PATH="$2"
       shift 2
       ;;
+    --config)
+      CONFIG="$2"
+      shift 2
+      ;;
     --output_dir)
-      OUTPUT_PATH="$2"
+      OUTPUT_DIR="$2"
       shift 2
       ;;
     --llm_path)
@@ -43,29 +47,21 @@ while [[ $# -gt 0 ]]; do
       CLIP_MODEL="$2"
       shift 2
       ;;
-    --config)
-      CONFIG_FILE="$2"
-      shift 2
-      ;;
     --batch_size)
       BATCH_SIZE="$2"
-      shift 2
-      ;;
-    --modality)
-      MODALITY="$2"
       shift 2
       ;;
     --max_epochs)
       MAX_EPOCHS="$2"
       shift 2
       ;;
+    --modality)
+      MODALITY="$2"
+      shift 2
+      ;;
     --save_every)
       SAVE_EVERY="$2"
       shift 2
-      ;;
-    --log_params)
-      LOG_PARAMS="true"
-      shift
       ;;
     --fp16)
       FP16="true"
@@ -85,7 +81,12 @@ while [[ $# -gt 0 ]]; do
       ;;
     --debug)
       DEBUG_MODE="true"
+      LOG_LEVEL="debug"
       shift
+      ;;
+    --log_level)
+      LOG_LEVEL="$2"
+      shift 2
       ;;
     --max_seq_len)
       MAX_SEQ_LEN="$2"
@@ -98,30 +99,40 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Check if data path is provided
+if [ -z "$DATA_PATH" ]; then
+  echo "Error: data_path must be specified"
+  exit 1
+fi
+
+# Create output directory if it doesn't exist
+mkdir -p $OUTPUT_DIR
+
 # Print configuration
 echo "Training ClipWhisperModel with the following configuration:"
 echo "======================"
 echo "Data path: $DATA_PATH"
-echo "Output path: $OUTPUT_PATH"
+echo "Output path: $OUTPUT_DIR"
 echo "LLM path: $LLM_PATH"
 echo "Whisper model: $WHISPER_MODEL"
 echo "CLIP model: $CLIP_MODEL"
-echo "Config file: $CONFIG_FILE"
+echo "Config file: $CONFIG"
 echo "Batch size: $BATCH_SIZE"
 echo "Modality: $MODALITY"
 echo "Max epochs: $MAX_EPOCHS"
 echo "Save checkpoint every: $SAVE_EVERY epochs"
-echo "Logging parameter updates: ${LOG_PARAMS^}"
-echo "Using mixed precision (FP16): ${FP16^}"
-echo "Using 4-bit quantization: ${USE_4BIT^}"
+echo "Logging parameter updates: $([ -n "$LOG_PARAM_UPDATES" ] && echo "Yes" || echo "False")"
+echo "Using mixed precision (FP16): $([ "$FP16" == "true" ] && echo "True" || echo "False")"
+echo "Using 4-bit quantization: $([ "$USE_4BIT" == "true" ] && echo "True" || echo "False")"
 echo "Using LoRA: $([ "$NO_LORA" == "false" ] && echo "Yes" || echo "No")"
 echo "Debug mode: ${DEBUG_MODE^}"
+echo "Log level: $LOG_LEVEL"
 echo "Max sequence length: $MAX_SEQ_LEN"
 
 # Build command
 CMD="python scripts/clip_whisper/train.py \
-  --config $CONFIG_FILE \
-  --output_dir $OUTPUT_PATH \
+  --config $CONFIG \
+  --output_dir $OUTPUT_DIR \
   --data_path $DATA_PATH \
   --llm_path $LLM_PATH \
   --whisper_model $WHISPER_MODEL \
@@ -130,13 +141,10 @@ CMD="python scripts/clip_whisper/train.py \
   --max_epochs $MAX_EPOCHS \
   --modality $MODALITY \
   --save_every $SAVE_EVERY \
-  --max_seq_len $MAX_SEQ_LEN"
+  --max_seq_len $MAX_SEQ_LEN \
+  --log_level $LOG_LEVEL"
 
 # Add optional arguments
-if [ "$LOG_PARAMS" = "true" ]; then
-  CMD="$CMD --log_param_updates"
-fi
-
 if [ "$FP16" = "true" ]; then
   CMD="$CMD --fp16"
 fi
@@ -149,12 +157,12 @@ if [ "$NO_LORA" = "true" ]; then
   CMD="$CMD --no_lora"
 fi
 
-if [ ! -z "$RESUME_FROM" ]; then
-  CMD="$CMD --resume_from $RESUME_FROM"
+if [ -n "$LOG_PARAM_UPDATES" ]; then
+  CMD="$CMD --log_param_updates"
 fi
 
-if [ "$DEBUG_MODE" = "true" ]; then
-  CMD="$CMD --log_level debug"
+if [ -n "$RESUME_FROM" ]; then
+  CMD="$CMD --resume_from $RESUME_FROM"
 fi
 
 echo "Starting training with modality: $MODALITY..."

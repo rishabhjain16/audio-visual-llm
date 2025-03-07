@@ -65,6 +65,9 @@ def parse_args():
                         help="Resume training from checkpoint")
     parser.add_argument("--max_seq_len", type=int, default=None,
                         help="Maximum sequence length for encoder output (overrides config)")
+    parser.add_argument("--log_level", type=str, default="info",
+                        choices=["debug", "info", "warning", "error", "critical"],
+                        help="Logging level")
     return parser.parse_args()
 
 
@@ -76,8 +79,19 @@ def load_config(config_path):
 
 
 def main():
-    # Parse arguments
     args = parse_args()
+    
+    # Set up logging
+    numeric_level = getattr(logging, args.log_level.upper(), None)
+    if not isinstance(numeric_level, int):
+        raise ValueError(f"Invalid log level: {args.log_level}")
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=numeric_level,
+    )
+    logger = logging.getLogger(__name__)
+    logger.info(f"Arguments: {args}")
     
     # Setup logging
     setup_logging()
