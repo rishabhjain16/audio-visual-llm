@@ -1,0 +1,54 @@
+# Configuration for ClipWhisperModel
+
+# Data configuration
+data:
+  path: "/path/to/your/data"
+  train_manifest: "train.tsv"
+  train_labels: "train.wrd"
+  val_manifest: "valid.tsv"
+  val_labels: "valid.wrd"
+  batch_size: 2
+  max_audio_length: 480000  # 30 seconds at 16kHz
+  max_video_length: 100     # Maximum number of video frames
+  max_seq_len: 256          # Maximum sequence length for encoder output
+  num_workers: 2            # Number of workers for dataloading
+  
+# Model configuration
+model:
+  llm_path: "checkpoints/Llama-3.2-1B"          # Path to LLM model
+  whisper_model: "openai/whisper-medium"     # Whisper model for audio encoding
+  clip_model: "openai/clip-vit-base-patch32" # CLIP model for video encoding
+  modality: "both"                          # Which modalities to use: "audio", "video", or "both"
+  use_fp16: false                           # Whether to use mixed precision (not recommended initially)
+  use_lora: true                            # Whether to use LoRA for efficient fine-tuning
+  lora_r: 16                                # LoRA rank
+  lora_alpha: 32                            # LoRA alpha
+  lora_dropout: 0.05                        # LoRA dropout
+  freeze_encoders: true                     # Whether to freeze Whisper and CLIP encoders
+  freeze_llm: false                         # Whether to freeze the LLM
+  fusion_scale: 0.5                         # Weight for audio in fusion (0.5 = equal weight)
+
+# Training configuration
+training:
+  num_epochs: 10                            # Number of epochs to train
+  learning_rate: 5e-5                       # Learning rate
+  weight_decay: 0.01                        # Weight decay
+  grad_accum_steps: 4                       # Gradient accumulation steps
+  max_grad_norm: 0.5                        # Maximum gradient norm for clipping
+  warmup_ratio: 0.1                         # Portion of training steps for warmup
+  log_interval: 10                          # Log every N batches
+  save_every: 1                             # Save checkpoint every N epochs
+  save_steps: null                          # Save checkpoint every N steps (overrides save_every)
+  checkpoint_dir: "outputs/clip_whisper"    # Directory to save checkpoints
+
+# Processor configuration
+processor:
+  audio:
+    sample_rate: 16000                      # Audio sample rate
+    feature_dim: 1024                       # Whisper feature dimension
+  video:
+    image_size: 224                         # CLIP image size
+    feature_dim: 768                        # CLIP feature dimension
+  text:
+    max_length: 128                         # Maximum text sequence length
+  random_seed: 42                           # Random seed for reproducibility 
