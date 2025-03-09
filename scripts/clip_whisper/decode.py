@@ -15,14 +15,17 @@ import traceback
 from tqdm import tqdm
 import jiwer
 from pathlib import Path
+import json
 
 # Add project root to path
 project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.append(str(project_root))
 
 from src.clip_whisper.models import ClipWhisperModel
-from src.data.processor import AVSRProcessor
-from src.data.dataloader import AVSRDataset, collate_fn
+from src.clip_whisper.data.simple_dataset import AVSRDataset
+from transformers import WhisperProcessor, CLIPProcessor, AutoTokenizer, WhisperModel, CLIPVisionModel, AutoModelForCausalLM
+from src.utils.media import load_audio, load_video, save_results
+from src.clip_whisper.models import ModalityConnector
 
 def calculate_wer(references, hypotheses):
     """Calculate Word Error Rate using jiwer"""
@@ -49,9 +52,13 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--config", type=str, default="configs/clip_whisper.yaml", 
                       help="Configuration file for processor settings")
-    parser.add_argument("--single_file", type=str, default=None, 
-                      help="Path to single audio/video file for testing")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+    parser.add_argument("--whisper_model", type=str, default="checkpoints/whisper-medium",
+                      help="Path to pre-trained Whisper model")
+    parser.add_argument("--clip_model", type=str, default="checkpoints/clip-vit-base-patch32",
+                      help="Path to pre-trained CLIP model")
+    parser.add_argument("--llm_model", type=str, default="checkpoints/Llama-3.2-1B",
+                      help="Path to pre-trained LLM model")
     
     args = parser.parse_args()
     
@@ -82,11 +89,8 @@ def main():
     logging.info("=" * 80)
     logging.info(f"Model path: {args.model_path}")
     logging.info(f"Modality: {args.modality}")
-    if args.single_file:
-        logging.info(f"Single file mode: {args.single_file}")
-    else:
-        logging.info(f"Test data: {args.test_data}")
-        logging.info(f"Test references: {args.test_wrd}")
+    logging.info(f"Test data: {args.test_data}")
+    logging.info(f"Test references: {args.test_wrd}")
     logging.info(f"Device: {args.device}")
     logging.info(f"Max new tokens: {args.max_new_tokens}")
     logging.info("=" * 80)
@@ -98,98 +102,133 @@ def main():
         
         # Load model
         logging.info(f"Loading model from {args.model_path}")
-        model = ClipWhisperModel.from_pretrained(args.model_path)
-        
-        # Important: Set the modality explicitly from the command line args
-        model.modality = args.modality
-        logging.info(f"Using modality: {args.modality}")
-        print(f"Using modality: {args.modality}")
-        
-        # Move model to device
-        model.to(args.device)
-        model.eval()
-        
-        # Load processor
-        processor = AVSRProcessor.from_config(config)
-        
-        # Handle single file testing
-        if args.single_file:
-            logging.info(f"Testing single file: {args.single_file}")
+        try:
+            # Check if the necessary files exist
+            audio_connector_path = os.path.join(args.model_path, "audio_connector.pt")
+            video_connector_path = os.path.join(args.model_path, "video_connector.pt")
+            model_config_path = os.path.join(args.model_path, "model_config.json")
+            tokenizer_path = os.path.join(args.model_path, "tokenizer")
+            llm_path = os.path.join(args.model_path, "llm")
             
-            # Determine if it's audio or video based on extension
-            file_ext = os.path.splitext(args.single_file)[1].lower()
-            
-            inputs = {}
-            
-            if file_ext in ['.wav', '.mp3', '.flac'] and args.modality in ["audio", "both"]:
-                logging.info(f"Processing audio file: {args.single_file}")
-                audio = processor.process_audio(args.single_file)
-                inputs["audio"] = audio.unsqueeze(0).to(args.device)  # Add batch dimension
-                
-                if args.modality == "both":
-                    logging.warning("Using audio-only input with 'both' modality. No video input provided.")
-            
-            elif file_ext in ['.mp4', '.avi', '.mov'] and args.modality in ["video", "both"]:
-                logging.info(f"Processing video file: {args.single_file}")
-                video = processor.process_video(args.single_file)
-                inputs["video"] = video.unsqueeze(0).to(args.device)  # Add batch dimension
-                
-                if args.modality == "both":
-                    logging.warning("Using video-only input with 'both' modality. No audio input provided.")
-            
-            else:
-                logging.error(f"File type {file_ext} not supported or doesn't match modality {args.modality}")
-                print(f"ERROR: File type {file_ext} not supported or doesn't match modality {args.modality}")
+            if not os.path.exists(tokenizer_path):
+                logging.error(f"Tokenizer directory not found at {tokenizer_path}")
                 return
             
-            # Generate text
-            logging.info("Generating text...")
-            with torch.no_grad():
-                try:
-                    # First get the embeddings from audio/video
-                    inputs_for_model = {}
-                    if "audio" in inputs and args.modality in ["audio", "both"]:
-                        inputs_for_model["audio"] = inputs["audio"]
-                    if "video" in inputs and args.modality in ["video", "both"]:
-                        inputs_for_model["video"] = inputs["video"]
-                        
-                    # Ensure we have the right inputs for the selected modality
-                    if not inputs_for_model:
-                        logging.error(f"No valid inputs for modality: {args.modality}")
-                        return
-                    
-                    encoder_out = model(
-                        **inputs_for_model,
-                        return_loss=False,
-                    )
-                    
-                    # Generate text from embeddings
-                    generation_output = model.llm.generate(
-                        inputs_embeds=encoder_out.hidden_states,
-                        attention_mask=torch.ones(
-                            (1, encoder_out.hidden_states.size(1)),
-                            dtype=torch.long,
-                            device=args.device
-                        ),
-                        max_new_tokens=args.max_new_tokens,
-                        do_sample=True,
-                        temperature=0.7,
-                        top_p=0.9,
-                    )
-                    
-                    # Decode the output tokens
-                    generated_text = model.tokenizer.decode(generation_output[0], skip_special_tokens=True)
-                    
-                    logging.info(f"Generated text: {generated_text}")
-                    print("\nGenerated Text:")
-                    print("-" * 40)
-                    print(generated_text)
-                    print("-" * 40)
-                except Exception as e:
-                    logging.error(f"Error during generation: {e}")
-                    logging.error(traceback.format_exc())
-                    print(f"Error during generation: {e}")
+            if not os.path.exists(model_config_path):
+                logging.error(f"Model config not found at {model_config_path}")
+                return
+                
+            if not os.path.exists(video_connector_path):
+                logging.error(f"Video connector not found at {video_connector_path}")
+                return
+                
+            # Load model configuration to get modality
+            with open(model_config_path, "rb") as f:
+                model_config = torch.load(f)
+                
+            # Load the config.json to get model settings
+            config_path = os.path.join(args.model_path, "config.json")
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    config_data = json.load(f)
+            else:
+                config_data = {}
             
+            # Extract settings
+            whisper_model_name = config_data.get("whisper_model", "openai/whisper-medium")
+            clip_model_name = config_data.get("clip_model", "openai/clip-vit-base-patch32")
+            llm_model_name = config_data.get("llm_path", "meta-llama/Llama-2-7b-chat-hf")
+            
+            # Load tokenizer
+            logging.info(f"Loading tokenizer from {tokenizer_path}")
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+            
+            # Load models from provided paths or HuggingFace
+            if os.path.exists(args.whisper_model):
+                logging.info(f"Loading Whisper model from local path: {args.whisper_model}")
+                whisper_model = WhisperModel.from_pretrained(args.whisper_model)
+                whisper_processor = WhisperProcessor.from_pretrained(args.whisper_model)
+            else:
+                logging.info(f"Loading Whisper model from HuggingFace: {whisper_model_name}")
+                whisper_model = WhisperModel.from_pretrained(whisper_model_name)
+                whisper_processor = WhisperProcessor.from_pretrained(whisper_model_name)
+            
+            if os.path.exists(args.clip_model):
+                logging.info(f"Loading CLIP model from local path: {args.clip_model}")
+                clip_model = CLIPVisionModel.from_pretrained(args.clip_model)
+                clip_processor = CLIPProcessor.from_pretrained(args.clip_model)
+            else:
+                logging.info(f"Loading CLIP model from HuggingFace: {clip_model_name}")
+                clip_model = CLIPVisionModel.from_pretrained(clip_model_name)
+                clip_processor = CLIPProcessor.from_pretrained(clip_model_name)
+            
+            # Load LLM - use the provided path instead of the one in the model directory
+            if os.path.exists(args.llm_model):
+                logging.info(f"Loading LLM from local path: {args.llm_model}")
+                llm = AutoModelForCausalLM.from_pretrained(args.llm_model, device_map="auto")
+            else:
+                # Fall back to the trained model's adapter if the specified model doesn't exist
+                logging.info(f"LLM path {args.llm_model} doesn't exist, falling back to HuggingFace: {llm_model_name}")
+                llm = AutoModelForCausalLM.from_pretrained(llm_model_name, device_map="auto")
+            
+            # Create a ClipWhisperModel with pre-loaded components
+            model = ClipWhisperModel(
+                llm_path=args.llm_model,  # Pass for reference
+                whisper_model=args.whisper_model,  # Pass for reference
+                clip_model=args.clip_model,  # Pass for reference
+                device=args.device,
+                use_lora=False,  # LoRA is already applied in the saved model
+                modality=args.modality,
+                _provided_tokenizer=tokenizer  # Use our pre-loaded tokenizer
+            )
+            
+            # Manually assign the pre-loaded components to the model to avoid loading them again
+            model.whisper = whisper_model
+            model.whisper_processor = whisper_processor
+            model.clip = clip_model
+            model.clip_processor = clip_processor
+            model.llm = llm
+            model.tokenizer = tokenizer
+            
+            # Set dimensions
+            model.audio_dim = whisper_model.config.d_model
+            model.video_dim = clip_model.config.hidden_size
+            
+            # Determine LLM dimension
+            model.llm_dim = model._get_llm_dim()
+            
+            # Load the connectors
+            model.audio_connector = ModalityConnector(
+                input_dim=model.audio_dim,
+                output_dim=model.llm_dim,
+                device=args.device
+            )
+            model.audio_connector.load_state_dict(torch.load(audio_connector_path))
+            
+            model.video_connector = ModalityConnector(
+                input_dim=model.video_dim,
+                output_dim=model.llm_dim,
+                device=args.device
+            )
+            model.video_connector.load_state_dict(torch.load(video_connector_path))
+            
+            # Set other parameters from model_config
+            model.max_seq_len = model_config.get("max_seq_len", 256)
+            model.fusion_scale = model_config.get("fusion_scale", 0.5)
+            
+            # Override with command line modality
+            model.modality = args.modality
+            logging.info(f"Using modality: {args.modality}")
+            print(f"Using modality: {args.modality}")
+            
+            # Move model to device
+            model.to(args.device)
+            model.eval()
+            
+            logging.info("Model loaded successfully")
+        except Exception as e:
+            logging.error(f"Error during model loading: {e}")
+            logging.error(traceback.format_exc())
             return
         
         # Batch decoding mode requires test data and reference file
@@ -204,27 +243,66 @@ def main():
         # Read test.wrd for reference texts
         references = {}
         try:
-            with open(args.test_wrd, 'r') as f:
+            # First load utterance IDs from test.tsv to understand their format
+            utterance_ids = []
+            with open(args.test_data, 'r') as f:
                 for line in f:
-                    if line.strip():
-                        parts = line.strip().split(maxsplit=1)
-                        if len(parts) == 2:
-                            utt_id = parts[0]
-                            ref_text = parts[1]
-                            references[utt_id] = ref_text
+                    parts = line.strip().split('\t')
+                    if len(parts) >= 1:
+                        # Extract the utterance ID from the first column
+                        utt_id = parts[0]
+                        # Skip header line if present
+                        if utt_id != "/" and not utt_id.startswith("#"):
+                            utterance_ids.append(utt_id)
+            
+            logging.info(f"Found {len(utterance_ids)} utterance IDs in test data")
+            
+            # Now load reference texts
+            with open(args.test_wrd, 'r') as f:
+                lines = f.readlines()
+                
+                # If number of lines in WRD matches number of utterances,
+                # then each line corresponds to one utterance
+                if len(lines) == len(utterance_ids):
+                    for i, line in enumerate(lines):
+                        if line.strip():
+                            references[utterance_ids[i]] = line.strip()
+                else:
+                    # Otherwise, try to parse as ID + text format
+                    for line in lines:
+                        if line.strip():
+                            parts = line.strip().split(maxsplit=1)
+                            if len(parts) == 2:
+                                utt_id = parts[0]
+                                ref_text = parts[1]
+                                references[utt_id] = ref_text
             
             logging.info(f"Loaded {len(references)} reference transcriptions")
         except Exception as e:
             logging.error(f"Error loading references: {e}")
-            return
+            logging.error(traceback.format_exc())
         
+        # Get root directory from TSV file path (common parent directory)
+        root_dir = os.path.dirname(os.path.dirname(args.test_data))
+        
+        # Read the test.wrd file
+        label_path = args.test_wrd
+        if not os.path.exists(label_path):
+            logging.error(f"Reference file not found: {label_path}")
+            return
+            
         # Create test dataset
         try:
             test_dataset = AVSRDataset(
-                data_path=args.test_data,
-                processor=processor,
+                manifest_path=args.test_data,
+                label_path=label_path,
+                root_dir=root_dir,
+                whisper_processor=model.whisper_processor,
+                clip_processor=model.clip_processor,
+                tokenizer=model.tokenizer,
+                max_audio_length=30,  # seconds
+                max_video_length=300,  # frames
                 split="test",
-                modality=args.modality,
             )
             
             # Create dataloader
@@ -232,7 +310,7 @@ def main():
                 test_dataset,
                 batch_size=args.batch_size,
                 shuffle=False,
-                collate_fn=collate_fn,
+                collate_fn=AVSRDataset.collate_fn,  # Use the class method
             )
             
             logging.info(f"Created dataloader with {len(test_dataset)} samples")
@@ -255,83 +333,211 @@ def main():
                 
             try:
                 # Get utterance IDs
-                utt_ids = batch["utt_id"]
+                if "utt_id" in batch:
+                    utt_ids = batch["utt_id"]
+                else:
+                    # If batch doesn't contain utt_ids, create artificial ones based on batch index
+                    # Use a reasonable default since batch_hypotheses isn't created yet
+                    utt_ids = [f"sample_{batch_idx}_{i}" for i in range(1)]  # We'll extend this later if needed
+                
+                # Print the actual keys in the batch for debugging
+                if args.verbose and batch_idx < 2:  # Only print for first few batches to avoid spam
+                    logging.info(f"Batch {batch_idx} keys: {list(batch.keys())}")
+                    for key in batch.keys():
+                        if isinstance(batch[key], torch.Tensor):
+                            logging.info(f"  {key}: {batch[key].shape}")
+                        else:
+                            logging.info(f"  {key}: {type(batch[key])}")
                 
                 # Prepare inputs based on modality
                 inputs_for_model = {}
-                if "audio" in batch and args.modality in ["audio", "both"]:
-                    inputs_for_model["audio"] = batch["audio"].to(args.device)
-                if "video" in batch and args.modality in ["video", "both"]:
-                    inputs_for_model["video"] = batch["video"].to(args.device)
                 
-                # Skip if we don't have the right inputs for the selected modality
-                if not inputs_for_model:
-                    logging.warning(f"Batch {batch_idx} has no valid inputs for modality {args.modality}, skipping")
+                # Check for various possible keys for audio features
+                for audio_key in ["audio_features", "audio_input", "audio", "audio_feature"]:
+                    if audio_key in batch and args.modality in ["audio", "both"]:
+                        inputs_for_model["audio"] = batch[audio_key].to(args.device)
+                        if args.verbose:
+                            logging.info(f"Found audio features with key: {audio_key}")
+                        break
+                        
+                # Check for various possible keys for video features
+                for video_key in ["video_features", "video_input", "video", "video_feature", "pixel_values"]:
+                    if video_key in batch and args.modality in ["video", "both"]:
+                        inputs_for_model["video"] = batch[video_key].to(args.device)
+                        if args.verbose:
+                            logging.info(f"Found video features with key: {video_key}")
+                        break
+                
+                # Special check for video format seen in the logs
+                if args.verbose and batch_idx < 5:
+                    logging.info(f"Raw batch type: {type(batch)}")
+                    if hasattr(batch, 'keys'):
+                        for k in batch.keys():
+                            if isinstance(batch[k], torch.Tensor):
+                                logging.info(f"  Key: {k}, Shape: {batch[k].shape}, Type: {batch[k].dtype}")
+                            else:
+                                logging.info(f"  Key: {k}, Type: {type(batch[k])}")
+                
+                # Special case: if we have a CLIP processor output, pixel_values might be nested in a dict
+                if "video_input" not in inputs_for_model and args.modality in ["video", "both"]:
+                    # Look for nested pixel_values in a dictionary
+                    for key, value in batch.items():
+                        if isinstance(value, dict) and "pixel_values" in value:
+                            inputs_for_model["video_input"] = value["pixel_values"].to(args.device)
+                            if args.verbose:
+                                logging.info(f"Found nested video features in key: {key}")
+                            break
+                
+                # Based on the logs showing "Processed video shape: torch.Size([42, 3, 224, 224])"
+                if "video_input" not in inputs_for_model and args.modality in ["video", "both"] and 0 in batch:
+                    video_tensor = batch[0]
+                    if isinstance(video_tensor, torch.Tensor) and len(video_tensor.shape) == 4:
+                        # Format like [frames, channels, height, width]
+                        if args.verbose:
+                            logging.info(f"Found video at batch[0], shape: {video_tensor.shape}")
+                        video_tensor = video_tensor.unsqueeze(0)  # Add batch dim [1, frames, channels, height, width]
+                        inputs_for_model["video_input"] = video_tensor.to(args.device)
+                
+                # Try even more approaches to find video data if we still don't have it
+                if "video_input" not in inputs_for_model and args.modality in ["video", "both"]:
+                    # Last resort: Look for any tensor that could be a video
+                    for key, value in batch.items():
+                        if isinstance(value, torch.Tensor) and len(value.shape) >= 4:
+                            # This looks like a video tensor with shape [batch, frames, channels, height, width]
+                            # or [frames, channels, height, width]
+                            if args.verbose:
+                                logging.info(f"Found tensor that looks like video in key: {key}, shape: {value.shape}")
+                            
+                            # Ensure it has the right dimensions for a video
+                            if len(value.shape) == 4:  # [frames, channels, height, width]
+                                # Add batch dimension
+                                value = value.unsqueeze(0)
+                            
+                            inputs_for_model["video_input"] = value.to(args.device)
+                            break
+                
+                # Final fallback: If batch is directly a tensor, use it
+                if "video_input" not in inputs_for_model and args.modality in ["video", "both"]:
+                    if isinstance(batch, torch.Tensor) and len(batch.shape) >= 4:
+                        if args.verbose:
+                            logging.info(f"Using batch directly as video input, shape: {batch.shape}")
+                        inputs_for_model["video_input"] = batch.to(args.device)
+                
+                # Ensure we have the right inputs for the selected modality
+                if args.modality == "audio" and "audio_input" not in inputs_for_model:
+                    logging.warning(f"Batch {batch_idx}: Audio modality selected but no audio input in batch, skipping")
+                    continue
+                elif args.modality == "video" and "video_input" not in inputs_for_model:
+                    logging.warning(f"Batch {batch_idx}: Video modality selected but no video input in batch, skipping")
+                    continue
+                elif args.modality == "both" and "audio_input" not in inputs_for_model and "video_input" not in inputs_for_model:
+                    logging.warning(f"Batch {batch_idx}: Both modality selected but neither audio nor video input in batch, skipping")
                     continue
                 
                 with torch.no_grad():
-                    # Get encoder outputs
-                    encoder_out = model(
-                        **inputs_for_model,
-                        return_loss=False
-                    )
+                    # Fix parameter names: rename "audio_input" to "audio" and "video_input" to "video"
+                    # to match the ClipWhisperModel.generate() method signature
+                    generate_inputs = {}
                     
-                    # Generate text
-                    generation_output = model.llm.generate(
-                        inputs_embeds=encoder_out.hidden_states,
-                        attention_mask=torch.ones(
-                            (encoder_out.hidden_states.size(0), encoder_out.hidden_states.size(1)),
-                            dtype=torch.long, 
-                            device=args.device
-                        ),
+                    # Map the input keys to the correct parameter names
+                    if "audio_input" in inputs_for_model:
+                        generate_inputs["audio"] = inputs_for_model["audio_input"]
+                    if "video_input" in inputs_for_model:
+                        generate_inputs["video"] = inputs_for_model["video_input"]
+                    
+                    # Copy any other arguments
+                    for key, value in inputs_for_model.items():
+                        if key not in ["audio_input", "video_input"]:
+                            generate_inputs[key] = value
+                    
+                    # Generate text with correctly named parameters
+                    outputs = model.generate(
+                        **generate_inputs,
                         max_new_tokens=args.max_new_tokens,
-                        do_sample=False,  # Deterministic for evaluation
-                        num_beams=5,      # Beam search for better results
+                        do_sample=True,
+                        temperature=0.7,
+                        top_p=0.9,
                     )
                     
-                    # Decode the output tokens for each sample
-                    batch_size = generation_output.size(0)
-                    for i in range(batch_size):
-                        utt_id = utt_ids[i]
-                        hypothesis = model.tokenizer.decode(generation_output[i], skip_special_tokens=True)
+                    # Process outputs
+                    batch_hypotheses = []
+                    if isinstance(outputs, list) and all(isinstance(item, str) for item in outputs):
+                        # If outputs is already a list of strings
+                        batch_hypotheses = outputs
+                    else:
+                        # If outputs is token IDs, decode them
+                        try:
+                            if isinstance(outputs, torch.Tensor):
+                                # Single tensor output
+                                text = model.tokenizer.decode(outputs[0], skip_special_tokens=True)
+                                batch_hypotheses.append(text)
+                            elif hasattr(outputs, "__getitem__"):
+                                # Sequence output
+                                for output_ids in outputs:
+                                    if isinstance(output_ids, torch.Tensor):
+                                        text = model.tokenizer.decode(output_ids, skip_special_tokens=True)
+                                    else:
+                                        # Handle case where output might already be text
+                                        text = str(output_ids)
+                                    batch_hypotheses.append(text)
+                            else:
+                                # Fallback for other output types
+                                text = str(outputs)
+                                batch_hypotheses.append(text)
+                        except Exception as e:
+                            logging.error(f"Error processing model outputs: {e}")
+                            batch_hypotheses = ["[ERROR: Failed to decode output]"]
+                
+                # Decode the output tokens for each sample
+                batch_size = len(batch_hypotheses)
+                for i in range(batch_size):
+                    utt_id = utt_ids[i] if i < len(utt_ids) else f"sample_{batch_idx}_{i}"
+                    hypothesis = batch_hypotheses[i]
+                    
+                    # Get reference
+                    reference = references.get(utt_id, "")
+                    
+                    # Print the transcription to console for immediate feedback
+                    print(f"\n=== Transcription for {utt_id} ===")
+                    print(f"HYP: {hypothesis}")
+                    if reference:
+                        print(f"REF: {reference}")
                         
-                        # Get reference
-                        reference = references.get(utt_id, "")
-                        
-                        # Calculate WER for this sample
-                        if reference:
-                            sample_wer = calculate_wer([reference], [hypothesis])
-                            all_references.append(reference)
-                            all_hypotheses.append(hypothesis)
-                        else:
-                            sample_wer = float('inf')
-                            logging.warning(f"No reference found for utterance {utt_id}")
-                        
-                        # Save result
-                        results.append({
-                            "utt_id": utt_id,
-                            "reference": reference,
-                            "hypothesis": hypothesis,
-                            "wer": sample_wer
-                        })
-                        
-                        # Log individual results if verbose
-                        if args.verbose:
-                            logging.info(f"Utterance: {utt_id}")
-                            logging.info(f"  REF: {reference}")
-                            logging.info(f"  HYP: {hypothesis}")
-                            logging.info(f"  WER: {sample_wer:.4f}")
+                    # Calculate WER for this sample
+                    if reference:
+                        sample_wer = calculate_wer([reference], [hypothesis])
+                        all_references.append(reference)
+                        all_hypotheses.append(hypothesis)
+                    else:
+                        sample_wer = float('inf')
+                        logging.warning(f"No reference found for utterance {utt_id}")
+                    
+                    # Save result
+                    results.append({
+                        "utt_id": utt_id,
+                        "reference": reference,
+                        "hypothesis": hypothesis,
+                        "wer": sample_wer
+                    })
+                    
+                    # Log individual results if verbose
+                    if args.verbose:
+                        logging.info(f"Utterance: {utt_id}")
+                        logging.info(f"  REF: {reference}")
+                        logging.info(f"  HYP: {hypothesis}")
+                        logging.info(f"  WER: {sample_wer:.4f}")
             except Exception as e:
                 logging.error(f"Error processing batch {batch_idx}: {e}")
                 logging.error(traceback.format_exc())
                 continue
         
-        # Calculate overall WER
-        if all_references and all_hypotheses:
+        # Save WER results
+        if len(all_references) > 0:
             overall_wer = calculate_wer(all_references, all_hypotheses)
+            
             logging.info(f"Overall WER: {overall_wer:.4f}")
             
-            # Save results
+            # Save detailed results
             with open(results_file, 'w') as f:
                 f.write(f"Modality: {args.modality}\n")
                 f.write(f"Overall WER: {overall_wer:.4f}\n\n")
@@ -341,14 +547,22 @@ def main():
                 
                 for result in results:
                     f.write(f"{result['utt_id']:<20} {result['wer']:<10.4f} {result['reference'][:40]:<40} {result['hypothesis'][:40]:<40}\n")
-            
+                    
             logging.info(f"Results saved to {results_file}")
-            print(f"\nModality: {args.modality}")
+            
+            # Also save summary to a separate file
+            with open(os.path.join(args.output_dir, f"wer_{timestamp}.txt"), "w") as f:
+                f.write(f"Overall WER: {overall_wer:.4f}\n")
+                f.write(f"Total samples: {len(all_references)}\n")
+            
+            # Print summary to console
+            print("\n" + "="*80)
+            print(f"DECODING SUMMARY")
             print(f"Overall WER: {overall_wer:.4f}")
-            print(f"Detailed results saved to {results_file}")
+            print(f"Total samples successfully decoded: {len(all_references)}")
+            print("="*80)
         else:
-            logging.error("No valid results collected. Cannot calculate WER.")
-            print("No valid results collected. Cannot calculate WER.")
+            logging.warning("No samples were successfully processed for WER calculation")
     
     except Exception as e:
         logging.error(f"Error during decoding: {e}")

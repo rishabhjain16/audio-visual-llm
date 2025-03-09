@@ -99,6 +99,7 @@ class ClipWhisperModel(nn.Module):
         modality: str = "both",
         max_seq_len: int = 256,
         fusion_scale: float = 0.5,
+        _provided_tokenizer=None,
     ):
         """
         Initialize the ClipWhisper model
@@ -119,6 +120,7 @@ class ClipWhisperModel(nn.Module):
             modality: Which modalities to use: "audio", "video", or "both"
             max_seq_len: Maximum sequence length for encoder output
             fusion_scale: Weight for audio in fusion (0.5 = equal weight)
+            _provided_tokenizer: Provided tokenizer instead of loading from llm_path
         """
         super().__init__()
         
@@ -131,6 +133,7 @@ class ClipWhisperModel(nn.Module):
         self.modality = modality
         self.max_seq_len = max_seq_len
         self.fusion_scale = fusion_scale
+        self._provided_tokenizer = _provided_tokenizer  # Store the provided tokenizer
         
         # Set modality with clear logging
         modality_banner = "=" * 80
@@ -157,9 +160,15 @@ class ClipWhisperModel(nn.Module):
         # Initialize all sub-models
         self.llm, self.tokenizer = self._track_component_memory("LLM",
                     lambda: self._load_llm(llm_path, use_lora, lora_r, lora_alpha, lora_dropout, freeze_llm, use_4bit))
-        self.whisper, self.whisper_processor = self._track_component_memory("Whisper",
+        
+        # Only load Whisper if not already provided as an object
+        if isinstance(whisper_model, str) or whisper_model is None:
+            self.whisper, self.whisper_processor = self._track_component_memory("Whisper",
                             lambda: self._load_whisper_model(whisper_model, freeze_encoders))
-        self.clip, self.clip_processor = self._track_component_memory("CLIP",
+        
+        # Only load CLIP if not already provided as an object
+        if isinstance(clip_model, str) or clip_model is None:
+            self.clip, self.clip_processor = self._track_component_memory("CLIP",
                          lambda: self._load_clip_model(clip_model, freeze_encoders))
         
         # Get dimensions of encoders and LLM
@@ -615,7 +624,7 @@ class ClipWhisperModel(nn.Module):
             logging.info("All expected files saved successfully")
     
     @classmethod
-    def from_pretrained(cls, model_dir):
+    def from_pretrained(cls, model_dir, tokenizer=None):
         """Load model from saved checkpoint"""
         if not os.path.exists(model_dir):
             raise ValueError(f"Model directory {model_dir} does not exist")
@@ -628,9 +637,12 @@ class ClipWhisperModel(nn.Module):
         with open(config_path, "rb") as f:
             config = torch.load(f)
         
+        # If tokenizer is provided, we'll use it instead of loading from llm_path
+        llm_path = os.path.join(model_dir, "llm")
+        
         # Create model with the saved configuration
         model = cls(
-            llm_path=os.path.join(model_dir, "llm"),
+            llm_path=llm_path,
             whisper_model=os.path.join(model_dir, "whisper"),
             clip_model=os.path.join(model_dir, "clip"),
             device=config.get("device", "cuda" if torch.cuda.is_available() else "cpu"),
@@ -641,6 +653,7 @@ class ClipWhisperModel(nn.Module):
             modality=config.get("modality", "both"),
             max_seq_len=config.get("max_seq_len", 256),
             fusion_scale=config.get("fusion_scale", 0.5),
+            _provided_tokenizer=tokenizer,  # Pass the tokenizer to __init__
         )
         
         # Load the projectors
@@ -716,19 +729,72 @@ class ClipWhisperModel(nn.Module):
             # Standard loading without quantization
             llm = AutoModelForCausalLM.from_pretrained(llm_path, device_map="auto")
         
-        # Load tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(llm_path)
+        # Use provided tokenizer if available, otherwise load from llm_path
+        if self._provided_tokenizer is not None:
+            logging.info("Using provided tokenizer")
+            tokenizer = self._provided_tokenizer
+        else:
+            logging.info(f"Loading tokenizer from {llm_path}")
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(llm_path)
+            except Exception as e:
+                logging.error(f"Error loading tokenizer from {llm_path}: {e}")
+                # If loading from llm_path fails, try loading from tokenizer subdirectory
+                tokenizer_path = os.path.join(os.path.dirname(llm_path), "tokenizer")
+                if os.path.exists(tokenizer_path):
+                    logging.info(f"Attempting to load tokenizer from {tokenizer_path}")
+                    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+                else:
+                    raise
         
         # Apply LoRA if requested
         if use_lora:
             logging.info(f"Applying LoRA with r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}")
             
-            # Configure target modules based on model type
-            if 'llama' in llm_path.lower():
-                target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+            # First, check if there's an adapter_config.json that already specifies the target modules
+            adapter_config_path = os.path.join(llm_path, "adapter_config.json")
+            if os.path.exists(adapter_config_path):
+                # Load existing adapter config to get the target modules
+                try:
+                    with open(adapter_config_path, 'r') as f:
+                        adapter_config = json.load(f)
+                    if 'target_modules' in adapter_config:
+                        target_modules = adapter_config['target_modules']
+                        logging.info(f"Using target modules from adapter_config.json: {target_modules}")
+                    else:
+                        # Fall back to default Llama target modules
+                        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+                        logging.info(f"No target_modules in adapter_config.json, using default Llama modules: {target_modules}")
+                except Exception as e:
+                    logging.error(f"Error reading adapter_config.json: {e}")
+                    # Fall back to default Llama target modules
+                    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
             else:
-                # Default target modules for other model types
-                target_modules = ["query", "key", "value", "dense"]
+                # Try to determine the model type from the config or architecture
+                try:
+                    # Check if it's a Llama model by looking at its config
+                    model_config_path = os.path.join(llm_path, "config.json")
+                    if os.path.exists(model_config_path):
+                        with open(model_config_path, 'r') as f:
+                            model_config = json.load(f)
+                        model_type = model_config.get('model_type', '').lower()
+                        architecture = model_config.get('architectures', [''])[0].lower()
+                        
+                        # Check if it's a Llama model
+                        if 'llama' in model_type or 'llama' in architecture or 'llama' in llm_path.lower():
+                            target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+                            logging.info(f"Detected Llama model, using target modules: {target_modules}")
+                        else:
+                            # Default target modules for other model types
+                            target_modules = ["query", "key", "value", "dense"]
+                            logging.info(f"Non-Llama model detected, using target modules: {target_modules}")
+                    else:
+                        # Default to Llama modules as they're more common
+                        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+                        logging.info(f"No config.json found, assuming Llama model with target modules: {target_modules}")
+                except Exception as e:
+                    logging.error(f"Error determining model type: {e}, defaulting to Llama target modules")
+                    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
                 
             # Create LoRA config
             peft_config = LoraConfig(
@@ -741,8 +807,13 @@ class ClipWhisperModel(nn.Module):
             )
             
             # Apply LoRA to model
-            llm = get_peft_model(llm, peft_config)
-            logging.info("LoRA applied successfully")
+            try:
+                llm = get_peft_model(llm, peft_config)
+                logging.info("LoRA applied successfully")
+            except Exception as e:
+                logging.error(f"Error applying LoRA: {e}")
+                logging.warning("Continuing without LoRA")
+                # Continue without LoRA rather than failing entirely
             
         # Freeze LLM weights if requested
         if freeze_llm:

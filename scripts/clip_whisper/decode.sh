@@ -2,17 +2,20 @@
 # Decoding script for the ClipWhisperModel
 
 # Default values
-MODEL_PATH=""
-TEST_DATA=""
-TEST_WRD=""
-OUTPUT_DIR="outputs/clip_whisper_decoding"
-MODALITY="both"
+MODEL_PATH="outputs/test_clip_whisper/best_model/model"
+TEST_DATA="/home/rishabh/Desktop/Datasets/lrs3/433h_data/test.tsv"
+TEST_WRD="/home/rishabh/Desktop/Datasets/lrs3/433h_data/test.wrd"
+OUTPUT_DIR="outputs/clip_whisper_decoding_infer"
+MODALITY="video"
 BATCH_SIZE=1
 MAX_NEW_TOKENS=100
 DEVICE="cuda"
 CONFIG="configs/clip_whisper.yaml"
 SINGLE_FILE=""
 VERBOSE=false
+WHISPER_MODEL="checkpoints/whisper-medium"
+CLIP_MODEL="checkpoints/clip-vit-base-patch32"
+LLM_MODEL="checkpoints/Llama-3.2-1B"
 
 # Display help
 show_help() {
@@ -28,6 +31,9 @@ show_help() {
     echo "  --device DEVICE         Device to run inference on (default: cuda)"
     echo "  --config PATH           Configuration file for processor settings (default: configs/clip_whisper.yaml)"
     echo "  --single_file PATH      Path to a single audio/video file for testing"
+    echo "  --whisper_model PATH    Path to pre-trained Whisper model (default: checkpoints/whisper-medium)"
+    echo "  --clip_model PATH       Path to pre-trained CLIP model (default: checkpoints/clip-vit-base-patch32)"
+    echo "  --llm_model PATH        Path to pre-trained LLM model (default: checkpoints/Llama-3.2-1B)"
     echo "  --verbose               Enable verbose output"
     echo "  -h, --help              Display this help message and exit"
 }
@@ -75,6 +81,18 @@ while [[ $# -gt 0 ]]; do
             SINGLE_FILE="$2"
             shift 2
             ;;
+        --whisper_model)
+            WHISPER_MODEL="$2"
+            shift 2
+            ;;
+        --clip_model)
+            CLIP_MODEL="$2"
+            shift 2
+            ;;
+        --llm_model)
+            LLM_MODEL="$2"
+            shift 2
+            ;;
         --verbose)
             VERBOSE=true
             shift
@@ -119,6 +137,9 @@ CMD+=" --batch_size $BATCH_SIZE"
 CMD+=" --max_new_tokens $MAX_NEW_TOKENS"
 CMD+=" --device $DEVICE"
 CMD+=" --config $CONFIG"
+CMD+=" --whisper_model $WHISPER_MODEL"
+CMD+=" --clip_model $CLIP_MODEL"
+CMD+=" --llm_model $LLM_MODEL"
 
 if [ "$VERBOSE" = true ]; then
     CMD+=" --verbose"
