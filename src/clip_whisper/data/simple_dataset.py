@@ -296,6 +296,7 @@ class AVSRDataset(Dataset):
         
         return {
             "id": idx,
+            "utt_id": audio_id,
             "audio": audio_features,
             "video": video_features,
             "text": text,
@@ -377,6 +378,7 @@ class AVSRDataset(Dataset):
             "labels": labels,
             "audio_paths": audio_paths,
             "video_paths": video_paths,
+            "utt_id": [item["utt_id"] for item in batch],
         }
 
 

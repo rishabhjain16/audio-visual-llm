@@ -311,12 +311,12 @@ class ClipWhisperModel(nn.Module):
             if batch_idx % 25 == 0:
                 logging.info(f"[Batch {batch_idx}] Forward pass using modality: {self.modality}")
             
-            batch_size = audio.size(0) if audio is not None else video.size(0)
-            
-            logging.debug(f"Forward pass with batch size {batch_size}")
-            
-            # Input validation
-            if audio is None and video is None:
+            # Determine batch size based on available inputs
+            if audio is not None:
+                batch_size = audio.size(0)
+            elif video is not None:
+                batch_size = video.size(0)
+            else:
                 raise ValueError("Both audio and video inputs cannot be None")
                 
             if audio is not None:
@@ -468,6 +468,45 @@ class ClipWhisperModel(nn.Module):
                 attention_mask = torch.ones((batch_size, encoder_out.size(1)), dtype=torch.long, device=self.device)
                 logging.info(f"Updated attention mask shape: {attention_mask.shape}")
             else:
+                # During training, we should ALWAYS have a prompt for consistent behavior
+                # If no prompt is provided, add a default transcription prompt
+                if return_loss and self.training:
+                    logging.warning("No prompt provided during training. Adding default transcription prompt.")
+                    
+                    # Create a simple transcription prompt
+                    default_prompt = "Transcribe the speech from this audio and video input: "
+                    
+                    # Convert to tensor if tokenizer is available 
+                    if hasattr(self, 'tokenizer'):
+                        if not hasattr(self.tokenizer, 'pad_token') or self.tokenizer.pad_token is None:
+                            self.tokenizer.pad_token = self.tokenizer.eos_token
+                            
+                        default_prompt_ids = self.tokenizer(
+                            default_prompt,
+                            return_tensors="pt",
+                            padding="max_length",
+                            truncation=True,
+                            max_length=32,
+                        ).input_ids.to(self.device)
+                        
+                        # Get embeddings
+                        embedding_layer = self.llm.get_input_embeddings()
+                        prompt_embeds = embedding_layer(default_prompt_ids)
+                        
+                        # Expand to batch size if needed
+                        if prompt_embeds.size(0) == 1 and encoder_out.size(0) > 1:
+                            prompt_embeds = prompt_embeds.expand(encoder_out.size(0), -1, -1)
+                            
+                        # Concatenate to encoder output
+                        encoder_out = torch.cat([prompt_embeds, encoder_out], dim=1)
+                        
+                        # Update attention mask
+                        attention_mask = torch.ones((batch_size, encoder_out.size(1)), dtype=torch.long, device=self.device)
+                        
+                        logging.info(f"Added default prompt. New encoder output shape: {encoder_out.shape}")
+                    else:
+                        logging.warning("Cannot add default prompt: tokenizer not available")
+                
                 logging.info(f"No prompt provided, using encoder output directly with shape: {encoder_out.shape}")
                 logging.info(f"Attention mask shape: {attention_mask.shape}")
                 
@@ -1102,13 +1141,7 @@ class ClipWhisperModel(nn.Module):
                     max(audio_features.size(1), video_features.size(1))
                 )
                 
-                # Log if we're truncating during fusion
-                if audio_features.size(1) > max_len:
-                    logging.debug(f"Truncating audio features from {audio_features.size(1)} to {max_len} during fusion")
-                
-                if video_features.size(1) > max_len:
-                    logging.debug(f"Truncating video features from {video_features.size(1)} to {max_len} during fusion")
-                
+                # Pad or truncate both features to the same length
                 audio_features = self._pad_or_truncate(audio_features, max_len)
                 video_features = self._pad_or_truncate(video_features, max_len)
                 
@@ -1117,80 +1150,105 @@ class ClipWhisperModel(nn.Module):
                     self.fusion_scale * audio_features +
                     (1 - self.fusion_scale) * video_features
                 )
-                
-                # Double-check that fusion result respects max_seq_len
-                if encoder_output.size(1) != max_len:
-                    logging.warning(f"Unexpected encoder output length after fusion: {encoder_output.size(1)} (expected {max_len})")
-                    encoder_output = self._pad_or_truncate(encoder_output, max_len)
             
-            # Apply sequence length limit
-            if encoder_output.size(1) > self.max_seq_len:
-                # Get the current batch index if available for logging
-                batch_idx = getattr(self, '_current_batch_idx', 0)
-                # Log less frequently to reduce clutter (only every 25 batches)
-                if batch_idx % 25 == 0:
-                    logging.info(f"[Batch {batch_idx}] Encoder output truncated from {encoder_output.size(1)} to {self.max_seq_len}")
-                encoder_output = encoder_output[:, :self.max_seq_len, :]
-                logging.debug(f"Truncated encoder output to {self.max_seq_len}")
+            # Track batch dimension for inputs to LLM
+            batch_size = encoder_output.size(0)
             
-            # Explicitly verify the sequence length after truncation
-            if encoder_output.size(1) != self.max_seq_len:
-                # Get the current batch index if available for logging
-                batch_idx = getattr(self, '_current_batch_idx', 0)
-                if batch_idx % 25 == 0:
-                    logging.info(f"[Batch {batch_idx}] After truncation, encoder output length ({encoder_output.size(1)}) doesn't match max_seq_len ({self.max_seq_len})")
-                # Force the correct sequence length if it still doesn't match
-                if encoder_output.size(1) > self.max_seq_len:
-                    encoder_output = encoder_output[:, :self.max_seq_len, :]
-                    logging.debug(f"Forcibly truncated encoder output to max_seq_len {self.max_seq_len}")
+            # Create attention mask (all 1s for the encoder output)
+            attention_mask = torch.ones(
+                (batch_size, encoder_output.size(1)),
+                dtype=torch.long,
+                device=self.device
+            )
             
-            # Get batch size and sequence length
-            batch_size, seq_len = encoder_output.size(0), encoder_output.size(1)
-            
-            # Create attention mask
-            attention_mask = torch.ones((batch_size, seq_len), dtype=torch.long, device=self.device)
-            
-            # Handle prompt if provided
+            # Handle prompt for LLM input
             if prompt is not None:
+                # Process the provided prompt
+                if isinstance(prompt, str):
+                    # Convert text prompt to token IDs
+                    prompt_ids = self.tokenizer(
+                        prompt,
+                        return_tensors="pt"
+                    ).input_ids.to(self.device)
+                else:
+                    # Assume it's already tokenized
+                    prompt_ids = prompt.to(self.device)
+                
+                # Convert tokens to embeddings
                 embedding_layer = self.llm.get_input_embeddings()
-                prompt_embeds = embedding_layer(prompt.to(self.device))
+                prompt_embeds = embedding_layer(prompt_ids)
                 
-                # Ensure batch dimensions match
-                if prompt_embeds.size(0) == 1 and encoder_output.size(0) > 1:
-                    prompt_embeds = prompt_embeds.expand(encoder_output.size(0), -1, -1)
+                # Ensure batch dimension matches
+                if prompt_embeds.size(0) == 1 and batch_size > 1:
+                    prompt_embeds = prompt_embeds.expand(batch_size, -1, -1)
                 
-                # Concatenate along sequence dimension
+                # Concatenate prompt and encoder output
                 inputs_embeds = torch.cat([prompt_embeds, encoder_output], dim=1)
                 
-                # Update attention mask to include prompt tokens
-                attention_mask = torch.ones(
-                    (batch_size, inputs_embeds.size(1)), 
-                    dtype=torch.long, 
+                # Update attention mask
+                prompt_attention = torch.ones(
+                    (batch_size, prompt_embeds.size(1)),
+                    dtype=torch.long,
                     device=self.device
                 )
+                attention_mask = torch.cat([prompt_attention, attention_mask], dim=1)
+                
+                logging.info(f"Using provided prompt. Input shape: {inputs_embeds.shape}")
+            else:
+                # Add a default transcription prompt for consistent behavior
+                default_prompt = "Transcribe the speech from this audio and video input: "
+                
+                if hasattr(self, 'tokenizer'):
+                    # Ensure pad token is set
+                    if not hasattr(self.tokenizer, 'pad_token') or self.tokenizer.pad_token is None:
+                        self.tokenizer.pad_token = self.tokenizer.eos_token
+                    
+                    # Convert prompt to token IDs
+                    prompt_ids = self.tokenizer(
+                        default_prompt,
+                        return_tensors="pt"
+                    ).input_ids.to(self.device)
+                    
+                    # Get embeddings
+                    embedding_layer = self.llm.get_input_embeddings()
+                    prompt_embeds = embedding_layer(prompt_ids)
+                    
+                    # Ensure batch dimension matches
+                    if prompt_embeds.size(0) == 1 and batch_size > 1:
+                        prompt_embeds = prompt_embeds.expand(batch_size, -1, -1)
+                    
+                    # Concatenate prompt and encoder output
+                    inputs_embeds = torch.cat([prompt_embeds, encoder_output], dim=1)
+                    
+                    # Update attention mask
+                    prompt_attention = torch.ones(
+                        (batch_size, prompt_embeds.size(1)),
+                        dtype=torch.long,
+                        device=self.device
+                    )
+                    attention_mask = torch.cat([prompt_attention, attention_mask], dim=1)
+                    
+                    logging.info(f"Using default prompt. Input shape: {inputs_embeds.shape}")
+                else:
+                    # No tokenizer available, use encoder output directly
+                    inputs_embeds = encoder_output
+                    logging.warning("No tokenizer available, cannot add default prompt")
+            
+            # Log the final input shape before generation
+            if 'inputs_embeds' in locals():
+                logging.info(f"Generating with inputs shape: {inputs_embeds.shape}")
             else:
                 inputs_embeds = encoder_output
+                logging.info(f"Generating with inputs shape: {encoder_output.shape}")
             
-            # Ensure input embeddings match LLM's expected dtype
-            llm_dtype = next(self.llm.parameters()).dtype
-            if inputs_embeds.dtype != llm_dtype:
-                inputs_embeds = inputs_embeds.to(llm_dtype)
-            
-            # Set up generation parameters
-            generation_config = {
-                "max_length": max_length,
-                "temperature": temperature,
-                "do_sample": do_sample,
-                **kwargs
-            }
-            
-            logging.info(f"Generating with inputs shape: {inputs_embeds.shape}")
-            
-            # Generate text
+            # Generate text using the LLM
             outputs = self.llm.generate(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
-                **generation_config
+                max_length=max_length,
+                do_sample=do_sample,
+                temperature=temperature,
+                **kwargs
             )
             
             return outputs

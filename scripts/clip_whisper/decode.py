@@ -261,14 +261,56 @@ def main():
             with open(args.test_wrd, 'r') as f:
                 lines = f.readlines()
                 
+                # Debug information about reference file
+                logging.info(f"Reference file contains {len(lines)} lines")
+                if len(lines) > 0:
+                    logging.info(f"First line of reference file: '{lines[0].strip()}'")
+                if len(lines) > 1:
+                    logging.info(f"Second line of reference file: '{lines[1].strip()}'")
+
+                # Check if we have utterance IDs from test.tsv in a specific format
+                # Extract all parts of the utterance IDs for flexible matching
+                utterance_id_parts = {}
+                for utt_id in utterance_ids:
+                    # Store the full ID
+                    utterance_id_parts[utt_id] = utt_id
+                    
+                    # Store without path prefix
+                    if "/" in utt_id:
+                        simple_id = utt_id.split("/")[-1]
+                        utterance_id_parts[simple_id] = utt_id
+                    
+                    # Store numeric part if it exists
+                    if any(char.isdigit() for char in utt_id):
+                        numeric_parts = ''.join(char for char in utt_id if char.isdigit())
+                        if numeric_parts:
+                            utterance_id_parts[numeric_parts] = utt_id
+                
+                # Detect reference file format based on first few lines
+                has_id_prefix = False
+                if len(lines) > 0:
+                    parts = lines[0].strip().split(maxsplit=1)
+                    if len(parts) == 2 and (parts[0] in utterance_ids or parts[0] in utterance_id_parts):
+                        has_id_prefix = True
+                        logging.info("Detected reference format with ID prefix")
+                    else:
+                        logging.info("Detected reference format without ID prefix, assuming line-by-line format")
+                
                 # If number of lines in WRD matches number of utterances,
-                # then each line corresponds to one utterance
-                if len(lines) == len(utterance_ids):
+                # and no ID prefix is detected, assume each line corresponds to one utterance
+                if len(lines) == len(utterance_ids) and not has_id_prefix:
+                    logging.info("Number of reference lines matches number of utterance IDs, using direct mapping")
                     for i, line in enumerate(lines):
                         if line.strip():
                             references[utterance_ids[i]] = line.strip()
+                            
+                            # Also add simplified versions of the ID to the references dict
+                            if "/" in utterance_ids[i]:
+                                simple_id = utterance_ids[i].split("/")[-1]
+                                references[simple_id] = line.strip()
                 else:
                     # Otherwise, try to parse as ID + text format
+                    logging.info("Parsing references with ID prefix format")
                     for line in lines:
                         if line.strip():
                             parts = line.strip().split(maxsplit=1)
@@ -276,8 +318,39 @@ def main():
                                 utt_id = parts[0]
                                 ref_text = parts[1]
                                 references[utt_id] = ref_text
-            
-            logging.info(f"Loaded {len(references)} reference transcriptions")
+                                
+                                # If the ID is in our utterance_id_parts mapping, add references
+                                # for all forms of the ID
+                                if utt_id in utterance_id_parts:
+                                    full_id = utterance_id_parts[utt_id]
+                                    references[full_id] = ref_text
+                                    
+                                    # Also add simplified version
+                                    if "/" in full_id:
+                                        simple_id = full_id.split("/")[-1]
+                                        references[simple_id] = ref_text
+                            elif len(parts) == 1:
+                                # Handle case with just an ID and no text
+                                references[parts[0]] = ""
+                
+                # Log some statistics about loaded references
+                logging.info(f"Loaded {len(references)} reference transcriptions")
+                logging.info(f"First few reference IDs: {list(references.keys())[:5]}")
+                logging.info(f"Number of utterance IDs matching references: {sum(1 for uid in utterance_ids if uid in references)}")
+                
+                # Check if we have enough matching IDs
+                matching_percent = sum(1 for uid in utterance_ids if uid in references) / len(utterance_ids) * 100
+                if matching_percent < 50:
+                    logging.warning(f"Only {matching_percent:.1f}% of utterance IDs match references. Check ID formats!")
+                    
+                    # Try to determine if we need to transform IDs
+                    logging.info("Example utterance ID formats:")
+                    for uid in utterance_ids[:5]:
+                        logging.info(f"  {uid}")
+                    
+                    logging.info("Example reference ID formats:")
+                    for rid in list(references.keys())[:5]:
+                        logging.info(f"  {rid}")
         except Exception as e:
             logging.error(f"Error loading references: {e}")
             logging.error(traceback.format_exc())
@@ -335,10 +408,13 @@ def main():
                 # Get utterance IDs
                 if "utt_id" in batch:
                     utt_ids = batch["utt_id"]
+                    if args.verbose:
+                        logging.info(f"Found utterance IDs in batch: {utt_ids}")
                 else:
                     # If batch doesn't contain utt_ids, create artificial ones based on batch index
                     # Use a reasonable default since batch_hypotheses isn't created yet
                     utt_ids = [f"sample_{batch_idx}_{i}" for i in range(1)]  # We'll extend this later if needed
+                    logging.warning(f"No utterance IDs found in batch {batch_idx}, using auto-generated IDs")
                 
                 # Print the actual keys in the batch for debugging
                 if args.verbose and batch_idx < 2:  # Only print for first few batches to avoid spam
@@ -490,11 +566,26 @@ def main():
                 
                 # Decode the output tokens for each sample
                 batch_size = len(batch_hypotheses)
+                
+                # If we need more utterance IDs (e.g., if the model output more hypotheses than inputs)
+                if len(utt_ids) < batch_size:
+                    # Extend utt_ids with auto-generated IDs
+                    for i in range(len(utt_ids), batch_size):
+                        utt_ids.append(f"sample_{batch_idx}_{i}")
+                    logging.warning(f"Extended utterance IDs with auto-generated IDs for batch {batch_idx}")
+                
                 for i in range(batch_size):
+                    # Get actual utterance ID from dataset if available
                     utt_id = utt_ids[i] if i < len(utt_ids) else f"sample_{batch_idx}_{i}"
+                    
+                    # For debug purposes, if it's an auto-generated ID, log this
+                    if utt_id.startswith("sample_"):
+                        logging.warning(f"Using auto-generated utterance ID: {utt_id}")
+                    
                     hypothesis = batch_hypotheses[i]
                     
-                    # Get reference
+                    # Map the utterance ID to the format in the reference file if needed
+                    # Check if utterance ID exists directly in references
                     reference = references.get(utt_id, "")
                     
                     # Print the transcription to console for immediate feedback
@@ -502,6 +593,17 @@ def main():
                     print(f"HYP: {hypothesis}")
                     if reference:
                         print(f"REF: {reference}")
+                    else:
+                        # Try to find reference by removing the path prefix if present
+                        if "/" in utt_id:
+                            # Extract just the last part of the path as a possible ID
+                            simple_id = utt_id.split("/")[-1]
+                            reference = references.get(simple_id, "")
+                            if reference:
+                                print(f"REF: {reference}")
+                                print(f"(Found reference using simplified ID: {simple_id})")
+                                # Update utt_id to the simplified version for WER calculation
+                                utt_id = simple_id
                         
                     # Calculate WER for this sample
                     if reference:
@@ -510,6 +612,12 @@ def main():
                         all_hypotheses.append(hypothesis)
                     else:
                         sample_wer = float('inf')
+                        # Enhanced error reporting for missing references
+                        print(f"No reference found for utterance ID: {utt_id}")
+                        print(f"Available reference IDs: {list(references.keys())[:5]}... (showing first 5 of {len(references)})")
+                        if utt_id.startswith("sample_"):
+                            print("Note: Using auto-generated sample IDs. These might not match reference file.")
+                            print("Check format of reference file and ensure utterance IDs match between data and references.")
                         logging.warning(f"No reference found for utterance {utt_id}")
                     
                     # Save result
