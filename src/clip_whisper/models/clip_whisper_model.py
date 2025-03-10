@@ -19,6 +19,7 @@ import datetime
 import gc
 from peft import LoraConfig, get_peft_model
 from .modality_connector import ModalityConnector
+import time
 
 class ClipWhisperModel(nn.Module):
     """
@@ -99,6 +100,7 @@ class ClipWhisperModel(nn.Module):
         modality: str = "both",
         max_seq_len: int = 256,
         fusion_scale: float = 0.5,
+        connector_type: str = "simple",
         _provided_tokenizer=None,
     ):
         """
@@ -118,9 +120,18 @@ class ClipWhisperModel(nn.Module):
             freeze_encoders: Whether to freeze encoders
             freeze_llm: Whether to freeze the LLM
             modality: Which modalities to use: "audio", "video", or "both"
-            max_seq_len: Maximum sequence length for encoder output
-            fusion_scale: Weight for audio in fusion (0.5 = equal weight)
-            _provided_tokenizer: Provided tokenizer instead of loading from llm_path
+            max_seq_len: Maximum sequence length for encoders
+            fusion_scale: Scaling factor for audio-video fusion (0-1)
+            connector_type: Type of connector to use. Options:
+                - "simple": Basic linear projection
+                - "deep": Multi-layer projection with residual connections
+                - "conv": Convolutional projection for sequence patterns
+                - "attention": Self-attention projection for long sequences
+                - "adaptive": Adaptive projection based on sequence length
+                - "cross_modal": Cross-modal attention between audio and video
+                - "qformer": Query-based transformer for multimodal fusion
+                - "perceiver": Perceiver-IO architecture for efficient multimodal processing
+            _provided_tokenizer: Optional pre-loaded tokenizer
         """
         super().__init__()
         
@@ -133,6 +144,7 @@ class ClipWhisperModel(nn.Module):
         self.modality = modality
         self.max_seq_len = max_seq_len
         self.fusion_scale = fusion_scale
+        self.connector_type = connector_type
         self._provided_tokenizer = _provided_tokenizer  # Store the provided tokenizer
         
         # Set modality with clear logging
@@ -226,6 +238,8 @@ class ClipWhisperModel(nn.Module):
             "freeze_llm": freeze_llm,
             "modality": modality,
             "max_seq_len": max_seq_len,
+            "fusion_scale": fusion_scale,
+            "connector_type": connector_type,
         }
         
         # Count and log trainable parameters by component
@@ -363,69 +377,90 @@ class ClipWhisperModel(nn.Module):
                 if batch_idx % 10 == 0:
                     logging.info(f"[Batch {batch_idx}] VIDEO-ONLY MODE: Using video features with shape {video_features.shape}")
             else:  # both modalities
-                # Log original sequence lengths before fusion
-                if batch_idx % 10 == 0 and audio_features is not None and video_features is not None:
-                    logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Pre-fusion audio length = {audio_features.size(1)}, video length = {video_features.size(1)}")
-                    logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: max_seq_len = {self.max_seq_len}")
-                
-                # Ensure both features have the same sequence length,
-                # but also respect the maximum sequence length limit
-                max_len = min(
-                    self.max_seq_len,
-                    max(
-                        audio_features.size(1) if audio_features is not None else 0,
-                        video_features.size(1) if video_features is not None else 0
+                # Check if we're using an advanced connector that processes audio and video together
+                if hasattr(self, 'multimodal_connector') and self.connector_type in ["cross_modal", "qformer", "perceiver"]:
+                    # Use the multimodal connector for fusion
+                    if batch_idx % 10 == 0:
+                        logging.info(f"[Batch {batch_idx}] FUSION: Using {self.connector_type} connector")
+                        
+                    # Create attention masks if needed
+                    audio_mask = None
+                    video_mask = None
+                    
+                    # Process with the multimodal connector
+                    encoder_out = self.multimodal_connector(
+                        audio_features=audio_features,
+                        video_features=video_features,
+                        audio_mask=audio_mask,
+                        video_mask=video_mask
                     )
-                )
-                
-                # Log the selected fusion length
-                if batch_idx % 10 == 0:
-                    if max_len < self.max_seq_len:
-                        logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Using natural max length {max_len} (< max_seq_len {self.max_seq_len})")
-                    else:
-                        logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Truncating to max_seq_len {max_len}")
-                
-                # Log if we're truncating during fusion
-                if audio_features is not None and audio_features.size(1) > max_len:
-                    # Get the current batch index if available for logging
-                    batch_idx = getattr(self, '_current_batch_idx', 0)
-                    # Log less frequently to reduce clutter (only every 25 batches)
+                    
                     if batch_idx % 10 == 0:
-                        pct_kept = (max_len / audio_features.size(1)) * 100
-                        logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Audio truncated from {audio_features.size(1)} → {max_len} ({pct_kept:.1f}% kept)")
-                
-                if video_features is not None and video_features.size(1) > max_len:
-                    # Get the current batch index if available for logging
-                    batch_idx = getattr(self, '_current_batch_idx', 0)
-                    # Log less frequently to reduce clutter (only every 25 batches)
+                        logging.info(f"[Batch {batch_idx}] FUSION RESULT: Shape {encoder_out.shape}")
+                else:
+                    # Log original sequence lengths before fusion
+                    if batch_idx % 10 == 0 and audio_features is not None and video_features is not None:
+                        logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Pre-fusion audio length = {audio_features.size(1)}, video length = {video_features.size(1)}")
+                        logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: max_seq_len = {self.max_seq_len}")
+                    
+                    # Ensure both features have the same sequence length,
+                    # but also respect the maximum sequence length limit
+                    max_len = min(
+                        self.max_seq_len,
+                        max(
+                            audio_features.size(1) if audio_features is not None else 0,
+                            video_features.size(1) if video_features is not None else 0
+                        )
+                    )
+                    
+                    # Log the selected fusion length
                     if batch_idx % 10 == 0:
-                        pct_kept = (max_len / video_features.size(1)) * 100
-                        logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Video truncated from {video_features.size(1)} → {max_len} ({pct_kept:.1f}% kept)")
-                
-                # Pad or truncate to match
-                audio_features = self._pad_or_truncate(audio_features, max_len)
-                video_features = self._pad_or_truncate(video_features, max_len)
-                
-                # Double-check that fusion result respects max_seq_len
-                if audio_features.size(1) != max_len or video_features.size(1) != max_len:
-                    logging.warning(f"Unexpected feature length after padding/truncation - Audio: {audio_features.size(1)}, Video: {video_features.size(1)}, Expected: {max_len}")
+                        if max_len < self.max_seq_len:
+                            logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Using natural max length {max_len} (< max_seq_len {self.max_seq_len})")
+                        else:
+                            logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Truncating to max_seq_len {max_len}")
+                    
+                    # Log if we're truncating during fusion
+                    if audio_features is not None and audio_features.size(1) > max_len:
+                        # Get the current batch index if available for logging
+                        batch_idx = getattr(self, '_current_batch_idx', 0)
+                        # Log less frequently to reduce clutter (only every 25 batches)
+                        if batch_idx % 10 == 0:
+                            pct_kept = (max_len / audio_features.size(1)) * 100
+                            logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Audio truncated from {audio_features.size(1)} → {max_len} ({pct_kept:.1f}% kept)")
+                    
+                    if video_features is not None and video_features.size(1) > max_len:
+                        # Get the current batch index if available for logging
+                        batch_idx = getattr(self, '_current_batch_idx', 0)
+                        # Log less frequently to reduce clutter (only every 25 batches)
+                        if batch_idx % 10 == 0:
+                            pct_kept = (max_len / video_features.size(1)) * 100
+                            logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Video truncated from {video_features.size(1)} → {max_len} ({pct_kept:.1f}% kept)")
+                    
+                    # Pad or truncate to match
                     audio_features = self._pad_or_truncate(audio_features, max_len)
                     video_features = self._pad_or_truncate(video_features, max_len)
-                
-                # Weighted sum of features
-                encoder_out = (
-                    self.fusion_scale * audio_features +
-                    (1 - self.fusion_scale) * video_features
-                )
-                
-                # Log fusion result
-                if batch_idx % 10 == 0:
-                    logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Final fused features shape = {encoder_out.shape}")
-                
-                # Double-check that fusion result respects max_seq_len
-                if encoder_out.size(1) != max_len:
-                    logging.warning(f"Unexpected encoder output length after fusion: {encoder_out.size(1)} (expected {max_len})")
-                    encoder_out = self._pad_or_truncate(encoder_out, max_len)
+                    
+                    # Double-check that fusion result respects max_seq_len
+                    if audio_features.size(1) != max_len or video_features.size(1) != max_len:
+                        logging.warning(f"Unexpected feature length after padding/truncation - Audio: {audio_features.size(1)}, Video: {video_features.size(1)}, Expected: {max_len}")
+                        audio_features = self._pad_or_truncate(audio_features, max_len)
+                        video_features = self._pad_or_truncate(video_features, max_len)
+                    
+                    # Weighted sum of features
+                    encoder_out = (
+                        self.fusion_scale * audio_features +
+                        (1 - self.fusion_scale) * video_features
+                    )
+                    
+                    # Log fusion result
+                    if batch_idx % 10 == 0:
+                        logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Final fused features shape = {encoder_out.shape}")
+                    
+                    # Double-check that fusion result respects max_seq_len
+                    if encoder_out.size(1) != max_len:
+                        logging.warning(f"Unexpected encoder output length after fusion: {encoder_out.size(1)} (expected {max_len})")
+                        encoder_out = self._pad_or_truncate(encoder_out, max_len)
             
             # Log final encoder output size before any LLM processing
             if batch_idx % 10 == 0:
@@ -597,9 +632,8 @@ class ClipWhisperModel(nn.Module):
                 "audio_dim": self.audio_dim,
                 "video_dim": self.video_dim,
                 "llm_dim": self.llm_dim,
-                "device": self.device,
-                "dtype": self.dtype,
-            }, os.path.join(output_dir, "model_config.json"))
+                "connector_type": self.connector_type
+            }, os.path.join(output_dir, "config.pt"))
         except Exception as e:
             logging.error(f"Error saving connectors: {e}")
         
@@ -692,6 +726,7 @@ class ClipWhisperModel(nn.Module):
             modality=config.get("modality", "both"),
             max_seq_len=config.get("max_seq_len", 256),
             fusion_scale=config.get("fusion_scale", 0.5),
+            connector_type=config.get("connector_type", "simple"),
             _provided_tokenizer=tokenizer,  # Pass the tokenizer to __init__
         )
         
@@ -752,21 +787,21 @@ class ClipWhisperModel(nn.Module):
                 
                 llm = AutoModelForCausalLM.from_pretrained(
                     llm_path,
-                    device_map="auto",
+                    device_map={"": 0},  # Use explicit device mapping instead of "auto"
                     quantization_config=quantization_config,
                 )
                 
                 logging.info("Successfully loaded LLM with 4-bit quantization")
             except ImportError:
                 logging.warning("BitsAndBytes not available for 4-bit quantization, falling back to standard loading")
-                llm = AutoModelForCausalLM.from_pretrained(llm_path, device_map="auto")
+                llm = AutoModelForCausalLM.from_pretrained(llm_path, device_map={"": 0})
             except Exception as e:
                 logging.error(f"Error loading LLM with 4-bit quantization: {e}")
                 logging.warning("Falling back to standard loading")
-                llm = AutoModelForCausalLM.from_pretrained(llm_path, device_map="auto")
+                llm = AutoModelForCausalLM.from_pretrained(llm_path, device_map={"": 0})
         else:
             # Standard loading without quantization
-            llm = AutoModelForCausalLM.from_pretrained(llm_path, device_map="auto")
+            llm = AutoModelForCausalLM.from_pretrained(llm_path, device_map={"": 0})
         
         # Use provided tokenizer if available, otherwise load from llm_path
         if self._provided_tokenizer is not None:
@@ -790,50 +825,12 @@ class ClipWhisperModel(nn.Module):
         if use_lora:
             logging.info(f"Applying LoRA with r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}")
             
-            # First, check if there's an adapter_config.json that already specifies the target modules
-            adapter_config_path = os.path.join(llm_path, "adapter_config.json")
-            if os.path.exists(adapter_config_path):
-                # Load existing adapter config to get the target modules
-                try:
-                    with open(adapter_config_path, 'r') as f:
-                        adapter_config = json.load(f)
-                    if 'target_modules' in adapter_config:
-                        target_modules = adapter_config['target_modules']
-                        logging.info(f"Using target modules from adapter_config.json: {target_modules}")
-                    else:
-                        # Fall back to default Llama target modules
-                        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
-                        logging.info(f"No target_modules in adapter_config.json, using default Llama modules: {target_modules}")
-                except Exception as e:
-                    logging.error(f"Error reading adapter_config.json: {e}")
-                    # Fall back to default Llama target modules
-                    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+            # Configure target modules based on model type
+            if 'llama' in llm_path.lower():
+                target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
             else:
-                # Try to determine the model type from the config or architecture
-                try:
-                    # Check if it's a Llama model by looking at its config
-                    model_config_path = os.path.join(llm_path, "config.json")
-                    if os.path.exists(model_config_path):
-                        with open(model_config_path, 'r') as f:
-                            model_config = json.load(f)
-                        model_type = model_config.get('model_type', '').lower()
-                        architecture = model_config.get('architectures', [''])[0].lower()
-                        
-                        # Check if it's a Llama model
-                        if 'llama' in model_type or 'llama' in architecture or 'llama' in llm_path.lower():
-                            target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
-                            logging.info(f"Detected Llama model, using target modules: {target_modules}")
-                        else:
-                            # Default target modules for other model types
-                            target_modules = ["query", "key", "value", "dense"]
-                            logging.info(f"Non-Llama model detected, using target modules: {target_modules}")
-                    else:
-                        # Default to Llama modules as they're more common
-                        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
-                        logging.info(f"No config.json found, assuming Llama model with target modules: {target_modules}")
-                except Exception as e:
-                    logging.error(f"Error determining model type: {e}, defaulting to Llama target modules")
-                    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+                # Default target modules for other model types
+                target_modules = ["query", "key", "value", "dense"]
                 
             # Create LoRA config
             peft_config = LoraConfig(
@@ -853,7 +850,7 @@ class ClipWhisperModel(nn.Module):
                 logging.error(f"Error applying LoRA: {e}")
                 logging.warning("Continuing without LoRA")
                 # Continue without LoRA rather than failing entirely
-            
+        
         # Freeze LLM weights if requested
         if freeze_llm:
             logging.info("Freezing LLM weights (only LoRA weights will be trained)")
@@ -865,7 +862,7 @@ class ClipWhisperModel(nn.Module):
                 for n, p in llm.named_parameters():
                     if 'lora' in n:
                         p.requires_grad = True
-                        
+                
         return llm, tokenizer
 
     def _log_parameter_count(self):
@@ -884,12 +881,21 @@ class ClipWhisperModel(nn.Module):
         audio_connector_trainable = sum(p.numel() for p in self.audio_connector.parameters() if p.requires_grad)
         video_connector_trainable = sum(p.numel() for p in self.video_connector.parameters() if p.requires_grad)
         
+        # Handle advanced connectors if present
+        multimodal_connector_params = 0
+        multimodal_connector_trainable = 0
+        if hasattr(self, 'multimodal_connector'):
+            multimodal_connector_params = sum(p.numel() for p in self.multimodal_connector.parameters())
+            multimodal_connector_trainable = sum(p.numel() for p in self.multimodal_connector.parameters() if p.requires_grad)
+        
         # Total counts
         total_params = whisper_params + clip_params + llm_params + \
-                       audio_connector_params + video_connector_params
+                       audio_connector_params + video_connector_params + \
+                       multimodal_connector_params
                         
         total_trainable = whisper_trainable + clip_trainable + llm_trainable + \
-                          audio_connector_trainable + video_connector_trainable
+                          audio_connector_trainable + video_connector_trainable + \
+                          multimodal_connector_trainable
         
         # Log the counts in a nice table format
         logging.info("=" * 80)
@@ -902,6 +908,12 @@ class ClipWhisperModel(nn.Module):
         logging.info(f"{'LLM':<20} {llm_params:,d} {llm_trainable:,d} {100*llm_trainable/max(1, llm_params):.2f}%")
         logging.info(f"{'Audio Connector':<20} {audio_connector_params:,d} {audio_connector_trainable:,d} {100*audio_connector_trainable/max(1, audio_connector_params):.2f}%")
         logging.info(f"{'Video Connector':<20} {video_connector_params:,d} {video_connector_trainable:,d} {100*video_connector_trainable/max(1, video_connector_params):.2f}%")
+        
+        # Add advanced connector to the table if present
+        if hasattr(self, 'multimodal_connector'):
+            connector_name = self.connector_type.replace('_', ' ').title()
+            logging.info(f"{connector_name+' Connector':<20} {multimodal_connector_params:,d} {multimodal_connector_trainable:,d} {100*multimodal_connector_trainable/max(1, multimodal_connector_params):.2f}%")
+            
         logging.info("-" * 80)
         logging.info(f"{'TOTAL':<20} {total_params:,d} {total_trainable:,d} {100*total_trainable/max(1, total_params):.2f}%")
         logging.info("=" * 80)
@@ -1067,23 +1079,98 @@ class ClipWhisperModel(nn.Module):
 
     def _setup_projections(self):
         """Create projections from encoder outputs to LLM input dimension"""
-        # Audio projection (Whisper -> LLM)
-        self.audio_connector = ModalityConnector(
-            input_dim=self.audio_dim,
-            output_dim=self.llm_dim,
-            device=self.device,
-            dtype=self.dtype
-        )
-        logging.info(f"Created audio projection: {self.audio_dim} -> {self.llm_dim}")
+        # Import here to avoid circular imports
+        from .modality_connector import create_modality_connector
         
-        # Video projection (CLIP -> LLM)
-        self.video_connector = ModalityConnector(
-            input_dim=self.video_dim,
-            output_dim=self.llm_dim,
-            device=self.device,
-            dtype=self.dtype
-        )
-        logging.info(f"Created video projection: {self.video_dim} -> {self.llm_dim}")
+        # Import advanced connectors only for the specific connector types
+        if self.connector_type in ["cross_modal", "qformer", "perceiver"]:
+            from .advanced_connectors import (
+                CrossModalConnector, 
+                QformerConnector,
+                MultimodalPerceiverConnector
+            )
+            
+            # For advanced connectors that process audio and video together
+            if self.connector_type == "cross_modal":
+                logging.info(f"Using CrossModalConnector for multimodal fusion")
+                self.multimodal_connector = CrossModalConnector(
+                    audio_dim=self.audio_dim,
+                    video_dim=self.video_dim,
+                    output_dim=self.llm_dim,
+                    device=self.device,
+                    dtype=self.dtype,
+                    num_heads=8,
+                    dropout=0.1,
+                    num_layers=2
+                )
+            elif self.connector_type == "qformer":
+                logging.info(f"Using QformerConnector for multimodal fusion")
+                self.multimodal_connector = QformerConnector(
+                    audio_dim=self.audio_dim,
+                    video_dim=self.video_dim,
+                    output_dim=self.llm_dim,
+                    device=self.device,
+                    dtype=self.dtype,
+                    num_queries=32,
+                    num_heads=8,
+                    num_layers=3,
+                    dropout=0.1
+                )
+            elif self.connector_type == "perceiver":
+                logging.info(f"Using MultimodalPerceiverConnector for multimodal fusion")
+                self.multimodal_connector = MultimodalPerceiverConnector(
+                    audio_dim=self.audio_dim,
+                    video_dim=self.video_dim,
+                    output_dim=self.llm_dim,
+                    device=self.device, 
+                    dtype=self.dtype,
+                    num_latents=64,
+                    num_heads=8,
+                    num_layers=3,
+                    dropout=0.1
+                )
+                
+            # We still create individual connectors for when modality is audio-only or video-only
+            self.audio_connector = create_modality_connector(
+                connector_type="simple",  # Use simple connector for single-modality
+                input_dim=self.audio_dim,
+                output_dim=self.llm_dim,
+                device=self.device,
+                dtype=self.dtype,
+                max_seq_len=self.max_seq_len
+            )
+            
+            self.video_connector = create_modality_connector(
+                connector_type="simple",  # Use simple connector for single-modality
+                input_dim=self.video_dim,
+                output_dim=self.llm_dim,
+                device=self.device,
+                dtype=self.dtype,
+                max_seq_len=self.max_seq_len
+            )
+        else:
+            # Standard connectors (simple, deep, conv, attention, adaptive)
+            # Audio projection (Whisper -> LLM)
+            self.audio_connector = create_modality_connector(
+                connector_type=self.connector_type,
+                input_dim=self.audio_dim,
+                output_dim=self.llm_dim,
+                device=self.device,
+                dtype=self.dtype,
+                max_seq_len=self.max_seq_len
+            )
+            logging.info(f"Created audio projection ({self.connector_type}): {self.audio_dim} -> {self.llm_dim}")
+            
+            # Video projection (CLIP -> LLM)
+            self.video_connector = create_modality_connector(
+                connector_type=self.connector_type,
+                input_dim=self.video_dim,
+                output_dim=self.llm_dim,
+                device=self.device,
+                dtype=self.dtype,
+                max_seq_len=self.max_seq_len
+            )
+            logging.info(f"Created video projection ({self.connector_type}): {self.video_dim} -> {self.llm_dim}")
         
     def _log_model_architecture(self):
         """Log model architecture details"""
@@ -1101,9 +1188,26 @@ class ClipWhisperModel(nn.Module):
         logging.info(f"{'Video Encoder (CLIP)':<30} {'-':<15} {self.video_dim:<15} {'video, both':<20}")
         logging.info(f"{'Video Connector':<30} {self.video_dim:<15} {self.llm_dim:<15} {'video, both':<20}")
         
+        # Advanced connector if present
+        if hasattr(self, 'multimodal_connector'):
+            connector_name = self.connector_type.replace('_', ' ').title()
+            logging.info(f"{connector_name+' Connector':<30} {self.audio_dim+','+str(self.video_dim):<15} {self.llm_dim:<15} {'both':<20}")
+        
         # LLM
         logging.info(f"{'LLM':<30} {self.llm_dim:<15} {'-':<15} {'all':<20}")
         logging.info(f"{dim_banner}\n")
+        
+        logging.info("\nACTIVE COMPONENTS FOR MODALITY: {}".format(self.modality.upper()))
+        if self.modality in ['audio', 'both']:
+            logging.info("- Using WHISPER for audio encoding")
+        if self.modality in ['video', 'both']:
+            logging.info("- Using CLIP for video encoding")
+        if self.modality == 'both':
+            if hasattr(self, 'multimodal_connector'):
+                logging.info(f"- Using {self.connector_type.upper()} connector for advanced multimodal fusion")
+            else:
+                logging.info("- Using both connectors and fusion for combined features")
+        logging.info("- All features projected to LLM dimension: {}\n".format(self.llm_dim))
 
     def generate(
         self,

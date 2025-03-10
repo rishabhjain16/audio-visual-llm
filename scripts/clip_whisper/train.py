@@ -68,6 +68,9 @@ def parse_args():
     parser.add_argument("--log_level", type=str, default="info",
                         choices=["debug", "info", "warning", "error", "critical"],
                         help="Logging level")
+    parser.add_argument("--connector_type", type=str, default="simple",
+                        choices=["simple", "deep", "conv", "attention", "adaptive", "cross_modal", "qformer", "perceiver"],
+                        help="Type of connector to use for modality projection")
     return parser.parse_args()
 
 
@@ -140,6 +143,10 @@ def main():
     if args.max_seq_len is not None:
         config["model"]["max_seq_len"] = args.max_seq_len
         logging.info(f"Overriding max_seq_len with {args.max_seq_len}")
+    
+    if args.connector_type:
+        config["model"]["connector_type"] = args.connector_type
+        logging.info(f"Using connector type: {args.connector_type}")
     
     # Log the effective max_seq_len
     logging.info(f"Using max_seq_len: {config['model']['max_seq_len']}")

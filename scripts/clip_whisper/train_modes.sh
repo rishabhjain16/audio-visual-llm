@@ -5,11 +5,13 @@
 DATA_PATH="/home/rishabh/Desktop/Datasets/lrs3/433h_data"
 EPOCHS=10
 BATCH_SIZE=2
-MODALITY="video"
-MODE="standard"  # standard, fp16, 4bit, or max
-OUTPUT_DIR="outputs/test_clip_whisper"
+MODALITY="both"
+LLM_PATH="checkpoints/Llama-3.2-1B"
+MODE="max"  # standard, fp16, 4bit, or max
+OUTPUT_DIR="outputs/new_test_clip_whisper"
 DEBUG="true"
 MAX_SEQ_LEN=1536  # Default is now 1536 to capture more of the 1500 audio frames
+CONNECTOR_TYPE="qformer"  # default connector type
 
 # ANSI color codes for prettier output
 RED='\033[0;31m'
@@ -55,6 +57,14 @@ while [[ $# -gt 0 ]]; do
       MAX_SEQ_LEN="$2"
       shift 2
       ;;
+    --connector_type)
+      CONNECTOR_TYPE="$2"
+      shift 2
+      ;;
+    --llm_path)
+      LLM_PATH="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown option: $1"
       exit 1
@@ -63,7 +73,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Base command
-BASE_CMD="bash scripts/clip_whisper/train.sh --data_path $DATA_PATH --max_epochs $EPOCHS --batch_size $BATCH_SIZE --modality $MODALITY --output_dir $OUTPUT_DIR --max_seq_len $MAX_SEQ_LEN"
+BASE_CMD="bash scripts/clip_whisper/train.sh --data_path $DATA_PATH --max_epochs $EPOCHS --batch_size $BATCH_SIZE --modality $MODALITY --output_dir $OUTPUT_DIR --max_seq_len $MAX_SEQ_LEN --connector_type $CONNECTOR_TYPE --llm_path $LLM_PATH"
 
 if [ "$DEBUG" = "true" ]; then
   BASE_CMD="$BASE_CMD --debug"
@@ -144,4 +154,78 @@ esac
 
 # Execute the command
 echo -e "Running command: ${CYAN}$CMD${NC}"
+
+# Print connector information
+echo -e "${BLUE}===============================================${NC}"
+echo -e "${CYAN}           CONNECTOR TYPE INFORMATION           ${NC}"
+echo -e "${BLUE}===============================================${NC}"
+
+case $CONNECTOR_TYPE in
+  simple)
+    echo -e "${GREEN}SIMPLE CONNECTOR${NC}"
+    echo -e "• Basic linear projection from encoder to LLM dimension"
+    echo -e "• Minimal memory usage and computational overhead"
+    echo -e "• Good baseline approach for stability"
+    ;;
+  deep)
+    echo -e "${YELLOW}DEEP CONNECTOR${NC}"
+    echo -e "• Multi-layer projection with residual connections"
+    echo -e "• Better representation learning capability"
+    echo -e "• Includes LayerNorm for improved training stability"
+    echo -e "• Moderate increase in parameters and computation"
+    ;;
+  conv)
+    echo -e "${PURPLE}CONVOLUTIONAL CONNECTOR${NC}"
+    echo -e "• Uses 1D convolutions to capture sequence patterns"
+    echo -e "• Better handling of local relationships in sequences"
+    echo -e "• Good for speech and visual temporal features"
+    echo -e "• Moderate increase in computation"
+    ;;
+  attention)
+    echo -e "${CYAN}ATTENTION CONNECTOR${NC}"
+    echo -e "• Self-attention based for capturing global relationships"
+    echo -e "• Best for long-range dependencies in sequences"
+    echo -e "• Includes residual connections and layer norms"
+    echo -e "• Higher computation cost but powerful modeling"
+    ;;
+  adaptive)
+    echo -e "${RED}ADAPTIVE CONNECTOR${NC}"
+    echo -e "• Dynamically adapts to sequence length using pooling"
+    echo -e "• Uses convolution for downsampling longer sequences"
+    echo -e "• Includes positional encoding for sequence awareness"
+    echo -e "• Best for handling variable-length sequences"
+    ;;
+  cross_modal)
+    echo -e "${BLUE}CROSS-MODAL CONNECTOR${NC}"
+    echo -e "• Enables audio and video to attend to each other"
+    echo -e "• True multimodal fusion through cross-attention"
+    echo -e "• Learns relationships between lip movements and speech"
+    echo -e "• Higher memory usage but better multimodal understanding"
+    echo -e "• Ideal for audio-visual tasks like lip reading"
+    ;;
+  qformer)
+    echo -e "${PURPLE}QFORMER CONNECTOR${NC}"
+    echo -e "• Inspired by BLIP-2 and Flamingo architectures"
+    echo -e "• Uses learnable query vectors to extract key information"
+    echo -e "• Efficient for long sequences (fixed output length)"
+    echo -e "• Strong semantic understanding of multimodal content"
+    echo -e "• Recommended for complex audio-visual understanding tasks"
+    ;;
+  perceiver)
+    echo -e "${CYAN}PERCEIVER CONNECTOR${NC}"
+    echo -e "• Based on Perceiver-IO architecture from DeepMind"
+    echo -e "• Processes inputs through a small set of latent vectors"
+    echo -e "• Very memory-efficient for long sequences"
+    echo -e "• Can handle extremely long audio-visual sequences"
+    echo -e "• Ideal for large-scale multimodal integration"
+    ;;
+  *)
+    echo -e "${RED}UNKNOWN CONNECTOR TYPE: $CONNECTOR_TYPE${NC}"
+    echo -e "Defaulting to simple connector"
+    ;;
+esac
+
+echo -e "${BLUE}===============================================${NC}"
+echo ""
+
 $CMD 

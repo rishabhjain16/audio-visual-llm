@@ -7,7 +7,7 @@ SRC=${ROOT}/src
 
 # Set variables (using same paths as original codebase)
 DATA_PATH=/home/rishabh/Desktop/Datasets/lrs3/433h_data
-CHECKPOINT_PATH=${ROOT}/checkpoints/trained/avsr_llm_output/best_model.pt
+CHECKPOINT_PATH=${ROOT}/checkpoints/trained/new_test_clip_whisper/best_model.pt
 OUTPUT_DIR=${ROOT}/results
 
 # Configuration file

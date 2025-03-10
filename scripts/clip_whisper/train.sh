@@ -2,10 +2,10 @@
 # Training script for the ClipWhisperModel
 
 # Default values
-DATA_PATH=""  # Must be specified by the user
+DATA_PATH="/home/rishabh/Desktop/Datasets/lrs3/433h_data"
 CONFIG="configs/clip_whisper.yaml"
 OUTPUT_DIR="outputs/clip_whisper"
-LLM_PATH="checkpoints/Llama-3.2-1B"
+LLM_PATH="checkpoints/Llama-2-7b-hf"
 WHISPER_MODEL="openai/whisper-medium"
 CLIP_MODEL="openai/clip-vit-base-patch32"
 BATCH_SIZE=2
@@ -19,6 +19,7 @@ RESUME_FROM=""
 DEBUG_MODE="false"  # Debug logging mode
 MAX_SEQ_LEN=1536  # Default to 1536 (can be overridden via command line)
 LOG_LEVEL="info"  # Default log level
+CONNECTOR_TYPE="simple"  # Default to simple connector
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -92,6 +93,10 @@ while [[ $# -gt 0 ]]; do
       MAX_SEQ_LEN="$2"
       shift 2
       ;;
+    --connector_type)
+      CONNECTOR_TYPE="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown option: $1"
       exit 1
@@ -128,6 +133,7 @@ echo "Using LoRA: $([ "$NO_LORA" == "false" ] && echo "Yes" || echo "No")"
 echo "Debug mode: ${DEBUG_MODE^}"
 echo "Log level: $LOG_LEVEL"
 echo "Max sequence length: $MAX_SEQ_LEN"
+echo "Connector type: $CONNECTOR_TYPE"
 
 # Build command
 CMD="python scripts/clip_whisper/train.py \
@@ -142,7 +148,8 @@ CMD="python scripts/clip_whisper/train.py \
   --modality $MODALITY \
   --save_every $SAVE_EVERY \
   --max_seq_len $MAX_SEQ_LEN \
-  --log_level $LOG_LEVEL"
+  --log_level $LOG_LEVEL \
+  --connector_type $CONNECTOR_TYPE"
 
 # Add optional arguments
 if [ "$FP16" = "true" ]; then
