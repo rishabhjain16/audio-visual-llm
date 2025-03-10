@@ -9,6 +9,8 @@ from typing import List, Tuple, Dict, Any, Optional
 import cv2
 import soundfile as sf
 import torch.nn.functional as F
+import random
+import traceback
 
 class AVSRDataset(Dataset):
     """
@@ -34,6 +36,7 @@ class AVSRDataset(Dataset):
         image_mean: float = 0,
         image_std: float = 1,
         image_crop_size: int = 88,
+        modality: str = "both",  # "audio", "video", or "both"
     ):
         super().__init__()
         
@@ -49,6 +52,7 @@ class AVSRDataset(Dataset):
         self.image_mean = image_mean
         self.image_std = image_std
         self.image_crop_size = image_crop_size
+        self.modality = modality  # Store which modality to use
         
         # Load manifest file
         logging.info(f"Loading manifest from {manifest_path}")
@@ -65,6 +69,7 @@ class AVSRDataset(Dataset):
             logging.warning("Using all available data without trimming.")
         
         logging.info(f"Dataset size: {len(self.names)} manifest entries, {len(self.labels)} label entries")
+        logging.info(f"Dataset operating in '{self.modality}' modality mode")
     
     def _load_manifest(self, manifest_path):
         """Load manifest file in LRS3 format"""
@@ -130,9 +135,9 @@ class AVSRDataset(Dataset):
             # Try another sample
             return self.__getitem__((idx + 1) % len(self))
         
-        # Load audio if it exists
+        # Load audio if it exists and if we need audio features
         audio_features = None
-        if audio_exists:
+        if audio_exists and (self.modality == "audio" or self.modality == "both"):
             try:
                 # Load audio
                 audio, sr = sf.read(audio_path)
@@ -166,9 +171,9 @@ class AVSRDataset(Dataset):
                 logging.error(f"Error loading audio {audio_path}: {e}")
                 audio_features = None
         
-        # Load video if it exists
+        # Load video if it exists and if we need video features
         video_features = None
-        if video_exists:
+        if video_exists and (self.modality == "video" or self.modality == "both"):
             try:
                 # Open video file
                 video = cv2.VideoCapture(video_path)
@@ -235,151 +240,194 @@ class AVSRDataset(Dataset):
                     # Each frame is [1, 3, 224, 224], we want [frames, 3, 224, 224]
                     video_features = torch.cat(processed_frames, dim=0)
                     
-                    # Log the shape to verify
-                    logging.info(f"Processed video shape: {video_features.shape}")
+                    # Log the shape less frequently to reduce log spam
+                    if random.random() < 0.05:  # Only log about 5% of the time
+                        logging.info(f"Processed video shape: {video_features.shape}")
             
             except Exception as e:
                 logging.error(f"Error loading video {video_path}: {e}")
                 video_features = None
         
-        # If both modalities failed, try another sample
-        if audio_features is None and video_features is None:
-            logging.warning(f"Both audio and video processing failed for sample {idx}")
+        # Handle required modalities not being available
+        if self.modality == "audio" and audio_features is None:
+            logging.warning(f"Audio required but not available for {audio_path}")
+            return self.__getitem__((idx + 1) % len(self))
+        elif self.modality == "video" and video_features is None:
+            logging.warning(f"Video required but not available for {video_path}")
+            return self.__getitem__((idx + 1) % len(self))
+        elif self.modality == "both" and (audio_features is None or video_features is None):
+            logging.warning(f"Both modalities required but not available for {audio_path}, {video_path}")
             return self.__getitem__((idx + 1) % len(self))
         
-        # Handle the case when one modality is missing - but don't create dummy features
-        # as this would confuse the model, instead raise a clear error
-        if audio_features is None and video_features is not None:
-            raise ValueError(f"Audio processing failed for {audio_path}. The model expects both modalities.")
+        # Get text labels
+        text = self.labels[idx]
         
-        if video_features is None and audio_features is not None:
-            raise ValueError(f"Video processing failed for {video_path}. The model expects both modalities.")
-        
-        # Get label - handle case where we might have more manifest entries than labels
-        text = ""
-        if idx < len(self.labels):
-            text = self.labels[idx]
-        else:
-            logging.warning(f"No label found for idx {idx}, using empty string")
-            text = ""
-        
-        # Create a comprehensive task description for the LLM
-        task_description = (
-            "Your task is to transcribe speech from the combined audio and visual input. "
-            "Pay attention to both spoken words from the audio and lip movements from the video. "
-            "Generate an accurate transcription of what the person is saying."
-        )
-        
+        # Create tokens for model input
         # Ensure tokenizer has a pad token before tokenizing
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             # Add the pad token to the vocabulary
             self.tokenizer.add_special_tokens({'pad_token': self.tokenizer.eos_token})
         
-        # Tokenize the prompt
-        prompt_tokens = self.tokenizer(
-            task_description,
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=64,
-        ).input_ids.squeeze(0)
-        
-        # Tokenize the label
-        label_tokens = self.tokenizer(
-            text,
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=256,
-        ).input_ids.squeeze(0)
-        
-        return {
-            "id": idx,
-            "utt_id": audio_id,
-            "audio": audio_features,
-            "video": video_features,
-            "text": text,
-            "prompt": prompt_tokens,
-            "labels": label_tokens,
-            "audio_path": audio_path,
-            "video_path": video_path,
+        # Get tokens for prompt and text
+        tokenizer_kwargs = {
+            "return_tensors": "pt",
+            "padding": "max_length",
+            "truncation": True,
+            "max_length": 256,  # Use a reasonable limit for labels
+            "return_attention_mask": False
         }
+        
+        # Convert text to model tokens (for labels during training)
+        tokens = self.tokenizer(text, **tokenizer_kwargs).input_ids[0].tolist()
+        
+        # Return data structured for the collate_fn
+        return audio_features, video_features, text, tokens
     
     @staticmethod
     def collate_fn(batch):
-        """Custom collate function to handle variable length sequences"""
-        # Filter out None values (failed samples)
-        batch = [b for b in batch if b is not None]
-        if len(batch) == 0:
-            return None
+        """
+        Custom collate function to handle variable-length sequences
         
-        # Get audio features
-        audio_features = torch.stack([item["audio"] for item in batch])
+        Args:
+            batch: List of tuples (audio_features, video_features, text, label_tokens)
         
-        # Ensure audio features are float16 for consistency with model
-        if audio_features.dtype != torch.float16:
-            audio_features = audio_features.to(torch.float16)
-        
-        # Get video features
-        # Verify the format is what we expect - [frames, channels, height, width]
-        video_shapes = [(v["video"].shape, v["video"].dtype) for v in batch]
-        logging.info(f"Video shapes in batch: {video_shapes}")
-        
-        # Get maximum number of frames
-        max_frames = max(item["video"].size(0) for item in batch)
-        video_features = []
-        
-        # Process each video tensor
-        for item in batch:
-            video = item["video"]
-            # Ensure it's in the right format:
-            # For CLIP: [frames, 3, height, width]
-            if video.dim() != 4 or video.size(1) != 3:
-                logging.warning(f"Unexpected video shape: {video.shape}, expected [frames, 3, height, width]")
-                # Try to fix by permuting if it looks like [frames, height, width, 3]
-                if video.dim() == 4 and video.size(3) == 3:
-                    video = video.permute(0, 3, 1, 2)  # [frames, channels, height, width]
-                    logging.info(f"Permuted video to: {video.shape}")
+        Returns:
+            Batched tensors with appropriate padding
+        """
+        try:
+            # Extract components
+            audio_features = []
+            video_features = []
+            texts = []
+            label_tokens = []
+            audio_shapes = []
+            video_shapes = []
             
-            # Create a zero tensor with max_frames and same dims as original video
-            # For CLIP format: [frames, channels, height, width]
-            channels, height, width = video.shape[1], video.shape[2], video.shape[3]
-            padded_video = torch.zeros(
-                (max_frames, channels, height, width),
-                dtype=torch.float16  # Always use float16
+            # Track whether each modality exists in this batch
+            has_audio = False
+            has_video = False
+            
+            for item in batch:
+                if len(item) != 4:
+                    logging.warning(f"Invalid batch item: {item}")
+                    continue
+                    
+                audio_feat, video_feat, text, labels = item
+                
+                # Check if audio features exist
+                if audio_feat is not None:
+                    audio_features.append(audio_feat)
+                    audio_shapes.append((audio_feat.shape, audio_feat.dtype))
+                    has_audio = True
+                
+                # Check if video features exist
+                if video_feat is not None:
+                    video_features.append(video_feat)
+                    video_shapes.append((video_feat.shape, video_feat.dtype))
+                    has_video = True
+                
+                texts.append(text)
+                label_tokens.append(labels)
+            
+            # Log the shapes for debugging
+            if audio_shapes:
+                logging.debug(f"Audio shapes in batch: {audio_shapes}")
+            if video_shapes:
+                logging.debug(f"Video shapes in batch: {video_shapes}")
+            
+            # Collate audio features if they exist
+            collated_audio = None
+            if has_audio:
+                # Check the dimension of the audio features
+                if audio_features[0].dim() == 2:
+                    # For 2D audio features [seq_len, feature_dim]
+                    # Pad along the sequence dimension (dim=0)
+                    max_audio_len = max(feat.size(0) for feat in audio_features)
+                    feature_dim = audio_features[0].size(1)
+                    
+                    # Create padded batch
+                    batch_size = len(audio_features)
+                    collated_audio = torch.zeros(
+                        batch_size, max_audio_len, feature_dim,
+                        dtype=audio_features[0].dtype
+                    )
+                    
+                    # Fill in the actual features
+                    for i, feat in enumerate(audio_features):
+                        seq_len = feat.size(0)
+                        # Add batch dimension
+                        collated_audio[i, :seq_len, :] = feat
+                
+                elif audio_features[0].dim() == 3:
+                    # For 3D audio features [batch, seq_len, feature_dim]
+                    # Pad along the sequence dimension (dim=1)
+                    max_audio_len = max(feat.size(1) for feat in audio_features)
+                    batch_size = len(audio_features)
+                    feature_dim = audio_features[0].size(2)
+                    
+                    # Create tensor with appropriate shape filled with zeros
+                    collated_audio = torch.zeros(
+                        batch_size, max_audio_len, feature_dim,
+                        dtype=audio_features[0].dtype
+                    )
+                    
+                    # Fill in the actual features
+                    for i, feat in enumerate(audio_features):
+                        seq_len = feat.size(1)
+                        collated_audio[i, :seq_len, :] = feat
+                else:
+                    logging.error(f"Unexpected audio feature dimension: {audio_features[0].dim()}")
+                    raise ValueError(f"Unexpected audio feature dimension: {audio_features[0].dim()}")
+            
+            # Collate video features if they exist
+            collated_video = None
+            if has_video:
+                # Get the maximum number of frames across the batch
+                max_frames = max(feat.size(0) for feat in video_features)
+                
+                # Get the dimensions from the first video
+                if video_features[0].dim() >= 4:  # [frames, channels, height, width]
+                    channels, height, width = video_features[0].size()[1:]
+                    batch_size = len(video_features)
+                    
+                    # Create padded tensor
+                    collated_video = torch.zeros(
+                        batch_size, max_frames, channels, height, width,
+                        dtype=video_features[0].dtype
+                    )
+                    
+                    # Fill in the features
+                    for i, feat in enumerate(video_features):
+                        frames = feat.size(0)
+                        collated_video[i, :frames, :, :, :] = feat
+                    
+                    # Log the final shape
+                    logging.debug(f"Final collated video shape: {collated_video.shape}")
+                else:
+                    logging.error(f"Unexpected video feature dimension: {video_features[0].dim()}")
+                    raise ValueError(f"Unexpected video feature dimension: {video_features[0].dim()}")
+            
+            # Collate label tokens
+            max_label_len = max(len(tokens) for tokens in label_tokens)
+            
+            # Create padded tensor for labels
+            collated_labels = torch.full(
+                (len(label_tokens), max_label_len),
+                -100,  # Padding token ID (will be ignored in loss calculation)
+                dtype=torch.long
             )
-            # Copy original frames to padded tensor
-            padded_video[:video.size(0)] = video.to(torch.float16)
-            video_features.append(padded_video)
+            
+            # Fill in the actual tokens
+            for i, tokens in enumerate(label_tokens):
+                collated_labels[i, :len(tokens)] = torch.tensor(tokens, dtype=torch.long)
+            
+            return collated_audio, collated_video, texts, collated_labels
         
-        # Stack video features along batch dimension to get [batch, frames, channels, height, width]
-        video_features = torch.stack(video_features)
-        logging.info(f"Final collated video shape: {video_features.shape}")
-        
-        # Get text
-        text = [item["text"] for item in batch]
-        
-        # Get prompts
-        prompts = torch.stack([item["prompt"] for item in batch])
-        
-        # Get labels
-        labels = torch.stack([item["labels"] for item in batch])
-        
-        # Paths for debugging
-        audio_paths = [item["audio_path"] for item in batch]
-        video_paths = [item["video_path"] for item in batch]
-        
-        return {
-            "audio": audio_features,
-            "video": video_features,
-            "text": text,
-            "prompt": prompts,
-            "labels": labels,
-            "audio_paths": audio_paths,
-            "video_paths": video_paths,
-            "utt_id": [item["utt_id"] for item in batch],
-        }
+        except Exception as e:
+            logging.error(f"Error in collate_fn: {e}")
+            logging.error(f"Traceback: {traceback.format_exc()}")
+            raise e
 
 
 def create_dataloaders(
@@ -433,10 +481,30 @@ def create_dataloaders(
             val_manifest_filename = "valid.tsv"
             val_label_filename = "valid.wrd"
         
+        # Try different directory structures
+        # First, check if files are in the root directory
         train_manifest_path = os.path.join(data_path, train_manifest_filename)
         train_label_path = os.path.join(data_path, train_label_filename)
         val_manifest_path = os.path.join(data_path, val_manifest_filename)
         val_label_path = os.path.join(data_path, val_label_filename)
+        
+        # If files aren't in the root, check if they're in a 'train' subdirectory
+        if not os.path.exists(train_manifest_path) or not os.path.exists(train_label_path):
+            train_dir = os.path.join(data_path, "train")
+            if os.path.exists(train_dir) and os.path.isdir(train_dir):
+                logging.info(f"Files not found in root directory, checking train subdirectory: {train_dir}")
+                train_manifest_path = os.path.join(train_dir, train_manifest_filename)
+                train_label_path = os.path.join(train_dir, train_label_filename)
+        
+        # If files aren't in the train directory, check if they're in a 'data' subdirectory
+        if not os.path.exists(train_manifest_path) or not os.path.exists(train_label_path):
+            data_dir = os.path.join(data_path, "data")
+            if os.path.exists(data_dir) and os.path.isdir(data_dir):
+                logging.info(f"Files not found in train subdirectory, checking data subdirectory: {data_dir}")
+                train_manifest_path = os.path.join(data_dir, train_manifest_filename)
+                train_label_path = os.path.join(data_dir, train_label_filename)
+                val_manifest_path = os.path.join(data_dir, val_manifest_filename)
+                val_label_path = os.path.join(data_dir, val_label_filename)
     else:
         train_manifest_path = manifest_path
         train_label_path = label_path
@@ -463,9 +531,22 @@ def create_dataloaders(
         whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-medium")
         clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
         tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
+        
+        # Ensure tokenizer has a pad token
+        if tokenizer.pad_token is None:
+            logging.info("Setting pad_token = eos_token for tokenizer in dataset")
+            tokenizer.pad_token = tokenizer.eos_token
+            # Add the pad token to the vocabulary
+            tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
+    
+    # Get the modality from the config
+    modality = "both"
+    if config and "modality" in config:
+        modality = config["modality"]
+        logging.info(f"Using modality from config: {modality}")
     
     # Create training dataset
-    logging.info(f"Creating training dataset...")
+    logging.info(f"Creating training dataset from {train_manifest_path}...")
     train_dataset = AVSRDataset(
         manifest_path=train_manifest_path,
         label_path=train_label_path,
@@ -476,6 +557,7 @@ def create_dataloaders(
         max_audio_length=max_audio_length,
         max_video_length=max_video_length,
         split="train",
+        modality=modality,  # Pass the modality parameter
     )
     
     # Check if dataset is empty
@@ -491,7 +573,7 @@ def create_dataloaders(
         shuffle=True,
         num_workers=num_workers,
         collate_fn=AVSRDataset.collate_fn,
-        pin_memory=True,
+        pin_memory=False,  # Disable pin_memory to prevent CUDA errors
         prefetch_factor=2 if num_workers > 0 else None,
         persistent_workers=num_workers > 0,
     )
@@ -501,7 +583,7 @@ def create_dataloaders(
     # Create validation dataloader if validation files exist
     val_dataloader = None
     if os.path.exists(val_manifest_path) and os.path.exists(val_label_path):
-        logging.info(f"Creating validation dataset...")
+        logging.info(f"Creating validation dataset from {val_manifest_path}...")
         val_dataset = AVSRDataset(
             manifest_path=val_manifest_path,
             label_path=val_label_path,
@@ -512,6 +594,7 @@ def create_dataloaders(
             max_audio_length=max_audio_length,
             max_video_length=max_video_length,
             split="val",
+            modality=modality,  # Pass the modality parameter
         )
         
         if len(val_dataset) > 0:
@@ -521,7 +604,7 @@ def create_dataloaders(
                 shuffle=False,
                 num_workers=num_workers,
                 collate_fn=AVSRDataset.collate_fn,
-                pin_memory=True,
+                pin_memory=False,  # Disable pin_memory to prevent CUDA errors
                 prefetch_factor=2 if num_workers > 0 else None,
                 persistent_workers=num_workers > 0,
             )

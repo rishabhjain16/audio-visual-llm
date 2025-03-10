@@ -5,13 +5,17 @@
 DATA_PATH="/home/rishabh/Desktop/Datasets/lrs3/433h_data"
 EPOCHS=10
 BATCH_SIZE=2
-MODALITY="both"
-LLM_PATH="checkpoints/Llama-3.2-1B"
+MODALITY="audio"
+LLM_PATH="checkpoints/Llama-2-7b-hf"
 MODE="max"  # standard, fp16, 4bit, or max
 OUTPUT_DIR="outputs/new_test_clip_whisper"
-DEBUG="true"
-MAX_SEQ_LEN=1536  # Default is now 1536 to capture more of the 1500 audio frames
-CONNECTOR_TYPE="qformer"  # default connector type
+DEBUG="true"  # When false, minimizes console output but still logs to file
+MAX_SEQ_LEN=512  # Default is now 1536 to capture more of the 1500 audio frames
+CONNECTOR_TYPE="simple"  # default connector type is simple for stability
+MAX_GRAD_NORM=0.5  # Default gradient clipping value
+LOG_LEVEL="info"  # Default log level for file logging
+LEARNING_RATE="5e-6"  # Default learning rate (reduced from 2e-5 for stability)
+NO_LORA="false"  # By default, enable LoRA
 
 # ANSI color codes for prettier output
 RED='\033[0;31m'
@@ -50,8 +54,8 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --debug)
-      DEBUG="true"
-      shift
+      DEBUG="$2"
+      shift 2
       ;;
     --max_seq_len)
       MAX_SEQ_LEN="$2"
@@ -65,6 +69,22 @@ while [[ $# -gt 0 ]]; do
       LLM_PATH="$2"
       shift 2
       ;;
+    --max_grad_norm)
+      MAX_GRAD_NORM="$2"
+      shift 2
+      ;;
+    --log_level)
+      LOG_LEVEL="$2"
+      shift 2
+      ;;
+    --learning_rate)
+      LEARNING_RATE="$2"
+      shift 2
+      ;;
+    --no_lora)
+      NO_LORA="true"
+      shift
+      ;;
     *)
       echo "Unknown option: $1"
       exit 1
@@ -72,12 +92,40 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Base command
-BASE_CMD="bash scripts/clip_whisper/train.sh --data_path $DATA_PATH --max_epochs $EPOCHS --batch_size $BATCH_SIZE --modality $MODALITY --output_dir $OUTPUT_DIR --max_seq_len $MAX_SEQ_LEN --connector_type $CONNECTOR_TYPE --llm_path $LLM_PATH"
+# Configure gradient clipping based on model size (if not explicitly set)
+# Only adjust if user didn't specify a value
+if [[ "$@" != *"--max_grad_norm"* ]]; then
+  # Check if it's a 7B or larger model
+  if [[ "$LLM_PATH" == *"7b"* ]] || [[ "$LLM_PATH" == *"7B"* ]] || 
+     [[ "$LLM_PATH" == *"13b"* ]] || [[ "$LLM_PATH" == *"13B"* ]] || 
+     [[ "$LLM_PATH" == *"70b"* ]] || [[ "$LLM_PATH" == *"70B"* ]]; then
+    # For larger models, use more aggressive clipping
+    MAX_GRAD_NORM=0.3
+    echo -e "${YELLOW}Automatically setting max_grad_norm=0.3 for large model${NC}"
+  elif [[ "$LLM_PATH" == *"1b"* ]] || [[ "$LLM_PATH" == *"1B"* ]]; then
+    # For smaller models, use less aggressive clipping
+    MAX_GRAD_NORM=1.0
+    echo -e "${GREEN}Automatically setting max_grad_norm=1.0 for small model${NC}"
+  fi
+fi
 
+# Base command
+BASE_CMD="bash scripts/clip_whisper/train.sh --data_path $DATA_PATH --max_epochs $EPOCHS --batch_size $BATCH_SIZE --modality $MODALITY --output_dir $OUTPUT_DIR --max_seq_len $MAX_SEQ_LEN --connector_type $CONNECTOR_TYPE --llm_path $LLM_PATH --max_grad_norm $MAX_GRAD_NORM --learning_rate $LEARNING_RATE"
+
+# Add no_lora if requested
+if [ "$NO_LORA" = "true" ]; then
+  BASE_CMD="$BASE_CMD --no_lora"
+fi
+
+# Set up logging based on DEBUG parameter
 if [ "$DEBUG" = "true" ]; then
-  BASE_CMD="$BASE_CMD --debug"
-  echo -e "${YELLOW}Debug mode enabled - you'll see more detailed logs${NC}"
+  # In debug mode: verbose console output with detailed logging
+  BASE_CMD="$BASE_CMD --debug --log_level $LOG_LEVEL --console_level $LOG_LEVEL"
+  echo -e "${YELLOW}Debug mode enabled - you'll see detailed logs in console${NC}"
+else
+  # In quiet mode: minimal console output but still log to file
+  BASE_CMD="$BASE_CMD --log_level $LOG_LEVEL --console_level warning"
+  echo -e "${BLUE}Quiet mode enabled - detailed logs will be saved to file but console output will be minimal${NC}"
 fi
 
 # Show memory usage information based on mode

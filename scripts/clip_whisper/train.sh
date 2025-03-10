@@ -12,14 +12,17 @@ BATCH_SIZE=2
 MAX_EPOCHS=5
 MODALITY="both"  # audio, video, or both
 SAVE_EVERY=1
-FP16="false"
-USE_4BIT="false"
+FP16="true"
+USE_4BIT="true"
 NO_LORA="false"  # By default, use LoRA
 RESUME_FROM=""
 DEBUG_MODE="false"  # Debug logging mode
 MAX_SEQ_LEN=1536  # Default to 1536 (can be overridden via command line)
-LOG_LEVEL="info"  # Default log level
+LOG_LEVEL="info"  # Default log level for file logging
+CONSOLE_LEVEL="$LOG_LEVEL"  # Default: console level matches log level
 CONNECTOR_TYPE="simple"  # Default to simple connector
+MAX_GRAD_NORM=0.5  # Default gradient clipping value (0.5 for stable training)
+LEARNING_RATE="5e-6"  # Default learning rate for stable training
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -89,12 +92,24 @@ while [[ $# -gt 0 ]]; do
       LOG_LEVEL="$2"
       shift 2
       ;;
+    --console_level)
+      CONSOLE_LEVEL="$2"
+      shift 2
+      ;;
     --max_seq_len)
       MAX_SEQ_LEN="$2"
       shift 2
       ;;
     --connector_type)
       CONNECTOR_TYPE="$2"
+      shift 2
+      ;;
+    --max_grad_norm)
+      MAX_GRAD_NORM="$2"
+      shift 2
+      ;;
+    --learning_rate)
+      LEARNING_RATE="$2"
       shift 2
       ;;
     *)
@@ -132,8 +147,11 @@ echo "Using 4-bit quantization: $([ "$USE_4BIT" == "true" ] && echo "True" || ec
 echo "Using LoRA: $([ "$NO_LORA" == "false" ] && echo "Yes" || echo "No")"
 echo "Debug mode: ${DEBUG_MODE^}"
 echo "Log level: $LOG_LEVEL"
+echo "Console level: $CONSOLE_LEVEL"
 echo "Max sequence length: $MAX_SEQ_LEN"
 echo "Connector type: $CONNECTOR_TYPE"
+echo "Max gradient norm: $MAX_GRAD_NORM"
+echo "Learning rate: $LEARNING_RATE"
 
 # Build command
 CMD="python scripts/clip_whisper/train.py \
@@ -149,7 +167,10 @@ CMD="python scripts/clip_whisper/train.py \
   --save_every $SAVE_EVERY \
   --max_seq_len $MAX_SEQ_LEN \
   --log_level $LOG_LEVEL \
-  --connector_type $CONNECTOR_TYPE"
+  --console_level $CONSOLE_LEVEL \
+  --connector_type $CONNECTOR_TYPE \
+  --max_grad_norm $MAX_GRAD_NORM \
+  --learning_rate $LEARNING_RATE"
 
 # Add optional arguments
 if [ "$FP16" = "true" ]; then

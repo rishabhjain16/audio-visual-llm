@@ -6,11 +6,19 @@ Training script for the ClipWhisperModel.
 import os
 import sys
 import logging
+
+# Configure logging early to suppress specific loggers
+for logger_name in ["urllib3", "urllib3.connectionpool", "huggingface_hub", "transformers"]:
+    logger = logging.getLogger(logger_name)
+    logger.setLevel(logging.WARNING)
+    logger.propagate = True
+
 import argparse
 import torch
 import yaml
 from pathlib import Path
 import traceback
+import random
 
 # Add project root to path
 project_root = Path(__file__).resolve().parent.parent.parent
@@ -65,12 +73,17 @@ def parse_args():
                         help="Resume training from checkpoint")
     parser.add_argument("--max_seq_len", type=int, default=None,
                         help="Maximum sequence length for encoder output (overrides config)")
-    parser.add_argument("--log_level", type=str, default="info",
+    parser.add_argument("--log_level", type=str.lower, default="info",
                         choices=["debug", "info", "warning", "error", "critical"],
-                        help="Logging level")
+                        help="Logging level for file output")
+    parser.add_argument("--console_level", type=str.lower, default=None,
+                        choices=["debug", "info", "warning", "error", "critical"],
+                        help="Logging level for console output (defaults to log_level if not set)")
     parser.add_argument("--connector_type", type=str, default="simple",
                         choices=["simple", "deep", "conv", "attention", "adaptive", "cross_modal", "qformer", "perceiver"],
                         help="Type of connector to use for modality projection")
+    parser.add_argument("--max_grad_norm", type=float, default=0.5,
+                        help="Maximum gradient norm for clipping (lower values like 0.1-0.5 help with larger models)")
     return parser.parse_args()
 
 
@@ -81,164 +94,204 @@ def load_config(config_path):
     return config
 
 
+def setup_dual_logging(log_level, console_level=None, log_file=None):
+    """Set up logging with different levels for console and file."""
+    if console_level is None:
+        console_level = log_level
+    
+    log_level = log_level.upper()
+    console_level = console_level.upper()
+    
+    # Create root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)  # Capture everything, then filter at handlers
+    
+    # Clear any existing handlers
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # Create formatters
+    file_formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s', 
+                                      datefmt='%Y-%m-%d %H:%M:%S')
+    console_formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s', 
+                                         datefmt='%Y-%m-%d %H:%M:%S')
+    
+    # Create console handler with specified level
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(getattr(logging, console_level))
+    console_handler.setFormatter(console_formatter)
+    root_logger.addHandler(console_handler)
+    
+    # Create file handler if a log file is specified
+    if log_file:
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(getattr(logging, log_level))
+        file_handler.setFormatter(file_formatter)
+        root_logger.addHandler(file_handler)
+    
+    # Silence external libraries (but still log according to console/file levels)
+    for logger_name in logging.root.manager.loggerDict:
+        if logger_name not in ['root', 'clip_whisper']:
+            logging.getLogger(logger_name).setLevel(logging.WARNING)
+    
+    logging.info(f"Logging configured with level {log_level} (file) and {console_level} (console)")
+
+
 def main():
     args = parse_args()
     
-    # Set up logging
-    numeric_level = getattr(logging, args.log_level.upper(), None)
-    if not isinstance(numeric_level, int):
-        raise ValueError(f"Invalid log level: {args.log_level}")
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=numeric_level,
+    # Set console level to log_level if not specified
+    if args.console_level is None:
+        args.console_level = args.log_level
+    
+    # Setup logging with dual levels
+    log_file = os.path.join(args.output_dir, "training.log") if args.output_dir else None
+    setup_dual_logging(args.log_level, args.console_level, log_file)
+    
+    config_path = args.config if args.config else None
+    config = load_config(config_path) if config_path else {}
+    
+    # Override config with command-line args
+    for key, value in vars(args).items():
+        if value is not None and key != 'config':
+            config[key] = value
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(config["output_dir"], exist_ok=True)
+    
+    # Set seed for reproducibility
+    torch.manual_seed(config.get("seed", 42))
+    random.seed(config.get("seed", 42))
+    
+    # Set up device
+    device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+    
+    # Log effective config
+    logging.info(f"Training with config: {config}")
+    
+    # Use mixed precision if requested
+    fp16 = config.get("fp16", False)
+    logging.info(f"FP16 training: {fp16}")
+    
+    # Load model
+    model = ClipWhisperModel(
+        llm_path=config.get("llm_path", "meta-llama/Llama-2-7b-chat-hf"),
+        whisper_model=config.get("whisper_model", "openai/whisper-medium"),
+        clip_model=config.get("clip_model", "openai/clip-vit-base-patch32"),
+        device=device,
+        use_fp16=fp16,
+        use_4bit=config.get("use_4bit", False),
+        use_lora=not config.get("no_lora", False),
+        lora_r=config.get("lora_r", 16),
+        lora_alpha=config.get("lora_alpha", 32),
+        lora_dropout=config.get("lora_dropout", 0.05),
+        freeze_encoders=config.get("freeze_encoders", True),
+        freeze_llm=config.get("freeze_llm", False),
+        modality=config.get("modality", "both"),
+        max_seq_len=config.get("max_seq_len", 256),
+        fusion_scale=config.get("fusion_scale", 0.5),
+        connector_type=config.get("connector_type", "simple"),
+    ).to(device)
+    
+    # Prepare optimizer
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=config.get("learning_rate", 5e-5),
+        weight_decay=config.get("weight_decay", 0.01)
     )
-    logger = logging.getLogger(__name__)
-    logger.info(f"Arguments: {args}")
     
-    # Setup logging
-    setup_logging()
-    
-    # Set random seed
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-    
-    # Load config
-    logging.info(f"Loading config from {args.config}")
-    with open(args.config, "r") as f:
-        config = yaml.safe_load(f)
-    
-    # Override config with command line arguments
-    if args.output_dir:
-        config["training"]["checkpoint_dir"] = args.output_dir
-    if args.data_path:
-        config["data"]["path"] = args.data_path
-    if args.llm_path:
-        config["model"]["llm_path"] = args.llm_path
-    if args.whisper_model:
-        config["model"]["whisper_model"] = args.whisper_model
-    if args.clip_model:
-        config["model"]["clip_model"] = args.clip_model
-    if args.batch_size:
-        config["data"]["batch_size"] = args.batch_size
-    if args.max_epochs:
-        config["training"]["num_epochs"] = args.max_epochs
-    if args.learning_rate:
-        config["training"]["learning_rate"] = args.learning_rate
-    if args.modality:
-        config["model"]["modality"] = args.modality
-    if args.fp16 is not None:
-        config["model"]["use_fp16"] = args.fp16
-    if args.use_4bit is not None:
-        config["model"]["use_4bit"] = args.use_4bit
-    if args.no_lora:
-        config["model"]["use_lora"] = False
-    if args.log_interval:
-        config["training"]["log_interval"] = args.log_interval
-    if args.save_every:
-        config["training"]["save_every"] = args.save_every
-    if args.save_steps:
-        config["training"]["save_steps"] = args.save_steps
-    if args.max_seq_len is not None:
-        config["model"]["max_seq_len"] = args.max_seq_len
-        logging.info(f"Overriding max_seq_len with {args.max_seq_len}")
-    
-    if args.connector_type:
-        config["model"]["connector_type"] = args.connector_type
-        logging.info(f"Using connector type: {args.connector_type}")
-    
-    # Log the effective max_seq_len
-    logging.info(f"Using max_seq_len: {config['model']['max_seq_len']}")
-    
-    # Create output directory
-    output_dir = config["training"]["checkpoint_dir"]
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Get device
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    # Log basic info
-    logging.info("STARTING CLIP-WHISPER TRAINING")
-    logging.info("=" * 80)
-    logging.info(f"Data path: {config['data']['path']}")
-    logging.info(f"Output directory: {output_dir}")
-    logging.info(f"Device: {device}")
-    logging.info(f"Selected modality: {config['model']['modality']}")
-    logging.info(f"Batch size: {config['data']['batch_size']}")
-    logging.info(f"Max epochs: {config['training']['num_epochs']}")
-    logging.info(f"FP16: {config['model'].get('use_fp16', False)}")
-    logging.info(f"4-bit quantization: {config['model'].get('use_4bit', False)}")
-    logging.info(f"LoRA: {config['model'].get('use_lora', True)}")
-    logging.info(f"Log parameter updates: {args.log_param_updates}")
-    
+    # Estimate number of training samples for scheduler - more robust approach
     try:
-        # Create dataloaders
+        # First try checking for train.tsv file directly in data_path
+        train_tsv = os.path.join(config["data_path"], "train.tsv")
+        if os.path.exists(train_tsv):
+            # Count lines in TSV file (subtract 1 for header if present)
+            with open(train_tsv, 'r') as f:
+                num_samples = sum(1 for _ in f)
+                if num_samples > 0:  # Account for possible header
+                    num_samples -= 1
+            logging.info(f"Estimated {num_samples} training samples from {train_tsv}")
+        else:
+            # Try train subdirectory path
+            train_dir = os.path.join(config["data_path"], "train")
+            train_tsv = os.path.join(train_dir, "train.tsv")
+            if os.path.exists(train_tsv):
+                with open(train_tsv, 'r') as f:
+                    num_samples = sum(1 for _ in f)
+                    if num_samples > 0:  # Account for possible header
+                        num_samples -= 1
+                logging.info(f"Estimated {num_samples} training samples from {train_tsv}")
+            else:
+                # Try data subdirectory path
+                data_dir = os.path.join(config["data_path"], "data")
+                train_tsv = os.path.join(data_dir, "train.tsv")
+                if os.path.exists(train_tsv):
+                    with open(train_tsv, 'r') as f:
+                        num_samples = sum(1 for _ in f)
+                        if num_samples > 0:  # Account for possible header
+                            num_samples -= 1
+                    logging.info(f"Estimated {num_samples} training samples from {train_tsv}")
+                else:
+                    # Use directory size or default
+                    num_samples = len(os.listdir(config["data_path"])) if os.path.isdir(config["data_path"]) else 1000
+                    logging.info(f"Could not find train.tsv file. Using estimated {num_samples} samples.")
+    except Exception as e:
+        num_samples = 1000  # Fallback to a reasonable default
+        logging.warning(f"Could not determine dataset size: {str(e)}. Using default of {num_samples} samples.")
+    
+    steps_per_epoch = num_samples // config.get("batch_size", 4)
+    total_steps = config.get("max_epochs", 10) * steps_per_epoch
+    
+    logging.info(f"Scheduler setup: {steps_per_epoch} steps per epoch, {total_steps} total steps")
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+    
+    # Add gradient clipping to stabilize training
+    max_grad_norm = config.get("max_grad_norm", 1.0)
+    logging.info(f"Using gradient clipping with max_grad_norm={max_grad_norm}")
+    
+    # Create dataloaders - with robust error handling
+    try:
+        logging.info(f"Creating dataloaders from {config['data_path']}")
         train_dataloader, val_dataloader = create_simple_dataloaders(
-            data_path=args.data_path,
-            batch_size=config["data"]["batch_size"],
-            num_workers=config["data"].get("num_workers", 2),
+            data_path=config["data_path"],
+            batch_size=config.get("batch_size", 4),
+            num_workers=config.get("num_workers", 4),
             config=config
         )
-        
-        # Log dataloader information
-        logging.info(f"Created dataloaders: train={len(train_dataloader)}, val={len(val_dataloader) if val_dataloader else 0}")
-        
-        # Create model with explicit logging of dimensions
-        logging.info("Creating ClipWhisperModel...")
-        model = ClipWhisperModel(
-            llm_path=config["model"]["llm_path"],
-            whisper_model=config["model"]["whisper_model"],
-            clip_model=config["model"]["clip_model"],
-            device=device,
-            use_fp16=config["model"].get("use_fp16", False),
-            use_4bit=config["model"].get("use_4bit", False),
-            use_lora=config["model"].get("use_lora", True),
-            lora_r=config["model"].get("lora_r", 16),
-            lora_alpha=config["model"].get("lora_alpha", 32),
-            lora_dropout=config["model"].get("lora_dropout", 0.05),
-            freeze_encoders=config["model"].get("freeze_encoders", True),
-            freeze_llm=config["model"].get("freeze_llm", False),
-            modality=config["model"]["modality"],
-            max_seq_len=config["model"].get("max_seq_len", 256),
-            fusion_scale=config["model"].get("fusion_scale", 0.5),
-        )
-        
-        # Create trainer
-        trainer = ClipWhisperTrainer(
-            model=model,
-            train_dataloader=train_dataloader,
-            val_dataloader=val_dataloader,
-            learning_rate=config["training"]["learning_rate"],
-            weight_decay=config["training"].get("weight_decay", 0.01),
-            max_epochs=config["training"]["num_epochs"],
-            output_dir=output_dir,
-            device=device,
-            fp16=config["model"].get("use_fp16", False),
-            grad_accum_steps=config["training"].get("grad_accum_steps", 4),
-            log_interval=config["training"].get("log_interval", 10),
-            save_every=config["training"].get("save_every", 1),
-            save_steps=config["training"].get("save_steps", None),
-            max_grad_norm=config["training"].get("max_grad_norm", 0.5),
-            warmup_steps=config["training"].get("warmup_steps", 0),
-            log_param_updates=args.log_param_updates,
-        )
-        
-        # Resume from checkpoint if specified
-        if args.resume_from:
-            logging.info(f"Resuming training from checkpoint: {args.resume_from}")
-            trainer.load_checkpoint(args.resume_from)
-        
-        # Train the model
-        trainer.train()
-        
-        logging.info("Training completed successfully")
-        return 0
-    
+        logging.info(f"Successfully created dataloaders")
     except Exception as e:
-        logging.error(f"Training failed: {e}")
+        logging.error(f"Error creating dataloaders: {e}")
         logging.error(traceback.format_exc())
-        return 1
+        raise RuntimeError(f"Failed to create dataloaders from {config['data_path']}: {e}")
+    
+    # Initialize trainer
+    trainer = ClipWhisperTrainer(
+        model=model,
+        train_dataloader=train_dataloader,
+        val_dataloader=val_dataloader,
+        learning_rate=config.get("learning_rate", 5e-5),
+        weight_decay=config.get("weight_decay", 0.01),
+        max_epochs=config.get("max_epochs", 10),
+        output_dir=config["output_dir"],
+        device=device,
+        fp16=fp16,
+        grad_accum_steps=config.get("grad_accumulation_steps", 1),
+        log_interval=config.get("log_every", 10),
+        save_every=config.get("save_every", 0),
+        save_steps=config.get("save_steps", None),
+        max_grad_norm=max_grad_norm,  # Pass max_grad_norm to trainer
+        warmup_steps=config.get("warmup_steps", 0),
+        log_param_updates=config.get("log_param_updates", False),
+    )
+    
+    # Start training
+    if config.get("resume_from"):
+        logging.info(f"Resuming training from {config['resume_from']}")
+    trainer.train()
+    
+    logging.info("Training completed successfully")
+    return 0
 
 
 if __name__ == "__main__":

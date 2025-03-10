@@ -146,6 +146,7 @@ class ClipWhisperModel(nn.Module):
         self.fusion_scale = fusion_scale
         self.connector_type = connector_type
         self._provided_tokenizer = _provided_tokenizer  # Store the provided tokenizer
+        self.log_param_updates = False  # Initialize this to ensure it's always defined
         
         # Set modality with clear logging
         modality_banner = "=" * 80
@@ -169,23 +170,54 @@ class ClipWhisperModel(nn.Module):
         # Log initial GPU memory
         self._log_memory_usage("Initial")
         
-        # Initialize all sub-models
+        # Track base memory usage before loading any models
+        base_memory = self._get_gpu_memory_usage()["allocated"]
+        
+        # Always load the LLM regardless of modality
         self.llm, self.tokenizer = self._track_component_memory("LLM",
                     lambda: self._load_llm(llm_path, use_lora, lora_r, lora_alpha, lora_dropout, freeze_llm, use_4bit))
         
-        # Only load Whisper if not already provided as an object
-        if isinstance(whisper_model, str) or whisper_model is None:
+        # Get LLM memory footprint
+        llm_memory = self._get_gpu_memory_usage()["allocated"] - base_memory
+        logging.info(f"LLM memory usage: {llm_memory:.2f} MB")
+        
+        # Load Whisper if needed for audio
+        if self.modality in ["audio", "both"]:
+            whisper_base_memory = self._get_gpu_memory_usage()["allocated"]
             self.whisper, self.whisper_processor = self._track_component_memory("Whisper",
                             lambda: self._load_whisper_model(whisper_model, freeze_encoders))
+            whisper_memory = self._get_gpu_memory_usage()["allocated"] - whisper_base_memory
+            logging.info(f"Whisper model memory usage: {whisper_memory:.2f} MB")
+            
+            self.audio_dim = self.whisper.config.d_model  # Whisper dimension
+            logging.info(f"Loaded Whisper model for {self.modality} modality")
+        else:
+            # Create placeholders for audio components when not used
+            self.whisper = None
+            self.whisper_processor = None
+            # Use a default dimension that matches Whisper for compatibility
+            self.audio_dim = 1024  # Standard Whisper dimension
+            logging.info(f"Whisper model not loaded (not needed for {self.modality} modality)")
         
-        # Only load CLIP if not already provided as an object
-        if isinstance(clip_model, str) or clip_model is None:
+        # Load CLIP if needed for video
+        if self.modality in ["video", "both"]:
+            clip_base_memory = self._get_gpu_memory_usage()["allocated"]
             self.clip, self.clip_processor = self._track_component_memory("CLIP",
-                         lambda: self._load_clip_model(clip_model, freeze_encoders))
+                        lambda: self._load_clip_model(clip_model, freeze_encoders))
+            clip_memory = self._get_gpu_memory_usage()["allocated"] - clip_base_memory
+            logging.info(f"CLIP model memory usage: {clip_memory:.2f} MB")
+            
+            self.video_dim = self.clip.config.hidden_size  # CLIP dimension
+            logging.info(f"Loaded CLIP model for {self.modality} modality")
+        else:
+            # Create placeholders for video components when not used
+            self.clip = None
+            self.clip_processor = None
+            # Use a default dimension that matches CLIP for compatibility
+            self.video_dim = 768  # Standard CLIP dimension
+            logging.info(f"CLIP model not loaded (not needed for {self.modality} modality)")
         
-        # Get dimensions of encoders and LLM
-        self.audio_dim = self.whisper.config.d_model  # Whisper dimension
-        self.video_dim = self.clip.config.hidden_size  # CLIP dimension
+        # Get LLM dimension
         self.llm_dim = self._get_llm_dim()
         
         # Create projections for encoder outputs
@@ -338,22 +370,21 @@ class ClipWhisperModel(nn.Module):
             if video is not None:
                 logging.debug(f"Video input shape: {video.shape}")
             
-            # Encode audio and/or video
-            audio_features = None
-            video_features = None
+            # Encode inputs based on modality
+            audio_features, video_features = None, None
             
             # Track memory before encoding
             encoder_memory_start = self._get_gpu_memory_usage()
             
             # Audio encoding
-            if (self.modality == "audio" or self.modality == "both") and audio is not None:
+            if self.modality in ["audio", "both"] and audio is not None:
                 audio_features = self.encode_audio(audio)
                 # Log initial audio features size before any truncation in fusion
                 if batch_idx % 25 == 0:
                     logging.info(f"[Batch {batch_idx}] Pre-fusion audio features shape: {audio_features.shape}")
             
             # Video encoding
-            if (self.modality == "video" or self.modality == "both") and video is not None:
+            if self.modality in ["video", "both"] and video is not None:
                 video_features = self.encode_video(video)
                 # Log initial video features size before any truncation in fusion
                 if batch_idx % 25 == 0:
@@ -382,7 +413,7 @@ class ClipWhisperModel(nn.Module):
                     # Use the multimodal connector for fusion
                     if batch_idx % 10 == 0:
                         logging.info(f"[Batch {batch_idx}] FUSION: Using {self.connector_type} connector")
-                        
+                
                     # Create attention masks if needed
                     audio_mask = None
                     video_mask = None
@@ -413,58 +444,15 @@ class ClipWhisperModel(nn.Module):
                         )
                     )
                     
-                    # Log the selected fusion length
-                    if batch_idx % 10 == 0:
-                        if max_len < self.max_seq_len:
-                            logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Using natural max length {max_len} (< max_seq_len {self.max_seq_len})")
-                        else:
-                            logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Truncating to max_seq_len {max_len}")
-                    
-                    # Log if we're truncating during fusion
-                    if audio_features is not None and audio_features.size(1) > max_len:
-                        # Get the current batch index if available for logging
-                        batch_idx = getattr(self, '_current_batch_idx', 0)
-                        # Log less frequently to reduce clutter (only every 25 batches)
-                        if batch_idx % 10 == 0:
-                            pct_kept = (max_len / audio_features.size(1)) * 100
-                            logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Audio truncated from {audio_features.size(1)} → {max_len} ({pct_kept:.1f}% kept)")
-                    
-                    if video_features is not None and video_features.size(1) > max_len:
-                        # Get the current batch index if available for logging
-                        batch_idx = getattr(self, '_current_batch_idx', 0)
-                        # Log less frequently to reduce clutter (only every 25 batches)
-                        if batch_idx % 10 == 0:
-                            pct_kept = (max_len / video_features.size(1)) * 100
-                            logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Video truncated from {video_features.size(1)} → {max_len} ({pct_kept:.1f}% kept)")
-                    
                     # Pad or truncate to match
                     audio_features = self._pad_or_truncate(audio_features, max_len)
                     video_features = self._pad_or_truncate(video_features, max_len)
-                    
-                    # Double-check that fusion result respects max_seq_len
-                    if audio_features.size(1) != max_len or video_features.size(1) != max_len:
-                        logging.warning(f"Unexpected feature length after padding/truncation - Audio: {audio_features.size(1)}, Video: {video_features.size(1)}, Expected: {max_len}")
-                        audio_features = self._pad_or_truncate(audio_features, max_len)
-                        video_features = self._pad_or_truncate(video_features, max_len)
                     
                     # Weighted sum of features
                     encoder_out = (
                         self.fusion_scale * audio_features +
                         (1 - self.fusion_scale) * video_features
                     )
-                    
-                    # Log fusion result
-                    if batch_idx % 10 == 0:
-                        logging.info(f"[Batch {batch_idx}] FUSION SEQ MONITOR: Final fused features shape = {encoder_out.shape}")
-                    
-                    # Double-check that fusion result respects max_seq_len
-                    if encoder_out.size(1) != max_len:
-                        logging.warning(f"Unexpected encoder output length after fusion: {encoder_out.size(1)} (expected {max_len})")
-                        encoder_out = self._pad_or_truncate(encoder_out, max_len)
-            
-            # Log final encoder output size before any LLM processing
-            if batch_idx % 10 == 0:
-                logging.info(f"[Batch {batch_idx}] FINAL SEQ MONITOR: Encoder output before LLM = {encoder_out.shape}")
             
             # Track sequence length stats across all batches - only use the length value after all adjustments
             self._track_sequence_length(encoder_out.size(1))
@@ -483,25 +471,73 @@ class ClipWhisperModel(nn.Module):
             
             # Handle prompt if provided
             if prompt is not None:
-                logging.info(f"Processing prompt with shape: {prompt.shape}")
+                logging.debug(f"Processing prompt with shape: {prompt.shape}")
+                
+                # Get embeddings from the model
                 embedding_layer = self.llm.get_input_embeddings()
-                prompt_embeds = embedding_layer(prompt.to(self.device))
-                logging.info(f"Prompt embeddings shape: {prompt_embeds.shape}, Encoder output shape: {encoder_out.shape}")
+                prompt_embeds = embedding_layer(prompt)
                 
-                # Ensure batch dimension matches
-                if prompt_embeds.size(0) != encoder_out.size(0):
-                    logging.warning(f"Batch size mismatch: prompt_embeds={prompt_embeds.size(0)}, encoder_out={encoder_out.size(0)}")
-                    # Expand prompt if needed
-                    if prompt_embeds.size(0) == 1 and encoder_out.size(0) > 1:
-                        prompt_embeds = prompt_embeds.expand(encoder_out.size(0), -1, -1)
+                logging.debug(f"Prompt embeddings shape: {prompt_embeds.shape}, Encoder output shape: {encoder_out.shape}")
                 
-                # Concatenate along sequence dimension (dim=1)
+                # Concat prompt embeddings with encoder output
                 encoder_out = torch.cat([prompt_embeds, encoder_out], dim=1)
-                logging.info(f"Combined output shape after adding prompt: {encoder_out.shape}")
                 
-                # Update attention mask to cover prompt tokens as well
+                logging.debug(f"Combined output shape after adding prompt: {encoder_out.shape}")
+                
+                # Update attention mask to cover prompt as well
                 attention_mask = torch.ones((batch_size, encoder_out.size(1)), dtype=torch.long, device=self.device)
-                logging.info(f"Updated attention mask shape: {attention_mask.shape}")
+                logging.debug(f"Updated attention mask shape: {attention_mask.shape}")
+                
+                # Fix label sequence length mismatch by intelligently resizing
+                if labels is not None and return_loss:
+                    if labels.size(1) != encoder_out.size(1):
+                        # Log the mismatch at reasonable frequency
+                        if batch_idx % 25 == 0:
+                            logging.info(f"[Batch {batch_idx}] Label sequence length ({labels.size(1)}) doesn't match encoder output ({encoder_out.size(1)})")
+                        
+                        # Approach: Instead of padding the labels to the full encoder_out length,
+                        # we'll trim the encoder_out to a more reasonable length that can still capture
+                        # the content but not waste computation on unnecessary padding
+                        
+                        # Determine the target sequence length - set a reasonable maximum length
+                        # based on the label length but not exceeding the full encoder output length
+                        max_reasonable_length = min(
+                            encoder_out.size(1),  # Don't exceed actual length
+                            max(
+                                256,  # Minimal reasonable length
+                                int(labels.size(1) * 1.2)  # 20% extra space beyond label length
+                            )
+                        )
+                        
+                        # If encoder output is too long, trim it
+                        if encoder_out.size(1) > max_reasonable_length:
+                            if batch_idx % 25 == 0:
+                                logging.debug(f"Trimming encoder output from {encoder_out.size(1)} to {max_reasonable_length}")
+                            encoder_out = encoder_out[:, :max_reasonable_length, :]
+                            attention_mask = attention_mask[:, :max_reasonable_length]
+                        
+                        # Now adjust the labels
+                        if labels.size(1) < encoder_out.size(1):
+                            # Pad the labels to match encoder_out
+                            if batch_idx % 25 == 0:
+                                logging.debug(f"Resized labels to match encoder output: {encoder_out.size()}")
+                            
+                            # Create a new tensor with -100 padding (ignore index for loss)
+                            new_labels = torch.full(
+                                (labels.size(0), encoder_out.size(1)), 
+                                -100,  # -100 is typically the ignore index for CrossEntropyLoss
+                                device=labels.device, 
+                                dtype=labels.dtype
+                            )
+                            
+                            # Copy the original labels
+                            new_labels[:, :labels.size(1)] = labels
+                            labels = new_labels
+                        elif labels.size(1) > encoder_out.size(1):
+                            # Trim the labels to match encoder_out
+                            if batch_idx % 25 == 0:
+                                logging.debug(f"Truncating labels from {labels.size(1)} to {encoder_out.size(1)}")
+                            labels = labels[:, :encoder_out.size(1)]
             else:
                 # During training, we should ALWAYS have a prompt for consistent behavior
                 # If no prompt is provided, add a default transcription prompt
@@ -519,9 +555,9 @@ class ClipWhisperModel(nn.Module):
                         default_prompt_ids = self.tokenizer(
                             default_prompt,
                             return_tensors="pt",
-                            padding="max_length",
+                            padding=True,
                             truncation=True,
-                            max_length=32,
+                            max_length=self.max_seq_len
                         ).input_ids.to(self.device)
                         
                         # Get embeddings
@@ -545,47 +581,16 @@ class ClipWhisperModel(nn.Module):
                 logging.info(f"No prompt provided, using encoder output directly with shape: {encoder_out.shape}")
                 logging.info(f"Attention mask shape: {attention_mask.shape}")
                 
-            # Prepare labels for loss computation if needed
+            # Run LLM on encoder output with appropriate attention mask
             if return_loss and labels is not None:
-                # Adjust labels to match sequence length
-                if labels.size(1) != encoder_out.size(1):
-                    # Get the current global step from kwargs for logging
-                    batch_idx = kwargs.get('batch_idx', 0)
-                    
-                    # Log occasionally (every 25 batches) to reduce clutter but maintain visibility
-                    if batch_idx % 25 == 0:
-                        logging.info(f"[Batch {batch_idx}] Label sequence length ({labels.size(1)}) doesn't match encoder output ({encoder_out.size(1)})")
-                    else:
-                        logging.debug(f"Label sequence length ({labels.size(1)}) doesn't match encoder output ({encoder_out.size(1)})")
-                    
-                    # Must resize labels to match encoder output exactly
-                    if labels.size(1) < encoder_out.size(1):
-                        # Pad labels with -100 (ignored in loss calculation)
-                        padding = torch.full(
-                            (batch_size, encoder_out.size(1) - labels.size(1)), 
-                            -100,  # Padding token ID that is ignored in loss calculation
-                            dtype=labels.dtype, 
-                            device=labels.device
-                        )
-                        labels = torch.cat([labels, padding], dim=1)
-                    else:
-                        # Truncate labels to match encoder output length
-                        labels = labels[:, :encoder_out.size(1)]
-                    
-                    # Log resizing at debug level
-                    logging.debug(f"Resized labels to match encoder output: {labels.shape}")
-                
-                # Check if batch sizes match
-                if labels.size(0) != encoder_out.size(0):
-                    raise ValueError(f"Label batch size ({labels.size(0)}) doesn't match encoder output ({encoder_out.size(0)})")
-                
-                # Forward pass with labels for loss computation
+                # For training, we need to compute loss
                 outputs = self.llm(
                     inputs_embeds=encoder_out,
                     attention_mask=attention_mask,
                     labels=labels,
                     return_dict=True
                 )
+                
             else:
                 # Forward pass without loss computation
                 outputs = self.llm(
@@ -742,11 +747,18 @@ class ClipWhisperModel(nn.Module):
     def _load_whisper_model(self, whisper_model, freeze_encoders):
         """Load the Whisper model for audio encoding"""
         logging.info(f"Loading Whisper model: {whisper_model}")
+        compute_dtype = torch.float16 if self.use_fp16 else torch.float32
+        
         try:
             processor = WhisperProcessor.from_pretrained(whisper_model)
-            model = WhisperModel.from_pretrained(whisper_model)
+            model = WhisperModel.from_pretrained(whisper_model, torch_dtype=compute_dtype)
+            
             if freeze_encoders:
                 self._freeze_model(model)
+            
+            # Log the model's dtype
+            logging.info(f"Whisper model dtype: {next(model.parameters()).dtype}")
+            
             return model, processor
         except Exception as e:
             logging.error(f"Error loading Whisper model: {e}")
@@ -755,11 +767,18 @@ class ClipWhisperModel(nn.Module):
     def _load_clip_model(self, clip_model, freeze_encoders):
         """Load the CLIP model for visual encoding"""
         logging.info(f"Loading CLIP model: {clip_model}")
+        compute_dtype = torch.float16 if self.use_fp16 else torch.float32
+        
         try:
             processor = CLIPProcessor.from_pretrained(clip_model)
-            model = CLIPVisionModel.from_pretrained(clip_model)
+            model = CLIPVisionModel.from_pretrained(clip_model, torch_dtype=compute_dtype)
+            
             if freeze_encoders:
                 self._freeze_model(model)
+            
+            # Log the model's dtype
+            logging.info(f"CLIP model dtype: {next(model.parameters()).dtype}")
+            
             return model, processor
         except Exception as e:
             logging.error(f"Error loading CLIP model: {e}")
@@ -774,13 +793,17 @@ class ClipWhisperModel(nn.Module):
         """Load the language model"""
         logging.info(f"Loading LLM from {llm_path}")
         
+        # Set consistent compute dtype for all components
+        compute_dtype = torch.float16 if self.use_fp16 else torch.float32
+        logging.info(f"Using compute_dtype: {compute_dtype} for all components")
+        
         # Configure 4-bit quantization if requested
         if use_4bit:
             try:
                 logging.info("Using 4-bit quantization for LLM")
                 quantization_config = BitsAndBytesConfig(
                     load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch.float16 if self.use_fp16 else torch.float32,
+                    bnb_4bit_compute_dtype=compute_dtype,
                     bnb_4bit_use_double_quant=True,
                     bnb_4bit_quant_type="nf4"
                 )
@@ -789,19 +812,20 @@ class ClipWhisperModel(nn.Module):
                     llm_path,
                     device_map={"": 0},  # Use explicit device mapping instead of "auto"
                     quantization_config=quantization_config,
+                    torch_dtype=compute_dtype,  # Set consistent dtype
                 )
                 
                 logging.info("Successfully loaded LLM with 4-bit quantization")
             except ImportError:
                 logging.warning("BitsAndBytes not available for 4-bit quantization, falling back to standard loading")
-                llm = AutoModelForCausalLM.from_pretrained(llm_path, device_map={"": 0})
+                llm = AutoModelForCausalLM.from_pretrained(llm_path, device_map={"": 0}, torch_dtype=compute_dtype)
             except Exception as e:
                 logging.error(f"Error loading LLM with 4-bit quantization: {e}")
                 logging.warning("Falling back to standard loading")
-                llm = AutoModelForCausalLM.from_pretrained(llm_path, device_map={"": 0})
+                llm = AutoModelForCausalLM.from_pretrained(llm_path, device_map={"": 0}, torch_dtype=compute_dtype)
         else:
             # Standard loading without quantization
-            llm = AutoModelForCausalLM.from_pretrained(llm_path, device_map={"": 0})
+            llm = AutoModelForCausalLM.from_pretrained(llm_path, device_map={"": 0}, torch_dtype=compute_dtype)
         
         # Use provided tokenizer if available, otherwise load from llm_path
         if self._provided_tokenizer is not None:
@@ -821,6 +845,13 @@ class ClipWhisperModel(nn.Module):
                 else:
                     raise
         
+        # Ensure tokenizer has a pad token
+        if tokenizer.pad_token is None:
+            logging.info("Tokenizer does not have a pad token. Setting pad_token = eos_token.")
+            tokenizer.pad_token = tokenizer.eos_token
+            # Add the pad token to the vocabulary
+            tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
+        
         # Apply LoRA if requested
         if use_lora:
             logging.info(f"Applying LoRA with r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}")
@@ -832,7 +863,7 @@ class ClipWhisperModel(nn.Module):
                 # Default target modules for other model types
                 target_modules = ["query", "key", "value", "dense"]
                 
-            # Create LoRA config
+            # Create LoRA config with stable initialization settings
             peft_config = LoraConfig(
                 r=lora_r,
                 lora_alpha=lora_alpha,
@@ -840,12 +871,28 @@ class ClipWhisperModel(nn.Module):
                 bias="none",
                 task_type="CAUSAL_LM",
                 target_modules=target_modules,
+                init_lora_weights="gaussian",  # Use gaussian initialization for better stability
+                fan_in_fan_out=False,  # Better for most models
             )
             
             # Apply LoRA to model
             try:
                 llm = get_peft_model(llm, peft_config)
                 logging.info("LoRA applied successfully")
+                
+                # Scale down the initial LoRA weights to prevent gradient explosions
+                with torch.no_grad():
+                    scaling_factor = 0.01  # Helps prevent initial gradient explosions
+                    param_count = 0
+                    
+                    for name, param in llm.named_parameters():
+                        if 'lora_' in name and param.requires_grad:
+                            # Apply a small scaling factor to LoRA weights
+                            param.data = param.data * scaling_factor
+                            param_count += 1
+                    
+                    logging.info(f"Scaled down initial values for {param_count} LoRA parameters by factor {scaling_factor}")
+                
             except Exception as e:
                 logging.error(f"Error applying LoRA: {e}")
                 logging.warning("Continuing without LoRA")
@@ -867,72 +914,60 @@ class ClipWhisperModel(nn.Module):
 
     def _log_parameter_count(self):
         """Log the number of parameters in each component"""
+        # Count total parameters
+        total_params = sum(p.numel() for p in self.parameters())
+        
         # Count parameters by component
-        whisper_params = sum(p.numel() for p in self.whisper.parameters())
-        clip_params = sum(p.numel() for p in self.clip.parameters())
         llm_params = sum(p.numel() for p in self.llm.parameters())
-        audio_connector_params = sum(p.numel() for p in self.audio_connector.parameters())
-        video_connector_params = sum(p.numel() for p in self.video_connector.parameters())
+        whisper_params = sum(p.numel() for p in self.whisper.parameters()) if self.whisper is not None else 0
+        clip_params = sum(p.numel() for p in self.clip.parameters()) if self.clip is not None else 0
         
-        # Count trainable parameters by component
-        whisper_trainable = sum(p.numel() for p in self.whisper.parameters() if p.requires_grad)
-        clip_trainable = sum(p.numel() for p in self.clip.parameters() if p.requires_grad)
-        llm_trainable = sum(p.numel() for p in self.llm.parameters() if p.requires_grad)
-        audio_connector_trainable = sum(p.numel() for p in self.audio_connector.parameters() if p.requires_grad)
-        video_connector_trainable = sum(p.numel() for p in self.video_connector.parameters() if p.requires_grad)
+        # Count connector parameters
+        connector_params = 0
+        if hasattr(self, 'audio_connector') and self.audio_connector is not None:
+            connector_params += sum(p.numel() for p in self.audio_connector.parameters())
+        if hasattr(self, 'video_connector') and self.video_connector is not None:
+            connector_params += sum(p.numel() for p in self.video_connector.parameters())
         
-        # Handle advanced connectors if present
-        multimodal_connector_params = 0
-        multimodal_connector_trainable = 0
-        if hasattr(self, 'multimodal_connector'):
-            multimodal_connector_params = sum(p.numel() for p in self.multimodal_connector.parameters())
-            multimodal_connector_trainable = sum(p.numel() for p in self.multimodal_connector.parameters() if p.requires_grad)
+        # Count trainable parameters
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         
-        # Total counts
-        total_params = whisper_params + clip_params + llm_params + \
-                       audio_connector_params + video_connector_params + \
-                       multimodal_connector_params
-                        
-        total_trainable = whisper_trainable + clip_trainable + llm_trainable + \
-                          audio_connector_trainable + video_connector_trainable + \
-                          multimodal_connector_trainable
-        
-        # Log the counts in a nice table format
+        # Log parameter counts
+        logging.info("\n" + "=" * 80)
+        logging.info("MODEL PARAMETER COUNTS")
         logging.info("=" * 80)
-        logging.info("Parameter counts by component:")
+        logging.info(f"{'Component':<20} {'Parameters':<15} {'% of Total':<15}")
         logging.info("-" * 80)
-        logging.info(f"{'Component':<20} {'Total':<15} {'Trainable':<15} {'% Trainable':<10}")
-        logging.info("-" * 80)
-        logging.info(f"{'Whisper':<20} {whisper_params:,d} {whisper_trainable:,d} {100*whisper_trainable/max(1, whisper_params):.2f}%")
-        logging.info(f"{'CLIP':<20} {clip_params:,d} {clip_trainable:,d} {100*clip_trainable/max(1, clip_params):.2f}%")
-        logging.info(f"{'LLM':<20} {llm_params:,d} {llm_trainable:,d} {100*llm_trainable/max(1, llm_params):.2f}%")
-        logging.info(f"{'Audio Connector':<20} {audio_connector_params:,d} {audio_connector_trainable:,d} {100*audio_connector_trainable/max(1, audio_connector_params):.2f}%")
-        logging.info(f"{'Video Connector':<20} {video_connector_params:,d} {video_connector_trainable:,d} {100*video_connector_trainable/max(1, video_connector_params):.2f}%")
         
-        # Add advanced connector to the table if present
-        if hasattr(self, 'multimodal_connector'):
-            connector_name = self.connector_type.replace('_', ' ').title()
-            logging.info(f"{connector_name+' Connector':<20} {multimodal_connector_params:,d} {multimodal_connector_trainable:,d} {100*multimodal_connector_trainable/max(1, multimodal_connector_params):.2f}%")
-            
-        logging.info("-" * 80)
-        logging.info(f"{'TOTAL':<20} {total_params:,d} {total_trainable:,d} {100*total_trainable/max(1, total_params):.2f}%")
-        logging.info("=" * 80)
+        # Format numbers with commas for readability
+        def fmt_count(count):
+            return f"{count:,}"
         
-        # Log active components based on modality
-        logging.info(f"Active components for modality '{self.modality}':")
-        if self.modality in ["audio", "both"]:
-            logging.info(f"- Whisper: {whisper_params:,d} parameters {'(frozen)' if not whisper_trainable else ''}")
-            logging.info(f"- Audio Connector: {audio_connector_params:,d} parameters {'(frozen)' if not audio_connector_trainable else ''}")
-        if self.modality in ["video", "both"]:
-            logging.info(f"- CLIP: {clip_params:,d} parameters {'(frozen)' if not clip_trainable else ''}")
-            logging.info(f"- Video Connector: {video_connector_params:,d} parameters {'(frozen)' if not video_connector_trainable else ''}")
-        logging.info(f"- LLM: {llm_params:,d} parameters {'(frozen)' if not llm_trainable else ''}")
+        logging.info(f"{'LLM':<20} {fmt_count(llm_params):<15} {llm_params/total_params*100:.2f}%")
+        
+        if self.whisper is not None:
+            logging.info(f"{'Whisper':<20} {fmt_count(whisper_params):<15} {whisper_params/total_params*100:.2f}%")
+        
+        if self.clip is not None:
+            logging.info(f"{'CLIP':<20} {fmt_count(clip_params):<15} {clip_params/total_params*100:.2f}%")
+        
+        logging.info(f"{'Connectors':<20} {fmt_count(connector_params):<15} {connector_params/total_params*100:.2f}%")
+        logging.info(f"{'TOTAL':<20} {fmt_count(total_params):<15} 100.00%")
+        logging.info("-" * 80)
+        logging.info(f"{'Trainable':<20} {fmt_count(trainable_params):<15} {trainable_params/total_params*100:.2f}%")
+        logging.info(f"{'Frozen':<20} {fmt_count(total_params-trainable_params):<15} {(total_params-trainable_params)/total_params*100:.2f}%")
+        logging.info("=" * 80 + "\n")
     
     def encode_audio(self, audio, attention_mask=None):
-        """Encode audio using Whisper"""
-        if self.modality == "video":
-            logging.warning("Trying to encode audio in video-only mode, returning dummy tensor")
-            return torch.zeros((audio.size(0), 1, self.llm_dim), device=self.device, dtype=self.dtype)
+        """Encode audio input using Whisper"""
+        if self.whisper is None:
+            # For compatibility, return a dummy tensor with the right shape
+            logging.warning("Audio encoding attempted but Whisper model not loaded - returning dummy tensor")
+            return torch.zeros((audio.size(0), 1, self.audio_dim), device=self.device, dtype=self.dtype)
+        
+        # Log input shape and device for debugging
+        if self.log_param_updates:
+            logging.info(f"Audio input - shape: {audio.shape}, device: {audio.device}, dtype: {audio.dtype}")
         
         with torch.set_grad_enabled(not self.freeze_encoders):
             # Check if we're using FP16 and ensure consistent types
@@ -1020,10 +1055,15 @@ class ClipWhisperModel(nn.Module):
             return features
     
     def encode_video(self, video, attention_mask=None):
-        """Encode video using CLIP"""
-        if self.modality == "audio":
-            logging.warning("Trying to encode video in audio-only mode, returning dummy tensor")
-            return torch.zeros((video.size(0), 1, self.llm_dim), device=self.device, dtype=self.dtype)
+        """Encode video input using CLIP"""
+        if self.clip is None:
+            # For compatibility, return a dummy tensor with the right shape
+            logging.warning("Video encoding attempted but CLIP model not loaded - returning dummy tensor")
+            return torch.zeros((video.size(0), 1, self.video_dim), device=self.device, dtype=self.dtype)
+        
+        # Log input shape and device for debugging
+        if self.log_param_updates:
+            logging.info(f"Video input - shape: {video.shape}, device: {video.device}, dtype: {video.dtype}")
         
         # Process all frames together
         batch_size, seq_len = video.size(0), video.size(1)
@@ -1078,136 +1118,85 @@ class ClipWhisperModel(nn.Module):
             return 4096 
 
     def _setup_projections(self):
-        """Create projections from encoder outputs to LLM input dimension"""
-        # Import here to avoid circular imports
+        """Set up projections from encoder outputs to LLM input space"""
         from .modality_connector import create_modality_connector
         
-        # Import advanced connectors only for the specific connector types
-        if self.connector_type in ["cross_modal", "qformer", "perceiver"]:
-            from .advanced_connectors import (
-                CrossModalConnector, 
-                QformerConnector,
-                MultimodalPerceiverConnector
-            )
-            
-            # For advanced connectors that process audio and video together
-            if self.connector_type == "cross_modal":
-                logging.info(f"Using CrossModalConnector for multimodal fusion")
-                self.multimodal_connector = CrossModalConnector(
-                    audio_dim=self.audio_dim,
-                    video_dim=self.video_dim,
-                    output_dim=self.llm_dim,
-                    device=self.device,
-                    dtype=self.dtype,
-                    num_heads=8,
-                    dropout=0.1,
-                    num_layers=2
-                )
-            elif self.connector_type == "qformer":
-                logging.info(f"Using QformerConnector for multimodal fusion")
-                self.multimodal_connector = QformerConnector(
-                    audio_dim=self.audio_dim,
-                    video_dim=self.video_dim,
-                    output_dim=self.llm_dim,
-                    device=self.device,
-                    dtype=self.dtype,
-                    num_queries=32,
-                    num_heads=8,
-                    num_layers=3,
-                    dropout=0.1
-                )
-            elif self.connector_type == "perceiver":
-                logging.info(f"Using MultimodalPerceiverConnector for multimodal fusion")
-                self.multimodal_connector = MultimodalPerceiverConnector(
-                    audio_dim=self.audio_dim,
-                    video_dim=self.video_dim,
-                    output_dim=self.llm_dim,
-                    device=self.device, 
-                    dtype=self.dtype,
-                    num_latents=64,
-                    num_heads=8,
-                    num_layers=3,
-                    dropout=0.1
-                )
-                
-            # We still create individual connectors for when modality is audio-only or video-only
-            self.audio_connector = create_modality_connector(
-                connector_type="simple",  # Use simple connector for single-modality
-                input_dim=self.audio_dim,
-                output_dim=self.llm_dim,
-                device=self.device,
-                dtype=self.dtype,
-                max_seq_len=self.max_seq_len
-            )
-            
-            self.video_connector = create_modality_connector(
-                connector_type="simple",  # Use simple connector for single-modality
-                input_dim=self.video_dim,
-                output_dim=self.llm_dim,
-                device=self.device,
-                dtype=self.dtype,
-                max_seq_len=self.max_seq_len
-            )
-        else:
-            # Standard connectors (simple, deep, conv, attention, adaptive)
-            # Audio projection (Whisper -> LLM)
-            self.audio_connector = create_modality_connector(
-                connector_type=self.connector_type,
-                input_dim=self.audio_dim,
-                output_dim=self.llm_dim,
-                device=self.device,
-                dtype=self.dtype,
-                max_seq_len=self.max_seq_len
-            )
-            logging.info(f"Created audio projection ({self.connector_type}): {self.audio_dim} -> {self.llm_dim}")
-            
-            # Video projection (CLIP -> LLM)
-            self.video_connector = create_modality_connector(
-                connector_type=self.connector_type,
-                input_dim=self.video_dim,
-                output_dim=self.llm_dim,
-                device=self.device,
-                dtype=self.dtype,
-                max_seq_len=self.max_seq_len
-            )
-            logging.info(f"Created video projection ({self.connector_type}): {self.video_dim} -> {self.llm_dim}")
+        logging.info(f"Setting up projections for modality: {self.modality}")
         
+        # Get connector type
+        connector_type = self.connector_type
+        logging.info(f"Using connector type: {connector_type}")
+        
+        # Create standard connectors (always create both for compatibility)
+        # Audio projection (Whisper -> LLM)
+        self.audio_connector = create_modality_connector(
+            connector_type=self.connector_type,
+            input_dim=self.audio_dim,
+            output_dim=self.llm_dim,
+            device=self.device,
+            dtype=self.dtype,
+            max_seq_len=self.max_seq_len
+        )
+        logging.info(f"Created audio projection ({self.connector_type}): {self.audio_dim} -> {self.llm_dim}")
+        
+        # Video projection (CLIP -> LLM)
+        self.video_connector = create_modality_connector(
+            connector_type=self.connector_type,
+            input_dim=self.video_dim,
+            output_dim=self.llm_dim,
+            device=self.device,
+            dtype=self.dtype,
+            max_seq_len=self.max_seq_len
+        )
+        logging.info(f"Created video projection ({self.connector_type}): {self.video_dim} -> {self.llm_dim}")
+
     def _log_model_architecture(self):
-        """Log model architecture details"""
-        # Print detailed dimension table for all components
-        dim_banner = "-" * 80
-        logging.info(f"\n{dim_banner}")
+        """Log the model architecture in a tabular format"""
+        logging.info("\n" + "=" * 80)
+        logging.info("CLIP-WHISPER MODEL ARCHITECTURE")
+        logging.info("=" * 80)
+        
+        # Header
         logging.info(f"{'COMPONENT':<30} {'INPUT DIM':<15} {'OUTPUT DIM':<15} {'ACTIVE IN MODALITY':<20}")
-        logging.info(f"{dim_banner}")
+        logging.info("-" * 80)
         
-        # Audio components
-        logging.info(f"{'Audio Encoder (Whisper)':<30} {'-':<15} {self.audio_dim:<15} {'audio, both':<20}")
-        logging.info(f"{'Audio Connector':<30} {self.audio_dim:<15} {self.llm_dim:<15} {'audio, both':<20}")
-        
-        # Video components
-        logging.info(f"{'Video Encoder (CLIP)':<30} {'-':<15} {self.video_dim:<15} {'video, both':<20}")
-        logging.info(f"{'Video Connector':<30} {self.video_dim:<15} {self.llm_dim:<15} {'video, both':<20}")
-        
-        # Advanced connector if present
-        if hasattr(self, 'multimodal_connector'):
-            connector_name = self.connector_type.replace('_', ' ').title()
-            logging.info(f"{connector_name+' Connector':<30} {self.audio_dim+','+str(self.video_dim):<15} {self.llm_dim:<15} {'both':<20}")
+        # Get string representations for dimensions (handling None values)
+        whisper_dim_str = str(self.audio_dim) if self.audio_dim is not None else "N/A"
+        clip_dim_str = str(self.video_dim) if self.video_dim is not None else "N/A"
+        llm_dim_str = str(self.llm_dim) if self.llm_dim is not None else "N/A"
         
         # LLM
-        logging.info(f"{'LLM':<30} {self.llm_dim:<15} {'-':<15} {'all':<20}")
-        logging.info(f"{dim_banner}\n")
+        logging.info(f"{'LLM':<30} {'-':<15} {llm_dim_str:<15} {'all':<20}")
         
+        # Encoders
+        if self.modality in ["audio", "both"]:
+            logging.info(f"{'Audio Encoder (Whisper)':<30} {'-':<15} {whisper_dim_str:<15} {'audio, both':<20}")
+        
+        if self.modality in ["video", "both"]:
+            logging.info(f"{'Video Encoder (CLIP)':<30} {'-':<15} {clip_dim_str:<15} {'video, both':<20}")
+        
+        # Connectors
+        if self.modality in ["audio", "both"] and hasattr(self, 'audio_connector') and self.audio_connector is not None:
+            logging.info(f"{'Audio Connector':<30} {whisper_dim_str:<15} {llm_dim_str:<15} {'audio, both':<20}")
+        
+        if self.modality in ["video", "both"] and hasattr(self, 'video_connector') and self.video_connector is not None:
+            logging.info(f"{'Video Connector':<30} {clip_dim_str:<15} {llm_dim_str:<15} {'video, both':<20}")
+        
+        logging.info("=" * 80)
+        
+        # Display active components summary
         logging.info("\nACTIVE COMPONENTS FOR MODALITY: {}".format(self.modality.upper()))
         if self.modality in ['audio', 'both']:
             logging.info("- Using WHISPER for audio encoding")
         if self.modality in ['video', 'both']:
             logging.info("- Using CLIP for video encoding")
         if self.modality == 'both':
-            if hasattr(self, 'multimodal_connector'):
-                logging.info(f"- Using {self.connector_type.upper()} connector for advanced multimodal fusion")
-            else:
-                logging.info("- Using both connectors and fusion for combined features")
-        logging.info("- All features projected to LLM dimension: {}\n".format(self.llm_dim))
+            logging.info("- Using connector for multimodal fusion")
+            
+        # Always using a connector to project to LLM dimension
+        logging.info(f"- All features projected to LLM dimension: {llm_dim_str}")
+        
+        logging.info("=" * 80 + "\n")
 
     def generate(
         self,
@@ -1249,7 +1238,7 @@ class ClipWhisperModel(nn.Module):
                 audio_features = self._pad_or_truncate(audio_features, max_len)
                 video_features = self._pad_or_truncate(video_features, max_len)
                 
-                # Apply fusion
+                # Weighted sum of features
                 encoder_output = (
                     self.fusion_scale * audio_features +
                     (1 - self.fusion_scale) * video_features
@@ -1272,7 +1261,10 @@ class ClipWhisperModel(nn.Module):
                     # Convert text prompt to token IDs
                     prompt_ids = self.tokenizer(
                         prompt,
-                        return_tensors="pt"
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=self.max_seq_len
                     ).input_ids.to(self.device)
                 else:
                     # Assume it's already tokenized
@@ -1310,7 +1302,10 @@ class ClipWhisperModel(nn.Module):
                     # Convert prompt to token IDs
                     prompt_ids = self.tokenizer(
                         default_prompt,
-                        return_tensors="pt"
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=self.max_seq_len
                     ).input_ids.to(self.device)
                     
                     # Get embeddings

@@ -6,7 +6,7 @@ import numpy as np
 from tqdm import tqdm
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from transformers import get_linear_schedule_with_warmup
+from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 import matplotlib.pyplot as plt
 from datetime import datetime
 import json
@@ -38,27 +38,7 @@ class ClipWhisperTrainer:
         warmup_steps=0,
         log_param_updates=False,
     ):
-        """
-        Initialize the trainer
-        
-        Args:
-            model: The model to train
-            train_dataloader: Training dataloader
-            val_dataloader: Validation dataloader (optional)
-            learning_rate: Learning rate for optimizer
-            weight_decay: Weight decay for optimizer
-            max_epochs: Maximum number of epochs to train
-            output_dir: Directory to save outputs
-            device: Device to train on ("cuda" or "cpu")
-            fp16: Whether to use mixed precision training
-            grad_accum_steps: Gradient accumulation steps
-            log_interval: Logging interval (in steps)
-            save_every: Save checkpoint every N epochs
-            save_steps: Save checkpoint every N steps (overrides save_every)
-            max_grad_norm: Maximum gradient norm for clipping
-            warmup_steps: Number of warmup steps for LR scheduler
-            log_param_updates: Whether to log parameter update statistics
-        """
+        """Initialize the trainer with a model, data, and training parameters"""
         self.model = model
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
@@ -67,7 +47,7 @@ class ClipWhisperTrainer:
         self.max_epochs = max_epochs
         self.output_dir = output_dir
         self.device = device
-        self.fp16 = fp16
+        self.fp16 = fp16 and torch.cuda.is_available()
         self.grad_accum_steps = grad_accum_steps
         self.log_interval = log_interval
         self.save_every = save_every
@@ -79,24 +59,25 @@ class ClipWhisperTrainer:
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
         
-        # Setup model, optimizer and scheduler
+        # Move model to device
+        self.model.to(device)
+        
+        # Set up optimizer and scheduler
         self.optimizer = self._setup_optimizer()
-        self.scheduler = self._setup_scheduler()
+        # Scheduler is now also set up in _setup_optimizer
         
-        # Setup gradient scaler for mixed precision training
-        if self.fp16:
-            # Use torch.amp.GradScaler instead of torch.cuda.amp.GradScaler
-            self.scaler = torch.amp.GradScaler('cuda')
-        else:
-            self.scaler = None
-        
-        # Initialize step counter
-        self.global_step = 0
-        
-        # Initialize validation loss tracking
+        # Initialize training state
+        self.epoch = 0
         self.best_val_loss = float('inf')
+        self.train_losses = []
+        self.val_losses = []
         
-        # Setup logging
+        # Set seed for reproducibility
+        torch.manual_seed(42)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(42)
+        
+        # Log configuration
         self._log_training_info()
         
         # Keep track of losses
@@ -107,72 +88,85 @@ class ClipWhisperTrainer:
         os.makedirs(os.path.join(output_dir, "logs"), exist_ok=True)
         
         # Log training parameters
-        logging.info(f"Trainer initialized with {train_dataloader.dataset.__len__()} training samples")
-        if val_dataloader:
-            logging.info(f"Validation set has {val_dataloader.dataset.__len__()} samples")
+        try:
+            if hasattr(self.train_dataloader, 'dataset') and hasattr(self.train_dataloader.dataset, '__len__'):
+                logging.info(f"Trainer initialized with {self.train_dataloader.dataset.__len__()} training samples")
+            else:
+                logging.info(f"Trainer initialized with {len(self.train_dataloader)} training batches")
+                
+            if val_dataloader and hasattr(val_dataloader, 'dataset') and hasattr(val_dataloader.dataset, '__len__'):
+                logging.info(f"Validation set has {val_dataloader.dataset.__len__()} samples")
+            elif val_dataloader:
+                logging.info(f"Validation set has {len(val_dataloader)} batches")
+        except Exception as e:
+            logging.warning(f"Could not determine dataset size: {e}")
+            
         logging.info(f"Using device: {device}, FP16: {fp16}")
         logging.info(f"Training for {max_epochs} epochs with LR: {learning_rate}")
         logging.info(f"Gradient accumulation steps: {grad_accum_steps}, Max grad norm: {max_grad_norm}")
-    
+        
     def _setup_optimizer(self):
-        """Set up the optimizer for training"""
-        # Separate parameters with and without weight decay
+        """Set up optimizer and scheduler with more stable settings"""
+        # Filter parameters that require gradients and group them
+        # Group 1: parameters that should have weight decay
+        # Group 2: bias terms, LayerNorm, etc. that should not have weight decay
         decay_params = []
         no_decay_params = []
         
-        # Log which parts of the model have trainable parameters
-        no_grad_count = 0
-        trainable_count = 0
+        # Log parameter counts and settings
+        logging.info("Setting up optimizer with stable settings for training")
         
+        # Group parameters based on whether they should have weight decay
         for name, param in self.model.named_parameters():
-            # Skip frozen parameters
             if not param.requires_grad:
-                no_grad_count += param.numel()
                 continue
                 
-            # Don't apply weight decay to bias, LayerNorm, and embeddings
-            if any(nd in name for nd in ['bias', 'LayerNorm', 'layer_norm', 'embedding']):
+            # Don't apply weight decay to bias terms, LayerNorm, or embeddings
+            if 'bias' in name or 'layer_norm' in name or 'layernorm' in name or 'norm' in name or 'embedding' in name:
                 no_decay_params.append(param)
             else:
                 decay_params.append(param)
-                
-            trainable_count += param.numel()
         
-        logging.info(f"Total parameters: {no_grad_count + trainable_count:,}")
-        logging.info(f"Trainable parameters: {trainable_count:,} ({100 * trainable_count / (no_grad_count + trainable_count):.2f}%)")
-        
-        # Create parameter groups
-        optim_groups = [
-            {"params": decay_params, "weight_decay": self.weight_decay},
-            {"params": no_decay_params, "weight_decay": 0.0}
+        # Set up parameter groups with appropriate weight decay
+        param_groups = [
+            {'params': decay_params, 'weight_decay': self.weight_decay},
+            {'params': no_decay_params, 'weight_decay': 0.0}
         ]
         
-        # Ensure learning_rate is a float
-        try:
-            # Use a smaller initial learning rate (10% of base rate)
-            if isinstance(self.learning_rate, str):
-                # Convert string to float if needed
-                initial_lr = float(self.learning_rate) * 0.1
-            else:
-                initial_lr = float(self.learning_rate) * 0.1
-            
-            logging.info(f"Setting initial learning rate to {initial_lr:.2e}")
-        except (ValueError, TypeError) as e:
-            # Fallback to default if conversion fails
-            logging.warning(f"Error converting learning rate: {e}. Using default value.")
-            initial_lr = 5e-6  # Default fallback value
-        
-        # Create optimizer
-        optimizer = AdamW(
-            optim_groups,
-            lr=initial_lr,
-            betas=(0.9, 0.999),
-            eps=1e-8
+        # Initialize optimizer with conservative settings for stability
+        # - Lower beta2 (0.95 instead of 0.999) for faster adaptation to gradient changes
+        # - Higher epsilon (1e-8 instead of 1e-8) for numerical stability
+        self.optimizer = torch.optim.AdamW(
+            param_groups,
+            lr=self.learning_rate,
+            betas=(0.9, 0.95),  # Conservative beta2 for better stability
+            eps=1e-8,           # Higher epsilon for numerical stability
         )
         
-        logging.info(f"Optimizer: AdamW with initial LR: {initial_lr:.2e}")
+        # Set up cosine learning rate scheduler with warmup
+        if self.warmup_steps > 0:
+            # Calculate total steps
+            num_batches = len(self.train_dataloader)
+            total_steps = self.max_epochs * num_batches
+            
+            # Create scheduler with warmup
+            self.scheduler = get_cosine_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=self.warmup_steps,
+                num_training_steps=total_steps
+            )
+            
+            logging.info(f"Using cosine scheduler with {self.warmup_steps} warmup steps over {total_steps} total steps")
+        else:
+            # Simple cosine annealing scheduler
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, 
+                T_max=self.max_epochs * len(self.train_dataloader)
+            )
+            
+            logging.info("Using cosine annealing scheduler without warmup")
         
-        return optimizer
+        return self.optimizer
     
     def _setup_scheduler(self):
         """Set up the learning rate scheduler"""
@@ -287,75 +281,135 @@ class ClipWhisperTrainer:
     def _train_epoch(self, epoch):
         """Train for one epoch"""
         self.model.train()
-        total_loss = 0
-        total_samples = 0
+        train_loss = 0.0
+        num_batches = len(self.train_dataloader)
         
-        # Check if LLM is frozen
-        llm_frozen = False
-        if hasattr(self.model, 'freeze_llm') and self.model.freeze_llm:
-            llm_frozen = True
-            logging.info("Training with frozen LLM - training only the connectors")
+        # Initialize gradient scaling for mixed precision
+        scaler = torch.amp.GradScaler('cuda' if torch.cuda.is_available() else 'cpu', enabled=self.fp16)
         
-        # Get modality information for logging
-        modality = getattr(self.model, 'modality', 'unknown')
+        # Track statistics for logging
+        batch_times = []
+        data_times = []
+        forward_times = []
+        backward_times = []
         
-        # Add periodic sanity check
-        logging.info(f"SANITY CHECK - EPOCH {epoch+1}:")
-        logging.info(f"  Current modality: {modality}")
-        if hasattr(self.model, 'audio_dim'):
-            logging.info(f"  Audio dimension: {self.model.audio_dim}")
-        if hasattr(self.model, 'video_dim'):
-            logging.info(f"  Video dimension: {self.model.video_dim}")
-        if hasattr(self.model, 'llm_dim'):
-            logging.info(f"  LLM dimension: {self.model.llm_dim}")
+        tqdm_desc = f"Epoch {epoch+1}/{self.max_epochs}"
+        pbar = tqdm(enumerate(self.train_dataloader), total=num_batches, desc=tqdm_desc)
         
-        # Force print to console as well
-        print(f"\nSANITY CHECK - EPOCH {epoch+1}:")
-        print(f"  Current modality: {modality}")
-        print(f"  Using {modality.upper()} modality for training\n")
-        
-        # Progress bar
-        pbar = tqdm(
-            enumerate(self.train_dataloader),
-            total=len(self.train_dataloader),
-            desc=f"Epoch {epoch+1}"
-        )
-        
-        # Training loop
+        data_start = time.time()
         for batch_idx, batch in pbar:
-            try:
-                # Skip None batches (from collate_fn)
-                if batch is None:
-                    continue
+            # Record data loading time
+            data_time = time.time() - data_start
+            data_times.append(data_time)
+            
+            # Track batch processing time
+            batch_start = time.time()
+            
+            # Process batch
+            batch = self._process_batch(batch, batch_idx, is_train=True)
+            
+            # Record forward pass time
+            forward_start = time.time()
+            
+            # Calculate loss with mixed precision if enabled
+            if self.fp16:
+                with torch.amp.autocast('cuda' if torch.cuda.is_available() else 'cpu'):
+                    outputs = self.model(**batch)
+                    loss = outputs["loss"] / self.grad_accum_steps
                 
-                # Process batch
-                loss = self._process_batch(batch, batch_idx=batch_idx, is_train=True)
+                # Scale loss and backpropagate
+                scaler.scale(loss).backward()
                 
-                # Update progress bar
-                desc = f"Epoch {epoch+1} | Loss: {loss:.6f}"
-                if llm_frozen:
-                    desc += " (LLM frozen)"
-                desc += f" | Modality: {modality}"
-                pbar.set_description(desc)
+                # Record backward pass time
+                backward_time = time.time() - forward_start
+                backward_times.append(backward_time)
                 
-                # Update statistics
-                batch_size = len(batch["audio"])
-                total_loss += loss * batch_size
-                total_samples += batch_size
+                # Only update every grad_accum_steps or at the end of epoch
+                if (batch_idx + 1) % self.grad_accum_steps == 0 or batch_idx == num_batches - 1:
+                    # Log gradient statistics but don't unscale manually
+                    # PyTorch amp handles unscaling internally in scaler.step()
+                    
+                    # Update with scaled gradients - scaler handles unscaling internally
+                    scaler.step(self.optimizer)
+                    scaler.update()
+                    
+                    # Update learning rate
+                    if self.scheduler is not None:
+                        self.scheduler.step()
+                    
+                    # Zero gradients
+                    self.optimizer.zero_grad()
+            else:
+                # Standard precision training
+                outputs = self.model(**batch)
+                loss = outputs["loss"] / self.grad_accum_steps
                 
-                # Log progress
-                if batch_idx % self.log_interval == 0:
-                    logging.info(f"Epoch {epoch+1} | Batch {batch_idx}/{len(self.train_dataloader)} | Loss: {loss:.6f} | Modality: {modality}")
+                # Backpropagate
+                loss.backward()
                 
-            except Exception as e:
-                logging.error(f"Error processing batch {batch_idx}: {e}")
-                logging.error(traceback.format_exc())
-                continue
+                # Record backward pass time
+                backward_time = time.time() - forward_start
+                backward_times.append(backward_time)
+                
+                # Only update every grad_accum_steps or at the end of epoch
+                if (batch_idx + 1) % self.grad_accum_steps == 0 or batch_idx == num_batches - 1:
+                    # Check for NaN or Inf values in gradients
+                    nan_inf_count = 0
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None:
+                            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                nan_inf_count += 1
+                                # Zero out problematic gradients to prevent training collapse
+                                param.grad = torch.zeros_like(param.grad)
+                    
+                    if nan_inf_count > 0:
+                        logging.warning(f"[Batch {batch_idx}] Found and fixed NaN/Inf gradients in {nan_inf_count} parameters")
+                    
+                    # Apply gradient clipping if needed
+                    if self.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    
+                    # Update weights
+                    self.optimizer.step()
+                    
+                    # Update learning rate
+                    if self.scheduler is not None:
+                        self.scheduler.step()
+                    
+                    # Zero gradients
+                    self.optimizer.zero_grad()
+            
+            # Track loss
+            train_loss += loss.item() * self.grad_accum_steps
+            
+            # Update progress bar
+            forward_time = time.time() - forward_start
+            forward_times.append(forward_time)
+            
+            batch_time = time.time() - batch_start
+            batch_times.append(batch_time)
+            
+            # Update progress bar with batch statistics
+            if batch_idx % self.log_interval == 0:
+                avg_loss = train_loss / (batch_idx + 1)
+                avg_batch_time = sum(batch_times) / len(batch_times)
+                avg_data_time = sum(data_times) / len(data_times)
+                avg_forward_time = sum(forward_times) / len(forward_times)
+                avg_backward_time = sum(backward_times) / len(backward_times)
+                
+                pbar.set_postfix({
+                    'loss': f"{avg_loss:.4f}",
+                    'batch_time': f"{avg_batch_time:.3f}s",
+                    'data_time': f"{avg_data_time:.3f}s",
+                    'fw_time': f"{avg_forward_time:.3f}s",
+                    'bw_time': f"{avg_backward_time:.3f}s",
+                })
+            
+            # Start timing data loading for next batch
+            data_start = time.time()
         
-        # Calculate average loss
-        avg_loss = total_loss / total_samples if total_samples > 0 else float('inf')
-        
-        return avg_loss
+        # Return average loss for the epoch
+        return train_loss / num_batches
     
     def _validate(self):
         """Validate the model"""
@@ -406,195 +460,109 @@ class ClipWhisperTrainer:
         return avg_loss
     
     def _process_batch(self, batch, batch_idx=0, is_train=True):
-        """Process a single batch of data"""
-        try:
-            # Extract batch data
-            audio = batch.get("audio", None)
-            video = batch.get("video", None) 
-            labels = batch.get("labels", None)
-            prompt = batch.get("prompt", None)
+        """Process a batch of data"""
+        # Skip None batches (from collate_fn)
+        if batch is None:
+            if is_train:
+                return {"loss": torch.tensor(0.0, device=self.device)}
+            else:
+                return {"loss": torch.tensor(0.0, device=self.device)}
+        
+        # Move batch to device - handle both tuple and dict batch formats
+        if isinstance(batch, (list, tuple)) and len(batch) >= 4:
+            audio, video, text, prompt = batch[:4]
             
-            # Move batch data to device if needed
+            # Create batch dictionary for the model
+            batch_dict = {}
+            
+            # Add audio if available
             if audio is not None:
-                audio = audio.to(self.device)
+                batch_dict["audio"] = audio.to(self.device)
+            
+            # Add video if available
             if video is not None:
-                video = video.to(self.device)
-            if labels is not None:
-                labels = labels.to(self.device)
-            if prompt is not None:
-                prompt = prompt.to(self.device)
-                
-            # Log batch sizes occasionally to track memory usage
-            if batch_idx % 50 == 0:
-                if audio is not None:
-                    logging.info(f"[Batch {batch_idx}] Audio input shape: {audio.shape}")
-                if video is not None:
-                    logging.info(f"[Batch {batch_idx}] Video input shape: {video.shape}")
-                if labels is not None:
-                    logging.info(f"[Batch {batch_idx}] Labels shape: {labels.shape}")
+                batch_dict["video"] = video.to(self.device)
             
-            # Forward pass through the model
-            if is_train:
-                # Zero gradients for first accumulation step
-                if batch_idx % self.grad_accum_steps == 0:
-                    self.optimizer.zero_grad()
-                
-                # Forward pass with gradient computation
-                with torch.amp.autocast('cuda') if self.fp16 else nullcontext():
-                    outputs = self.model(
-                        audio=audio,
-                        video=video,
-                        labels=labels,
-                        prompt=prompt,
-                        return_loss=True,
-                        batch_idx=batch_idx,  # Pass batch index for logging
-                    )
-            else:
-                # Validation pass without gradients
-                with torch.no_grad():
-                    with torch.amp.autocast('cuda') if self.fp16 else nullcontext():
-                        outputs = self.model(
-                            audio=audio,
-                            video=video,
-                            labels=labels,
-                            prompt=prompt,
-                            return_loss=True,
-                            batch_idx=batch_idx  # Pass batch index for logging
-                        )
-            
-            # Extract and process loss
-            if hasattr(outputs, "loss"):
-                loss = outputs.loss
-            elif isinstance(outputs, dict) and "loss" in outputs:
-                loss = outputs["loss"]
-            else:
-                logging.info("No loss found in model outputs (expected when LLM is frozen)")
-                # Return a dummy loss of 0.0 that's a proper tensor for stability
-                return torch.tensor(0.0, device=self.device).item()
-                
-            # Additional check to handle None loss (when LLM is frozen)
-            if loss is None:
-                logging.info("Loss is None (expected when LLM is frozen)")
-                return torch.tensor(0.0, device=self.device).item()
-            
-            # Check for NaN/Inf in loss
-            if torch.isnan(loss).any() or torch.isinf(loss).any():
-                logging.error(f"NaN/Inf detected in loss at batch {batch_idx}")
-                if is_train:
-                    # During training, try to recover
-                    self.optimizer.zero_grad()  # Clear any bad gradients
-                    loss = torch.tensor(1.0, device=self.device, requires_grad=True)
-                else:
-                    # During validation, skip this batch
-                    return 0.0
-                    
-            # Scale loss for gradient accumulation
-            if is_train and self.grad_accum_steps > 1:
-                loss = loss / self.grad_accum_steps
-                
-            # Backward pass with gradient handling
-            if is_train:
-                try:
-                    # Compute gradients
-                    if self.fp16:
-                        self.scaler.scale(loss).backward()
+            # Add text if available (for teacher forcing / supervised learning)
+            if text is not None:
+                if isinstance(text, torch.Tensor):
+                    batch_dict["text"] = text.to(self.device)
+                elif isinstance(text, list):
+                    # Handle list of token IDs or strings - may need to be processed differently
+                    if all(isinstance(t, torch.Tensor) for t in text):
+                        # List of tensors - stack or pad them
+                        batch_dict["text"] = torch.stack([t.to(self.device) for t in text])
+                    elif all(isinstance(t, (list, tuple)) for t in text):
+                        # Convert list of lists to tensor
+                        batch_dict["text"] = torch.tensor(text, device=self.device)
                     else:
-                        loss.backward()
-                        
-                    # Check for NaN/Inf in gradients
-                    has_bad_gradients = False
-                    for name, param in self.model.named_parameters():
-                        if param.grad is not None:
-                            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
-                                logging.error(f"NaN/Inf gradients in {name}")
-                                
-                                # Special handling for LoRA parameters
-                                if "lora" in name.lower():
-                                    logging.warning(f"Zeroing out bad LoRA gradients in {name}")
-                                    param.grad.data.zero_()
-                                else:
-                                    # For non-LoRA parameters with bad gradients, skip the update
-                                    has_bad_gradients = True
-                                    break
-                                    
-                    if has_bad_gradients:
-                        logging.warning("Found bad gradients in non-LoRA parameters, skipping update")
-                        self.optimizer.zero_grad()
-                        return 1.0
-                        
-                    # Step optimizer and scheduler if needed
-                    if (batch_idx + 1) % self.grad_accum_steps == 0 or \
-                       (batch_idx + 1) == len(self.train_dataloader):
-                        
-                        if self.fp16:
-                            # First unscale gradients, then clip them, then step optimizer
-                            self.scaler.unscale_(self.optimizer)
-                            
-                            # Clip gradients
-                            grad_norm = torch.nn.utils.clip_grad_norm_(
-                                self.model.parameters(), 
-                                max_norm=self.max_grad_norm
-                            )
-                            
-                            # Check for NaN in gradient norm
-                            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                                logging.error(f"NaN/Inf gradient norm at batch {batch_idx}")
-                                self.optimizer.zero_grad()
-                                return 1.0
-                                
-                            # Step optimizer with scaler
-                            self.scaler.step(self.optimizer)
-                            self.scaler.update()
+                        # For string lists, we may need the tokenizer
+                        if hasattr(self.model, 'tokenizer') and self.model.tokenizer is not None:
+                            encoded = self.model.tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=self.model.max_seq_len)
+                            batch_dict["text"] = encoded.input_ids.to(self.device)
                         else:
-                            # For non-FP16 mode, clip gradients and step normally
-                            grad_norm = torch.nn.utils.clip_grad_norm_(
-                                self.model.parameters(), 
-                                max_norm=self.max_grad_norm
-                            )
-                            
-                            # Check for NaN in gradient norm
-                            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                                logging.error(f"NaN/Inf gradient norm at batch {batch_idx}")
-                                self.optimizer.zero_grad()
-                                return 1.0
-                                
-                            # Step optimizer normally
-                            self.optimizer.step()
-                        
-                        # Step scheduler
-                        self.scheduler.step()
-                        
-                        # Log gradient norm occasionally
-                        if batch_idx % 100 == 0:
-                            logging.info(f"Batch {batch_idx} gradient norm: {grad_norm:.4f}")
-                        
-                except RuntimeError as e:
-                    logging.error(f"Runtime error in backward pass: {e}")
-                    self.optimizer.zero_grad()
-                    if self.fp16:
-                        # Reset scaler state if there was an error
-                        self.scaler = torch.amp.GradScaler('cuda')
-                    return 1.0
-                    
-            # Return loss value
-            loss_value = loss.item()
-            if np.isnan(loss_value) or np.isinf(loss_value):
-                logging.warning(f"NaN/Inf in final loss value: {loss_value}")
-                return 1.0
-                
-            # Log additional sequence stats occasionally
-            if batch_idx % 100 == 0:
-                stats = getattr(self.model, '_seq_len_stats', None)
-                if stats:
-                    logging.info(f"[Batch {batch_idx}] Sequence length stats - Min: {stats.get('min', 'N/A')}, "
-                               f"Max: {stats.get('max', 'N/A')}, Avg: {stats.get('avg', 'N/A')}")
-                               
-            return loss_value
+                            logging.warning(f"Received text as list of strings but no tokenizer available. Skipping text input.")
             
-        except Exception as e:
-            logging.error(f"Error processing batch: {str(e)}")
-            logging.error(traceback.format_exc())
-            return 1.0  # Default loss on error
+            # Add prompt if available
+            if prompt is not None:
+                if isinstance(prompt, torch.Tensor):
+                    batch_dict["prompt"] = prompt.to(self.device)
+                elif isinstance(prompt, list) and all(isinstance(p, torch.Tensor) for p in prompt):
+                    batch_dict["prompt"] = torch.stack([p.to(self.device) for p in prompt])
+                elif isinstance(prompt, list) and all(isinstance(p, (list, tuple)) for p in prompt):
+                    batch_dict["prompt"] = torch.tensor(prompt, device=self.device)
+                elif isinstance(prompt, list) and all(isinstance(p, str) for p in prompt):
+                    if hasattr(self.model, 'tokenizer') and self.model.tokenizer is not None:
+                        encoded = self.model.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=self.model.max_seq_len)
+                        batch_dict["prompt"] = encoded.input_ids.to(self.device)
+            
+            # Add labels (same as text for autoregressive training)
+            if "text" in batch_dict:
+                batch_dict["labels"] = batch_dict["text"]
+            
+            # Set return_loss flag
+            batch_dict["return_loss"] = True
+        else:
+            # Handle dictionary batch format
+            batch_dict = {}
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    batch_dict[k] = v.to(self.device)
+                elif k in ["text", "prompt", "labels"] and isinstance(v, list):
+                    # Handle list inputs for text, prompt, or labels
+                    if all(isinstance(item, torch.Tensor) for item in v):
+                        batch_dict[k] = torch.stack([item.to(self.device) for item in v])
+                    elif all(isinstance(item, (list, tuple)) for item in v):
+                        batch_dict[k] = torch.tensor(v, device=self.device)
+                    elif all(isinstance(item, str) for item in v) and hasattr(self.model, 'tokenizer'):
+                        encoded = self.model.tokenizer(v, return_tensors="pt", padding=True, truncation=True, max_length=self.model.max_seq_len)
+                        batch_dict[k] = encoded.input_ids.to(self.device)
+                else:
+                    batch_dict[k] = v
+            
+            # Ensure return_loss is set
+            batch_dict["return_loss"] = True
+        
+        if is_train:
+            # In training mode, ensure tokenizer has a pad token
+            if hasattr(self.model, 'tokenizer') and self.model.tokenizer is not None:
+                if self.model.tokenizer.pad_token is None:
+                    self.model.tokenizer.pad_token = self.model.tokenizer.eos_token
+                    # Add the pad token to the vocabulary if needed
+                    if self.model.tokenizer.pad_token not in self.model.tokenizer.get_vocab():
+                        self.model.tokenizer.add_special_tokens({'pad_token': self.model.tokenizer.pad_token})
+                    
+            return batch_dict
+        else:
+            # In validation mode, compute loss manually
+            try:
+                with torch.no_grad():
+                    outputs = self.model(**batch_dict)
+                    return outputs  # Return full outputs for validation metrics
+            except Exception as e:
+                logging.error(f"Error during validation batch {batch_idx}: {e}")
+                logging.error(traceback.format_exc())
+                return {"loss": torch.tensor(float('inf'), device=self.device)}
     
     def _save_checkpoint(self, is_best=False, is_final=False):
         """Save a checkpoint of the model and training state"""
@@ -714,103 +682,77 @@ class ClipWhisperTrainer:
             )
     
     def _display_active_components_summary(self, modality):
-        """Display a summary of active components based on modality"""
-        # Make sure we're using the actual model's modality, not the parameter
-        if hasattr(self.model, 'modality'):
-            modality = self.model.modality
-            logging.info(f"Using model's actual modality: {modality}")
-        
-        # Skip if model doesn't have the expected attributes
-        if not hasattr(self.model, 'audio_dim') or not hasattr(self.model, 'video_dim') or not hasattr(self.model, 'llm_dim'):
-            return
-            
-        # Get dimensions
-        audio_dim = self.model.audio_dim
-        video_dim = self.model.video_dim
-        llm_dim = self.model.llm_dim
-        
-        # Create a clear summary banner
-        summary_banner = "=" * 100
-        logging.info(f"\n{summary_banner}")
-        logging.info(f"ACTIVE COMPONENTS SUMMARY FOR MODALITY: {modality.upper()}")
-        logging.info(f"{'-' * 100}")
-        
-        # Component table header
-        logging.info(f"{'COMPONENT':<30} {'INPUT DIM':<15} {'OUTPUT DIM':<15} {'ACTIVE':<10}")
-        logging.info(f"{'-' * 100}")
-        
-        # List components based on modality
-        if modality in ["audio", "both"]:
-            logging.info(f"{'Audio Encoder (Whisper)':<30} {'Raw Audio':<15} {audio_dim:<15} {'YES':<10}")
-            logging.info(f"{'Audio Connector':<30} {audio_dim:<15} {llm_dim:<15} {'YES':<10}")
-        else:
-            logging.info(f"{'Audio Encoder (Whisper)':<30} {'Raw Audio':<15} {audio_dim:<15} {'NO':<10}")
-            logging.info(f"{'Audio Connector':<30} {audio_dim:<15} {llm_dim:<15} {'NO':<10}")
-            
-        if modality in ["video", "both"]:
-            logging.info(f"{'Video Encoder (CLIP)':<30} {'Raw Video':<15} {video_dim:<15} {'YES':<10}")
-            logging.info(f"{'Video Connector':<30} {video_dim:<15} {llm_dim:<15} {'YES':<10}")
-        else:
-            logging.info(f"{'Video Encoder (CLIP)':<30} {'Raw Video':<15} {video_dim:<15} {'NO':<10}")
-            logging.info(f"{'Video Connector':<30} {video_dim:<15} {llm_dim:<15} {'NO':<10}")
-            
-        if modality == "both":
-            logging.info(f"{'Fusion (weighted average)':<30} {llm_dim:<15} {llm_dim:<15} {'YES':<10}")
-        else:
-            logging.info(f"{'Fusion (weighted average)':<30} {llm_dim:<15} {llm_dim:<15} {'NO':<10}")
-            
-        logging.info(f"{'LLM':<30} {llm_dim:<15} {'Vocab Size':<15} {'YES':<10}")
-        
-        # End summary
-        logging.info(f"{summary_banner}\n")
-        
-        # Print to console as well for visibility
-        print(f"\nACTIVE COMPONENTS FOR MODALITY: {modality.upper()}")
-        if modality == "audio":
-            print("- Using WHISPER for audio encoding")
-            print("- Using audio connector to project to LLM dimension")
-        elif modality == "video":
-            print("- Using CLIP for video encoding")
-            print("- Using video connector to project to LLM dimension")
-        elif modality == "both":
-            print("- Using WHISPER for audio encoding")
-            print("- Using CLIP for video encoding")
-            print("- Using both connectors and fusion for combined features")
-        print(f"- All features projected to LLM dimension: {llm_dim}")
-        print("")
-
-    def _setup_dataloaders(self):
-        """Setup data loaders for training and validation"""
-        logging.info("Setting up dataloaders")
-        
+        """Display summary of active model components"""
         try:
-            # If dataloaders are already provided, use them
-            if hasattr(self, 'train_dataloader') and self.train_dataloader is not None:
-                logging.info(f"Using provided train dataloader")
-                return
+            # Get dimensions from model
+            audio_dim = getattr(self.model, 'audio_dim', None)
+            video_dim = getattr(self.model, 'video_dim', None)
+            llm_dim = getattr(self.model, 'llm_dim', None)
             
-            # Import dataset modules
-            from ..data.dataset import AVSRDataset, create_dataloader
-            from ..data.simple_dataset import AVSRDataset as SimpleAVSRDataset, create_dataloaders as create_simple_dataloaders
+            # Format for display (handle None values)
+            audio_dim_str = str(audio_dim) if audio_dim is not None else "N/A"
+            video_dim_str = str(video_dim) if video_dim is not None else "N/A"
+            llm_dim_str = str(llm_dim) if llm_dim is not None else "N/A"
             
-            # Get configuration for data
-            if hasattr(self.config, 'data'):
-                data_config = self.config.data
-                
-                # Get data paths
-                data_path = getattr(data_config, "path", "data")
-                
-                # Setup appropriate datasets based on configuration
-                # Implementation will depend on your specific requirements
-                
-                logging.info(f"Dataloaders setup complete")
+            # Display table of active components
+            logging.info("\nACTIVE COMPONENTS FOR MODALITY: {}".format(modality.upper()))
+            logging.info(f"{'COMPONENT':<30} {'INPUT':<15} {'OUTPUT':<15} {'ACTIVE':<10}")
+            logging.info("-" * 75)
+            
+            # Display encoders based on modality
+            audio_active = modality in ["audio", "both"]
+            video_active = modality in ["video", "both"]
+            
+            # Audio encoder
+            if audio_active:
+                logging.info(f"{'Audio Encoder (Whisper)':<30} {'Raw Audio':<15} {audio_dim_str:<15} {'YES':<10}")
             else:
-                logging.warning("No data configuration found in config")
+                logging.info(f"{'Audio Encoder (Whisper)':<30} {'Raw Audio':<15} {audio_dim_str:<15} {'NO':<10}")
                 
+            # Video encoder
+            if video_active:
+                logging.info(f"{'Video Encoder (CLIP)':<30} {'Raw Video':<15} {video_dim_str:<15} {'YES':<10}")
+            else:
+                logging.info(f"{'Video Encoder (CLIP)':<30} {'Raw Video':<15} {video_dim_str:<15} {'NO':<10}")
+            
+            # Display connections between components
+            if audio_active:
+                logging.info(f"{'Audio Connector':<30} {audio_dim_str:<15} {llm_dim_str:<15} {'YES':<10}")
+            else:
+                logging.info(f"{'Audio Connector':<30} {audio_dim_str:<15} {llm_dim_str:<15} {'NO':<10}")
+                
+            if video_active:
+                logging.info(f"{'Video Connector':<30} {video_dim_str:<15} {llm_dim_str:<15} {'YES':<10}")
+            else:
+                logging.info(f"{'Video Connector':<30} {video_dim_str:<15} {llm_dim_str:<15} {'NO':<10}")
+            
+            # LLM is always active
+            logging.info(f"{'Language Model (LLM)':<30} {llm_dim_str:<15} {'Text':<15} {'YES':<10}")
+            
+            # Memory usage summary
+            logging.info("\nESTIMATED MEMORY USAGE:")
+            
+            # These are rough estimates based on model sizes
+            whisper_mem = "~0.5 GB" if audio_active else "0 GB (not loaded)"
+            clip_mem = "~0.5 GB" if video_active else "0 GB (not loaded)"
+            llm_mem = "~3.5 GB"  # 1B model with activations
+            batch_mem = "~0.1 GB"  # Memory for inputs, gradients, etc.
+            
+            logging.info(f"• Whisper: {whisper_mem}")
+            logging.info(f"• CLIP: {clip_mem}")
+            logging.info(f"• LLM: {llm_mem}")
+            logging.info(f"• Batch data and activations: {batch_mem}")
+            
+            total_est = ("~5 GB" if modality == "both" else 
+                         "~4 GB" if modality == "audio" else 
+                         "~4 GB" if modality == "video" else "Unknown")
+            
+            logging.info(f"• Total estimated usage: {total_est}")
+            logging.info("-" * 75)
+            
         except Exception as e:
-            logging.error(f"Error during dataloader setup: {e}")
-            logging.error(traceback.format_exc())
-
+            logging.error(f"Error displaying component summary: {e}")
+    
     def _log_training_info(self):
         """Log information about the training configuration"""
         logging.info("=" * 50)
@@ -829,10 +771,24 @@ class ClipWhisperTrainer:
             logging.info(f"Save checkpoint every: {self.save_steps} steps")
         logging.info(f"Max gradient norm: {self.max_grad_norm}")
         logging.info(f"Logging parameter updates: {self.log_param_updates}")
-        logging.info(f"Training samples: {len(self.train_dataloader.dataset) if hasattr(self.train_dataloader, 'dataset') else 'Unknown'}")
-        logging.info(f"Validation samples: {len(self.val_dataloader.dataset) if hasattr(self.val_dataloader, 'dataset') else 'Unknown'}")
-        logging.info(f"Training batches: {len(self.train_dataloader)}")
-        logging.info(f"Validation batches: {len(self.val_dataloader)}")
+        
+        # Safely log dataset sizes
+        try:
+            if hasattr(self.train_dataloader, 'dataset') and hasattr(self.train_dataloader.dataset, '__len__'):
+                logging.info(f"Training samples: {len(self.train_dataloader.dataset)}")
+            else:
+                logging.info(f"Training batches: {len(self.train_dataloader)}")
+                
+            if hasattr(self, 'val_dataloader') and self.val_dataloader is not None:
+                if hasattr(self.val_dataloader, 'dataset') and hasattr(self.val_dataloader.dataset, '__len__'):
+                    logging.info(f"Validation samples: {len(self.val_dataloader.dataset)}")
+                else:
+                    logging.info(f"Validation batches: {len(self.val_dataloader)}")
+            else:
+                logging.info("Validation dataset: Not available")
+        except Exception as e:
+            logging.warning(f"Could not determine dataset size: {e}")
+        
         logging.info("-" * 50)
         
         # Log model architecture
