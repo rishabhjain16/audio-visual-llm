@@ -4,7 +4,7 @@
 # Default values
 DATA_PATH="/home/rishabh/Desktop/Datasets/lrs3/433h_data"
 EPOCHS=10
-BATCH_SIZE=2
+BATCH_SIZE=1
 MODALITY="audio"
 LLM_PATH="checkpoints/Llama-2-7b-hf"
 MODE="max"  # standard, fp16, 4bit, or max

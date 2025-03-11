@@ -13,6 +13,7 @@ import json
 import traceback
 from contextlib import nullcontext
 from pathlib import Path
+import gc
 
 class ClipWhisperTrainer:
     """
@@ -64,7 +65,6 @@ class ClipWhisperTrainer:
         
         # Set up optimizer and scheduler
         self.optimizer = self._setup_optimizer()
-        # Scheduler is now also set up in _setup_optimizer
         
         # Initialize training state
         self.epoch = 0
@@ -214,75 +214,76 @@ class ClipWhisperTrainer:
         # Display active component summary based on modality
         self._display_active_components_summary(modality)
         
-        # Training loop
-        for epoch in range(self.max_epochs):
-            self.current_epoch = epoch
-            logging.info(f"Starting epoch {epoch+1}/{self.max_epochs}")
-            
-            # Train
-            train_loss = self._train_epoch(epoch)
-            train_losses.append(train_loss)
-            
-            # Validate
-            val_loss = float('inf')
-            if self.val_dataloader is not None:
-                val_loss = self._validate()
-                val_losses.append(val_loss)
+        try:
+            for epoch in range(self.max_epochs):
+                # Clear cache at start of epoch
+                torch.cuda.empty_cache()
+                gc.collect()
                 
-                # Save best model
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    self._save_checkpoint(is_best=True)
-                    logging.info(f"New best validation loss: {val_loss:.4f}")
+                # Train and validate
+                train_loss = self._train_epoch(epoch)
+                val_loss = self._validate() if self.val_dataloader else float('inf')
+                
+                # Clear cache after each epoch
+                torch.cuda.empty_cache()
+                gc.collect()
+                
+                # Save checkpoint based on epoch if step-based saving is not enabled
+                if (epoch + 1) % self.save_every == 0:
+                    self._save_checkpoint()
+                    logging.info(f"Checkpoint saved at epoch {epoch+1}")
+                
+                # Log progress to file
+                with open(loss_log_path, "a") as f:
+                    f.write(f"{epoch+1},{train_loss:.6f},{val_loss:.6f}\n")
+                
+                # Log progress to console with clear formatting
+                is_best = val_loss == best_val_loss
+                best_marker = " (BEST)" if is_best else ""
+                print(f"{epoch+1:^10}|{train_loss:^20.6f}|{val_loss:^20.6f}|{best_val_loss:^20.6f}{best_marker}")
+                
+                # Provide regular logging output
+                modality_info = f"[Modality: {modality}] "
+                if self.val_dataloader is not None:
+                    logging.info(f"{modality_info}Epoch {epoch+1}/{self.max_epochs} - "
+                               f"Train loss: {train_loss:.6f}, "
+                               f"Val loss: {val_loss:.6f}")
+                else:
+                    logging.info(f"{modality_info}Epoch {epoch+1}/{self.max_epochs} - "
+                               f"Train loss: {train_loss:.6f}")
             
-            # Save checkpoint based on epoch if step-based saving is not enabled
-            if (epoch + 1) % self.save_every == 0:
-                self._save_checkpoint()
-                logging.info(f"Checkpoint saved at epoch {epoch+1}")
+            # Print final summary
+            print("=" * 80)
+            print(f"Training completed after {self.max_epochs} epochs")
+            print(f"Best validation loss: {best_val_loss:.6f}")
+            print(f"Final training loss: {train_losses[-1]:.6f}")
+            print("=" * 80)
             
-            # Log progress to file
-            with open(loss_log_path, "a") as f:
-                f.write(f"{epoch+1},{train_loss:.6f},{val_loss:.6f}\n")
+            # Save final model
+            self._save_checkpoint(is_final=True)
             
-            # Log progress to console with clear formatting
-            is_best = val_loss == best_val_loss
-            best_marker = " (BEST)" if is_best else ""
-            print(f"{epoch+1:^10}|{train_loss:^20.6f}|{val_loss:^20.6f}|{best_val_loss:^20.6f}{best_marker}")
+            # Plot loss
+            self._plot_loss(train_losses, val_losses)
             
-            # Provide regular logging output
-            modality_info = f"[Modality: {modality}] "
-            if self.val_dataloader is not None:
-                logging.info(f"{modality_info}Epoch {epoch+1}/{self.max_epochs} - "
-                           f"Train loss: {train_loss:.6f}, "
-                           f"Val loss: {val_loss:.6f}")
-            else:
-                logging.info(f"{modality_info}Epoch {epoch+1}/{self.max_epochs} - "
-                           f"Train loss: {train_loss:.6f}")
-        
-        # Print final summary
-        print("=" * 80)
-        print(f"Training completed after {self.max_epochs} epochs")
-        print(f"Best validation loss: {best_val_loss:.6f}")
-        print(f"Final training loss: {train_losses[-1]:.6f}")
-        print("=" * 80)
-        
-        # Save final model
-        self._save_checkpoint(is_final=True)
-        
-        # Plot loss
-        self._plot_loss(train_losses, val_losses)
-        
-        return {
-            "train_losses": train_losses,
-            "val_losses": val_losses,
-            "best_val_loss": best_val_loss,
-        }
+            return {
+                "train_losses": train_losses,
+                "val_losses": val_losses,
+                "best_val_loss": best_val_loss,
+            }
+        finally:
+            # Ensure all memory is cleared
+            torch.cuda.empty_cache()
+            gc.collect()
     
     def _train_epoch(self, epoch):
         """Train for one epoch"""
         self.model.train()
         train_loss = 0.0
         num_batches = len(self.train_dataloader)
+        
+        # Clear cache only at start of epoch
+        torch.cuda.empty_cache()
+        gc.collect()
         
         # Initialize gradient scaling for mixed precision
         scaler = torch.amp.GradScaler('cuda' if torch.cuda.is_available() else 'cpu', enabled=self.fp16)
@@ -298,86 +299,31 @@ class ClipWhisperTrainer:
         
         data_start = time.time()
         for batch_idx, batch in pbar:
-            # Record data loading time
-            data_time = time.time() - data_start
-            data_times.append(data_time)
-            
-            # Track batch processing time
-            batch_start = time.time()
-            
             # Process batch
-            batch = self._process_batch(batch, batch_idx, is_train=True)
+            batch_dict = self._process_batch(batch, batch_idx, is_train=True)
             
             # Record forward pass time
             forward_start = time.time()
             
-            # Calculate loss with mixed precision if enabled
-            if self.fp16:
-                with torch.amp.autocast('cuda' if torch.cuda.is_available() else 'cpu'):
-                    outputs = self.model(**batch)
-                    loss = outputs["loss"] / self.grad_accum_steps
-                
-                # Scale loss and backpropagate
-                scaler.scale(loss).backward()
-                
-                # Record backward pass time
-                backward_time = time.time() - forward_start
-                backward_times.append(backward_time)
-                
-                # Only update every grad_accum_steps or at the end of epoch
-                if (batch_idx + 1) % self.grad_accum_steps == 0 or batch_idx == num_batches - 1:
-                    # Log gradient statistics but don't unscale manually
-                    # PyTorch amp handles unscaling internally in scaler.step()
-                    
-                    # Update with scaled gradients - scaler handles unscaling internally
-                    scaler.step(self.optimizer)
-                    scaler.update()
-                    
-                    # Update learning rate
-                    if self.scheduler is not None:
-                        self.scheduler.step()
-                    
-                    # Zero gradients
-                    self.optimizer.zero_grad()
-            else:
-                # Standard precision training
-                outputs = self.model(**batch)
+            # Wrap forward pass in a context manager to clear memory
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=self.fp16):
+                outputs = self.model(**batch_dict)
                 loss = outputs["loss"] / self.grad_accum_steps
-                
-                # Backpropagate
-                loss.backward()
-                
-                # Record backward pass time
-                backward_time = time.time() - forward_start
-                backward_times.append(backward_time)
-                
-                # Only update every grad_accum_steps or at the end of epoch
-                if (batch_idx + 1) % self.grad_accum_steps == 0 or batch_idx == num_batches - 1:
-                    # Check for NaN or Inf values in gradients
-                    nan_inf_count = 0
-                    for name, param in self.model.named_parameters():
-                        if param.grad is not None:
-                            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
-                                nan_inf_count += 1
-                                # Zero out problematic gradients to prevent training collapse
-                                param.grad = torch.zeros_like(param.grad)
-                    
-                    if nan_inf_count > 0:
-                        logging.warning(f"[Batch {batch_idx}] Found and fixed NaN/Inf gradients in {nan_inf_count} parameters")
-                    
-                    # Apply gradient clipping if needed
-                    if self.max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                    
-                    # Update weights
-                    self.optimizer.step()
-                    
-                    # Update learning rate
-                    if self.scheduler is not None:
-                        self.scheduler.step()
-                    
-                    # Zero gradients
-                    self.optimizer.zero_grad()
+            
+            # Scale loss and backpropagate
+            scaler.scale(loss).backward()
+            
+            # Record backward pass time
+            backward_time = time.time() - forward_start
+            backward_times.append(backward_time)
+            
+            # Only update every grad_accum_steps or at the end of epoch
+            if (batch_idx + 1) % self.grad_accum_steps == 0 or batch_idx == num_batches - 1:
+                scaler.step(self.optimizer)
+                scaler.update()
+                if self.scheduler is not None:
+                    self.scheduler.step()
+                self.optimizer.zero_grad()
             
             # Track loss
             train_loss += loss.item() * self.grad_accum_steps
@@ -386,29 +332,50 @@ class ClipWhisperTrainer:
             forward_time = time.time() - forward_start
             forward_times.append(forward_time)
             
-            batch_time = time.time() - batch_start
+            batch_time = time.time() - data_start
             batch_times.append(batch_time)
             
             # Update progress bar with batch statistics
             if batch_idx % self.log_interval == 0:
                 avg_loss = train_loss / (batch_idx + 1)
-                avg_batch_time = sum(batch_times) / len(batch_times)
-                avg_data_time = sum(data_times) / len(data_times)
-                avg_forward_time = sum(forward_times) / len(forward_times)
-                avg_backward_time = sum(backward_times) / len(backward_times)
+                avg_batch_time = sum(batch_times) / len(batch_times) if batch_times else 0
+                avg_forward_time = sum(forward_times) / len(forward_times) if forward_times else 0
+                avg_backward_time = sum(backward_times) / len(backward_times) if backward_times else 0
                 
                 pbar.set_postfix({
                     'loss': f"{avg_loss:.4f}",
                     'batch_time': f"{avg_batch_time:.3f}s",
-                    'data_time': f"{avg_data_time:.3f}s",
                     'fw_time': f"{avg_forward_time:.3f}s",
                     'bw_time': f"{avg_backward_time:.3f}s",
                 })
             
             # Start timing data loading for next batch
             data_start = time.time()
+            
+            if batch_idx % 100 == 0:
+                logging.info(f"Epoch {epoch} - Batch {batch_idx} - Loss: {loss.item():.4f}")
         
-        # Return average loss for the epoch
+        # Clear cache at end of epoch
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        # Add video frame statistics tracking
+        video_lengths = []
+        
+        for batch_idx, batch in pbar:
+            # Track video lengths
+            if "video" in batch_dict and batch_dict["video"] is not None:
+                video_lengths.append(batch_dict["video"].size(1))  # Number of frames
+            
+            # ... existing training code ...
+        
+        # Log video statistics at end of epoch
+        if video_lengths:
+            min_frames = min(video_lengths)
+            max_frames = max(video_lengths)
+            avg_frames = sum(video_lengths) / len(video_lengths)
+            logging.info(f"Video frame stats - Min: {min_frames}, Max: {max_frames}, Avg: {avg_frames:.1f}")
+        
         return train_loss / num_batches
     
     def _validate(self):
@@ -472,36 +439,29 @@ class ClipWhisperTrainer:
         if isinstance(batch, (list, tuple)) and len(batch) >= 4:
             audio, video, text, prompt = batch[:4]
             
+            # Convert text to tensor if it's a list
+            if isinstance(text, list):
+                # Tokenize text if we have a tokenizer
+                if hasattr(self.model, 'tokenizer') and self.model.tokenizer is not None:
+                    text = self.model.tokenizer(
+                        text, 
+                        return_tensors="pt", 
+                        padding=True, 
+                        truncation=True, 
+                        max_length=self.model.max_seq_len
+                    ).input_ids
+                else:
+                    # Convert list of strings to tensor of token IDs
+                    text = torch.tensor(text, dtype=torch.long)
+            
             # Create batch dictionary for the model
-            batch_dict = {}
-            
-            # Add audio if available
-            if audio is not None:
-                batch_dict["audio"] = audio.to(self.device)
-            
-            # Add video if available
-            if video is not None:
-                batch_dict["video"] = video.to(self.device)
-            
-            # Add text if available (for teacher forcing / supervised learning)
-            if text is not None:
-                if isinstance(text, torch.Tensor):
-                    batch_dict["text"] = text.to(self.device)
-                elif isinstance(text, list):
-                    # Handle list of token IDs or strings - may need to be processed differently
-                    if all(isinstance(t, torch.Tensor) for t in text):
-                        # List of tensors - stack or pad them
-                        batch_dict["text"] = torch.stack([t.to(self.device) for t in text])
-                    elif all(isinstance(t, (list, tuple)) for t in text):
-                        # Convert list of lists to tensor
-                        batch_dict["text"] = torch.tensor(text, device=self.device)
-                    else:
-                        # For string lists, we may need the tokenizer
-                        if hasattr(self.model, 'tokenizer') and self.model.tokenizer is not None:
-                            encoded = self.model.tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=self.model.max_seq_len)
-                            batch_dict["text"] = encoded.input_ids.to(self.device)
-                        else:
-                            logging.warning(f"Received text as list of strings but no tokenizer available. Skipping text input.")
+            batch_dict = {
+                "audio": audio.to(self.device) if audio is not None else None,
+                "video": video.to(self.device) if video is not None else None,
+                "text": text.to(self.device) if text is not None else None,
+                "labels": text.to(self.device) if text is not None else None,
+                "return_loss": True
+            }
             
             # Add prompt if available
             if prompt is not None:
@@ -516,12 +476,15 @@ class ClipWhisperTrainer:
                         encoded = self.model.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=self.model.max_seq_len)
                         batch_dict["prompt"] = encoded.input_ids.to(self.device)
             
-            # Add labels (same as text for autoregressive training)
-            if "text" in batch_dict:
-                batch_dict["labels"] = batch_dict["text"]
+            # Only check dimensions if the inputs are not None
+            if audio is not None and video is not None:
+                assert audio.size(0) == video.size(0), "Audio and video batch sizes must match"
+            if text is not None:
+                if audio is not None:
+                    assert audio.size(0) == text.size(0), "Input and label batch sizes must match"
+                elif video is not None:
+                    assert video.size(0) == text.size(0), "Input and label batch sizes must match"
             
-            # Set return_loss flag
-            batch_dict["return_loss"] = True
         else:
             # Handle dictionary batch format
             batch_dict = {}
@@ -552,6 +515,10 @@ class ClipWhisperTrainer:
                     if self.model.tokenizer.pad_token not in self.model.tokenizer.get_vocab():
                         self.model.tokenizer.add_special_tokens({'pad_token': self.model.tokenizer.pad_token})
                     
+            # Add gradient checkpointing
+            if self.grad_accum_steps > 1:
+                torch.utils.checkpoint.checkpoint(self.model, **batch_dict)
+            
             return batch_dict
         else:
             # In validation mode, compute loss manually
@@ -795,3 +762,56 @@ class ClipWhisperTrainer:
         if hasattr(self.model, "_log_model_architecture"):
             self.model._log_model_architecture()
         logging.info("=" * 50) 
+
+    def _log_memory_usage(self, stage):
+        # Add detailed memory tracking
+        memory = torch.cuda.memory_stats()
+        logging.info(f"Memory Details [{stage}]:")
+        logging.info(f"- Allocated: {memory['allocated_bytes.all.current'] / 1e9:.2f} GB")
+        logging.info(f"- Reserved: {memory['reserved_bytes.all.current'] / 1e9:.2f} GB")
+        logging.info(f"- Active: {memory['active_bytes.all.current'] / 1e9:.2f} GB")
+        logging.info(f"- Peak: {memory['allocated_bytes.all.peak'] / 1e9:.2f} GB")
+
+    def _find_optimal_batch_size(self):
+        """Find the optimal batch size using actual data from the dataloader"""
+        if not self.train_dataloader:
+            return 1  # Default to batch size 1 if no dataloader
+        
+        # Get the first batch from the dataloader
+        try:
+            first_batch = next(iter(self.train_dataloader))
+        except Exception as e:
+            logging.warning(f"Could not get first batch from dataloader: {e}")
+            return 1
+        
+        batch_size = 1
+        while True:
+            try:
+                # Create a batch by repeating the first batch
+                batch = self._create_batch_from_sample(first_batch, batch_size)
+                
+                # Test memory usage
+                with torch.no_grad():
+                    self.model(**batch)
+                
+                # Double the batch size
+                batch_size *= 2
+            except RuntimeError as e:
+                if 'CUDA out of memory' in str(e):
+                    return max(1, batch_size // 2)
+                raise
+
+    def _create_batch_from_sample(self, sample, batch_size):
+        """Create a batch by repeating a single sample"""
+        if isinstance(sample, (list, tuple)):
+            return [self._repeat_tensor(x, batch_size) if torch.is_tensor(x) else x for x in sample]
+        elif isinstance(sample, dict):
+            return {k: self._repeat_tensor(v, batch_size) if torch.is_tensor(v) else v for k, v in sample.items()}
+        else:
+            return sample
+
+    def _repeat_tensor(self, tensor, batch_size):
+        """Repeat a tensor along the batch dimension"""
+        if tensor.dim() == 0:
+            return tensor.unsqueeze(0).repeat(batch_size)
+        return tensor.unsqueeze(0).repeat(batch_size, *[1]*(tensor.dim()-1)) 

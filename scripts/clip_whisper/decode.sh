@@ -140,6 +140,8 @@ CMD+=" --config $CONFIG"
 CMD+=" --whisper_model $WHISPER_MODEL"
 CMD+=" --clip_model $CLIP_MODEL"
 CMD+=" --llm_model $LLM_MODEL"
+CMD+=" --text_key text"
+CMD+=" --calculate_loss"
 
 if [ "$VERBOSE" = true ]; then
     CMD+=" --verbose"

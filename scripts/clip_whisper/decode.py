@@ -59,6 +59,10 @@ def main():
                       help="Path to pre-trained CLIP model")
     parser.add_argument("--llm_model", type=str, default="checkpoints/Llama-3.2-1B",
                       help="Path to pre-trained LLM model")
+    parser.add_argument('--calculate_loss', action='store_true', 
+                        help='Calculate loss during decoding (requires reference text)')
+    parser.add_argument('--text_key', type=str, default='text', 
+                        help='Key for text input in batch (default: "text")')
     
     args = parser.parse_args()
     
@@ -428,21 +432,19 @@ def main():
                 # Prepare inputs based on modality
                 inputs_for_model = {}
                 
-                # Check for various possible keys for audio features
-                for audio_key in ["audio_features", "audio_input", "audio", "audio_feature"]:
-                    if audio_key in batch and args.modality in ["audio", "both"]:
-                        inputs_for_model["audio"] = batch[audio_key].to(args.device)
-                        if args.verbose:
-                            logging.info(f"Found audio features with key: {audio_key}")
-                        break
-                        
-                # Check for various possible keys for video features
-                for video_key in ["video_features", "video_input", "video", "video_feature", "pixel_values"]:
-                    if video_key in batch and args.modality in ["video", "both"]:
-                        inputs_for_model["video"] = batch[video_key].to(args.device)
-                        if args.verbose:
-                            logging.info(f"Found video features with key: {video_key}")
-                        break
+                # Add audio input if available
+                if "audio" in batch and args.modality in ["audio", "both"]:
+                    inputs_for_model["audio"] = batch["audio"].to(args.device)
+
+                # Add video input if available
+                if "video" in batch and args.modality in ["video", "both"]:
+                    inputs_for_model["video"] = batch["video"].to(args.device)
+
+                # Add text input if available (use 'labels' or 'text' as in training)
+                if "labels" in batch:
+                    inputs_for_model["labels"] = batch["labels"].to(args.device)
+                elif "text" in batch:
+                    inputs_for_model["text"] = batch["text"].to(args.device)
                 
                 # Special check for video format seen in the logs
                 if args.verbose and batch_idx < 5:
@@ -510,59 +512,46 @@ def main():
                     logging.warning(f"Batch {batch_idx}: Both modality selected but neither audio nor video input in batch, skipping")
                     continue
                 
+                # Run model forward pass
                 with torch.no_grad():
-                    # Fix parameter names: rename "audio_input" to "audio" and "video_input" to "video"
-                    # to match the ClipWhisperModel.generate() method signature
-                    generate_inputs = {}
-                    
-                    # Map the input keys to the correct parameter names
-                    if "audio_input" in inputs_for_model:
-                        generate_inputs["audio"] = inputs_for_model["audio_input"]
-                    if "video_input" in inputs_for_model:
-                        generate_inputs["video"] = inputs_for_model["video_input"]
-                    
-                    # Copy any other arguments
-                    for key, value in inputs_for_model.items():
-                        if key not in ["audio_input", "video_input"]:
-                            generate_inputs[key] = value
-                    
-                    # Generate text with correctly named parameters
-                    outputs = model.generate(
-                        **generate_inputs,
-                        max_new_tokens=args.max_new_tokens,
-                        do_sample=True,
-                        temperature=0.7,
-                        top_p=0.9,
-                    )
-                    
-                    # Process outputs
-                    batch_hypotheses = []
-                    if isinstance(outputs, list) and all(isinstance(item, str) for item in outputs):
-                        # If outputs is already a list of strings
-                        batch_hypotheses = outputs
-                    else:
-                        # If outputs is token IDs, decode them
-                        try:
-                            if isinstance(outputs, torch.Tensor):
-                                # Single tensor output
-                                text = model.tokenizer.decode(outputs[0], skip_special_tokens=True)
+                    outputs = model(**inputs_for_model, return_loss=True)
+
+                # Calculate loss if text/labels are available
+                if "labels" in inputs_for_model or "text" in inputs_for_model:
+                    if hasattr(outputs, 'logits'):
+                        logits = outputs.logits
+                        labels = inputs_for_model.get("labels", inputs_for_model.get("text"))
+                        loss = model.calculate_loss(logits, labels)
+                        logging.info(f"Batch {batch_idx} - Loss: {loss.item():.4f}")
+                
+                # Process outputs
+                batch_hypotheses = []
+                if isinstance(outputs, list) and all(isinstance(item, str) for item in outputs):
+                    # If outputs is already a list of strings
+                    batch_hypotheses = outputs
+                else:
+                    # If outputs is token IDs, decode them
+                    try:
+                        if isinstance(outputs, torch.Tensor):
+                            # Single tensor output
+                            text = model.tokenizer.decode(outputs[0], skip_special_tokens=True)
+                            batch_hypotheses.append(text)
+                        elif hasattr(outputs, "__getitem__"):
+                            # Sequence output
+                            for output_ids in outputs:
+                                if isinstance(output_ids, torch.Tensor):
+                                    text = model.tokenizer.decode(output_ids, skip_special_tokens=True)
+                                else:
+                                    # Handle case where output might already be text
+                                    text = str(output_ids)
                                 batch_hypotheses.append(text)
-                            elif hasattr(outputs, "__getitem__"):
-                                # Sequence output
-                                for output_ids in outputs:
-                                    if isinstance(output_ids, torch.Tensor):
-                                        text = model.tokenizer.decode(output_ids, skip_special_tokens=True)
-                                    else:
-                                        # Handle case where output might already be text
-                                        text = str(output_ids)
-                                    batch_hypotheses.append(text)
-                            else:
-                                # Fallback for other output types
-                                text = str(outputs)
-                                batch_hypotheses.append(text)
-                        except Exception as e:
-                            logging.error(f"Error processing model outputs: {e}")
-                            batch_hypotheses = ["[ERROR: Failed to decode output]"]
+                        else:
+                            # Fallback for other output types
+                            text = str(outputs)
+                            batch_hypotheses.append(text)
+                    except Exception as e:
+                        logging.error(f"Error processing model outputs: {e}")
+                        batch_hypotheses = ["[ERROR: Failed to decode output]"]
                 
                 # Decode the output tokens for each sample
                 batch_size = len(batch_hypotheses)

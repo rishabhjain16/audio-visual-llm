@@ -7,7 +7,7 @@ data:
   train_labels: "train.wrd"
   val_manifest: "valid.tsv"
   val_labels: "valid.wrd"
-  batch_size: 2
+  batch_size: 1
   max_audio_length: 480000  # 30 seconds at 16kHz
   max_video_length: 100     # Maximum number of video frames
   max_seq_len: 1536          # Maximum sequence length for encoder output (increased from 256 to handle full 1500 audio frames)
