@@ -282,7 +282,7 @@ class AVSRDataCollator:
         
         # Process text if available
         if "text" in batch[0]:
-            output["text"] = [sample["text"] for sample in batch]
+            output["labels"] = [sample["text"] for sample in batch]
         
         return output
 
@@ -328,6 +328,7 @@ def create_dataloader(
             pin_memory=False,
             drop_last=False,
         )
+
 class DummyDataset(Dataset):
     """
     A dummy dataset for testing AVSR-LLM model

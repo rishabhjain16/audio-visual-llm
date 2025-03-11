@@ -1,7 +1,7 @@
 #!/bin/bash
-# Training script for the ClipWhisperModel
+# Simplified training script for ClipWhisperModel
 
-# Default values
+# Training Configuration
 DATA_PATH="/home/rishabh/Desktop/Datasets/lrs3/433h_data"
 CONFIG="configs/clip_whisper.yaml"
 OUTPUT_DIR="outputs/clip_whisper"
@@ -12,195 +12,67 @@ BATCH_SIZE=2
 MAX_EPOCHS=5
 MODALITY="both"  # audio, video, or both
 SAVE_EVERY=1
-FP16="true"
-USE_4BIT="true"
-NO_LORA="false"  # By default, use LoRA
-RESUME_FROM=""
-DEBUG_MODE="false"  # Debug logging mode
-MAX_SEQ_LEN=1536  # Default to 1536 (can be overridden via command line)
-LOG_LEVEL="info"  # Default log level for file logging
-CONSOLE_LEVEL="$LOG_LEVEL"  # Default: console level matches log level
-CONNECTOR_TYPE="simple"  # Default to simple connector
-MAX_GRAD_NORM=0.5  # Default gradient clipping value (0.5 for stable training)
-LEARNING_RATE="5e-6"  # Default learning rate for stable training
-
-# Parse command line arguments
-while [[ $# -gt 0 ]]; do
-  case $1 in
-    --data_path)
-      DATA_PATH="$2"
-      shift 2
-      ;;
-    --config)
-      CONFIG="$2"
-      shift 2
-      ;;
-    --output_dir)
-      OUTPUT_DIR="$2"
-      shift 2
-      ;;
-    --llm_path)
-      LLM_PATH="$2"
-      shift 2
-      ;;
-    --whisper_model)
-      WHISPER_MODEL="$2"
-      shift 2
-      ;;
-    --clip_model)
-      CLIP_MODEL="$2"
-      shift 2
-      ;;
-    --batch_size)
-      BATCH_SIZE="$2"
-      shift 2
-      ;;
-    --max_epochs)
-      MAX_EPOCHS="$2"
-      shift 2
-      ;;
-    --modality)
-      MODALITY="$2"
-      shift 2
-      ;;
-    --save_every)
-      SAVE_EVERY="$2"
-      shift 2
-      ;;
-    --fp16)
-      FP16="true"
-      shift
-      ;;
-    --use_4bit)
-      USE_4BIT="true"
-      shift
-      ;;
-    --no_lora)
-      NO_LORA="true"
-      shift
-      ;;
-    --resume_from)
-      RESUME_FROM="$2"
-      shift 2
-      ;;
-    --debug)
-      DEBUG_MODE="true"
-      LOG_LEVEL="debug"
-      shift
-      ;;
-    --log_level)
-      LOG_LEVEL="$2"
-      shift 2
-      ;;
-    --console_level)
-      CONSOLE_LEVEL="$2"
-      shift 2
-      ;;
-    --max_seq_len)
-      MAX_SEQ_LEN="$2"
-      shift 2
-      ;;
-    --connector_type)
-      CONNECTOR_TYPE="$2"
-      shift 2
-      ;;
-    --max_grad_norm)
-      MAX_GRAD_NORM="$2"
-      shift 2
-      ;;
-    --learning_rate)
-      LEARNING_RATE="$2"
-      shift 2
-      ;;
-    *)
-      echo "Unknown option: $1"
-      exit 1
-      ;;
-  esac
-done
-
-# Check if data path is provided
-if [ -z "$DATA_PATH" ]; then
-  echo "Error: data_path must be specified"
-  exit 1
-fi
-
-# Create output directory if it doesn't exist
-mkdir -p $OUTPUT_DIR
+FP16=true
+USE_4BIT=true
+NO_LORA=false
+MAX_SEQ_LEN=1536
+CONNECTOR_TYPE="simple"
+MAX_GRAD_NORM=0.5
+LEARNING_RATE="5e-6"
 
 # Print configuration
-echo "Training ClipWhisperModel with the following configuration:"
-echo "======================"
-echo "Data path: $DATA_PATH"
-echo "Output path: $OUTPUT_DIR"
-echo "LLM path: $LLM_PATH"
-echo "Whisper model: $WHISPER_MODEL"
-echo "CLIP model: $CLIP_MODEL"
-echo "Config file: $CONFIG"
-echo "Batch size: $BATCH_SIZE"
+echo "Starting training with the following configuration:"
+echo "-----------------------------------------------"
+echo "Data Path: $DATA_PATH"
+echo "Output Directory: $OUTPUT_DIR"
+echo "Batch Size: $BATCH_SIZE"
+echo "Max Epochs: $MAX_EPOCHS"
 echo "Modality: $MODALITY"
-echo "Max epochs: $MAX_EPOCHS"
-echo "Save checkpoint every: $SAVE_EVERY epochs"
-echo "Logging parameter updates: $([ -n "$LOG_PARAM_UPDATES" ] && echo "Yes" || echo "False")"
-echo "Using mixed precision (FP16): $([ "$FP16" == "true" ] && echo "True" || echo "False")"
-echo "Using 4-bit quantization: $([ "$USE_4BIT" == "true" ] && echo "True" || echo "False")"
-echo "Using LoRA: $([ "$NO_LORA" == "false" ] && echo "Yes" || echo "No")"
-echo "Debug mode: ${DEBUG_MODE^}"
-echo "Log level: $LOG_LEVEL"
-echo "Console level: $CONSOLE_LEVEL"
-echo "Max sequence length: $MAX_SEQ_LEN"
-echo "Connector type: $CONNECTOR_TYPE"
-echo "Max gradient norm: $MAX_GRAD_NORM"
-echo "Learning rate: $LEARNING_RATE"
+echo "FP16: $FP16"
+echo "4-bit Quantization: $USE_4BIT"
+echo "LoRA: $([ "$NO_LORA" = "true" ] && echo "Disabled" || echo "Enabled")"
+echo "-----------------------------------------------"
 
-# Build command
-CMD="python scripts/clip_whisper/train.py \
-  --config $CONFIG \
-  --output_dir $OUTPUT_DIR \
-  --data_path $DATA_PATH \
-  --llm_path $LLM_PATH \
-  --whisper_model $WHISPER_MODEL \
-  --clip_model $CLIP_MODEL \
-  --batch_size $BATCH_SIZE \
-  --max_epochs $MAX_EPOCHS \
-  --modality $MODALITY \
-  --save_every $SAVE_EVERY \
-  --max_seq_len $MAX_SEQ_LEN \
-  --log_level $LOG_LEVEL \
-  --console_level $CONSOLE_LEVEL \
-  --connector_type $CONNECTOR_TYPE \
-  --max_grad_norm $MAX_GRAD_NORM \
-  --learning_rate $LEARNING_RATE"
-
-# Add optional arguments
+# Prepare boolean flags
+FP16_FLAG=""
 if [ "$FP16" = "true" ]; then
-  CMD="$CMD --fp16"
+    FP16_FLAG="--fp16"
 fi
 
+USE_4BIT_FLAG=""
 if [ "$USE_4BIT" = "true" ]; then
-  CMD="$CMD --use_4bit"
+    USE_4BIT_FLAG="--use_4bit"
 fi
 
+NO_LORA_FLAG=""
 if [ "$NO_LORA" = "true" ]; then
-  CMD="$CMD --no_lora"
+    NO_LORA_FLAG="--no_lora"
 fi
 
-if [ -n "$LOG_PARAM_UPDATES" ]; then
-  CMD="$CMD --log_param_updates"
-fi
-
-if [ -n "$RESUME_FROM" ]; then
-  CMD="$CMD --resume_from $RESUME_FROM"
-fi
-
-echo "Starting training with modality: $MODALITY..."
-echo "Executing: $CMD"
-$CMD
+# Run training
+python scripts/clip_whisper/train.py \
+    --data_path "$DATA_PATH" \
+    --config "$CONFIG" \
+    --output_dir "$OUTPUT_DIR" \
+    --llm_path "$LLM_PATH" \
+    --whisper_model "$WHISPER_MODEL" \
+    --clip_model "$CLIP_MODEL" \
+    --batch_size "$BATCH_SIZE" \
+    --max_epochs "$MAX_EPOCHS" \
+    --modality "$MODALITY" \
+    --save_every "$SAVE_EVERY" \
+    $FP16_FLAG \
+    $USE_4BIT_FLAG \
+    $NO_LORA_FLAG \
+    --max_seq_len "$MAX_SEQ_LEN" \
+    --connector_type "$CONNECTOR_TYPE" \
+    --max_grad_norm "$MAX_GRAD_NORM" \
+    --learning_rate "$LEARNING_RATE"
 
 # Check if training was successful
-if [ $? -ne 0 ]; then
-  echo "Training failed with exit code $?"
-  exit 1
-fi
-
-echo "Training completed successfully!" 
+if [ $? -eq 0 ]; then
+    echo "Training completed successfully!"
+else
+    echo "Training failed. Check the logs for more information."
+    exit 1
+fi 

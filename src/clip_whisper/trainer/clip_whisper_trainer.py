@@ -276,36 +276,22 @@ class ClipWhisperTrainer:
             gc.collect()
     
     def _train_epoch(self, epoch):
-        """Train for one epoch"""
+        """Train for one epoch with simplified logging"""
         self.model.train()
         train_loss = 0.0
         num_batches = len(self.train_dataloader)
         
-        # Clear cache only at start of epoch
-        torch.cuda.empty_cache()
-        gc.collect()
-        
-        # Initialize gradient scaling for mixed precision
-        scaler = torch.amp.GradScaler('cuda' if torch.cuda.is_available() else 'cpu', enabled=self.fp16)
-        
-        # Track statistics for logging
-        batch_times = []
-        data_times = []
-        forward_times = []
-        backward_times = []
+        # Initialize gradient scaler for mixed precision training
+        scaler = torch.cuda.amp.GradScaler(enabled=self.fp16)
         
         tqdm_desc = f"Epoch {epoch+1}/{self.max_epochs}"
         pbar = tqdm(enumerate(self.train_dataloader), total=num_batches, desc=tqdm_desc)
         
-        data_start = time.time()
         for batch_idx, batch in pbar:
             # Process batch
             batch_dict = self._process_batch(batch, batch_idx, is_train=True)
             
-            # Record forward pass time
-            forward_start = time.time()
-            
-            # Wrap forward pass in a context manager to clear memory
+            # Forward pass with mixed precision
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=self.fp16):
                 outputs = self.model(**batch_dict)
                 loss = outputs["loss"] / self.grad_accum_steps
@@ -313,11 +299,7 @@ class ClipWhisperTrainer:
             # Scale loss and backpropagate
             scaler.scale(loss).backward()
             
-            # Record backward pass time
-            backward_time = time.time() - forward_start
-            backward_times.append(backward_time)
-            
-            # Only update every grad_accum_steps or at the end of epoch
+            # Update every grad_accum_steps or at end of epoch
             if (batch_idx + 1) % self.grad_accum_steps == 0 or batch_idx == num_batches - 1:
                 scaler.step(self.optimizer)
                 scaler.update()
@@ -329,52 +311,14 @@ class ClipWhisperTrainer:
             train_loss += loss.item() * self.grad_accum_steps
             
             # Update progress bar
-            forward_time = time.time() - forward_start
-            forward_times.append(forward_time)
+            pbar.set_postfix({
+                'loss': f"{train_loss / (batch_idx + 1):.4f}",
+                'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}"
+            })
             
-            batch_time = time.time() - data_start
-            batch_times.append(batch_time)
-            
-            # Update progress bar with batch statistics
-            if batch_idx % self.log_interval == 0:
-                avg_loss = train_loss / (batch_idx + 1)
-                avg_batch_time = sum(batch_times) / len(batch_times) if batch_times else 0
-                avg_forward_time = sum(forward_times) / len(forward_times) if forward_times else 0
-                avg_backward_time = sum(backward_times) / len(backward_times) if backward_times else 0
-                
-                pbar.set_postfix({
-                    'loss': f"{avg_loss:.4f}",
-                    'batch_time': f"{avg_batch_time:.3f}s",
-                    'fw_time': f"{avg_forward_time:.3f}s",
-                    'bw_time': f"{avg_backward_time:.3f}s",
-                })
-            
-            # Start timing data loading for next batch
-            data_start = time.time()
-            
+            # Only log every 100 batches
             if batch_idx % 100 == 0:
-                logging.info(f"Epoch {epoch} - Batch {batch_idx} - Loss: {loss.item():.4f}")
-        
-        # Clear cache at end of epoch
-        torch.cuda.empty_cache()
-        gc.collect()
-        
-        # Add video frame statistics tracking
-        video_lengths = []
-        
-        for batch_idx, batch in pbar:
-            # Track video lengths
-            if "video" in batch_dict and batch_dict["video"] is not None:
-                video_lengths.append(batch_dict["video"].size(1))  # Number of frames
-            
-            # ... existing training code ...
-        
-        # Log video statistics at end of epoch
-        if video_lengths:
-            min_frames = min(video_lengths)
-            max_frames = max(video_lengths)
-            avg_frames = sum(video_lengths) / len(video_lengths)
-            logging.info(f"Video frame stats - Min: {min_frames}, Max: {max_frames}, Avg: {avg_frames:.1f}")
+                logging.debug(f"Batch {batch_idx} - Loss: {loss.item():.4f}")
         
         return train_loss / num_batches
     
@@ -458,7 +402,6 @@ class ClipWhisperTrainer:
             batch_dict = {
                 "audio": audio.to(self.device) if audio is not None else None,
                 "video": video.to(self.device) if video is not None else None,
-                "text": text.to(self.device) if text is not None else None,
                 "labels": text.to(self.device) if text is not None else None,
                 "return_loss": True
             }
@@ -491,8 +434,8 @@ class ClipWhisperTrainer:
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
                     batch_dict[k] = v.to(self.device)
-                elif k in ["text", "prompt", "labels"] and isinstance(v, list):
-                    # Handle list inputs for text, prompt, or labels
+                elif k in ["labels", "prompt"] and isinstance(v, list):
+                    # Handle list inputs for labels or prompt
                     if all(isinstance(item, torch.Tensor) for item in v):
                         batch_dict[k] = torch.stack([item.to(self.device) for item in v])
                     elif all(isinstance(item, (list, tuple)) for item in v):
@@ -721,47 +664,15 @@ class ClipWhisperTrainer:
             logging.error(f"Error displaying component summary: {e}")
     
     def _log_training_info(self):
-        """Log information about the training configuration"""
+        """Log essential training configuration"""
         logging.info("=" * 50)
-        logging.info("ClipWhisperTrainer Configuration:")
-        logging.info("-" * 50)
-        logging.info(f"Output directory: {self.output_dir}")
-        logging.info(f"Max epochs: {self.max_epochs}")
-        logging.info(f"Learning rate: {self.learning_rate}")
-        logging.info(f"Weight decay: {self.weight_decay}")
-        logging.info(f"Device: {self.device}")
-        logging.info(f"FP16 mixed precision: {self.fp16}")
-        logging.info(f"Gradient accumulation steps: {self.grad_accum_steps}")
-        logging.info(f"Log interval: {self.log_interval}")
-        logging.info(f"Save checkpoint every: {self.save_every} epochs")
-        if self.save_steps:
-            logging.info(f"Save checkpoint every: {self.save_steps} steps")
-        logging.info(f"Max gradient norm: {self.max_grad_norm}")
-        logging.info(f"Logging parameter updates: {self.log_param_updates}")
-        
-        # Safely log dataset sizes
-        try:
-            if hasattr(self.train_dataloader, 'dataset') and hasattr(self.train_dataloader.dataset, '__len__'):
-                logging.info(f"Training samples: {len(self.train_dataloader.dataset)}")
-            else:
-                logging.info(f"Training batches: {len(self.train_dataloader)}")
-                
-            if hasattr(self, 'val_dataloader') and self.val_dataloader is not None:
-                if hasattr(self.val_dataloader, 'dataset') and hasattr(self.val_dataloader.dataset, '__len__'):
-                    logging.info(f"Validation samples: {len(self.val_dataloader.dataset)}")
-                else:
-                    logging.info(f"Validation batches: {len(self.val_dataloader)}")
-            else:
-                logging.info("Validation dataset: Not available")
-        except Exception as e:
-            logging.warning(f"Could not determine dataset size: {e}")
-        
-        logging.info("-" * 50)
-        
-        # Log model architecture
-        if hasattr(self.model, "_log_model_architecture"):
-            self.model._log_model_architecture()
-        logging.info("=" * 50) 
+        logging.info("Training Configuration:")
+        logging.info(f"• Epochs: {self.max_epochs}")
+        logging.info(f"• Learning Rate: {self.learning_rate}")
+        logging.info(f"• Batch Size: {self.train_dataloader.batch_size}")
+        logging.info(f"• Device: {self.device}")
+        logging.info(f"• FP16: {self.fp16}")
+        logging.info("=" * 50)
 
     def _log_memory_usage(self, stage):
         # Add detailed memory tracking

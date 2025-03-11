@@ -400,7 +400,7 @@ class ClipWhisperModel(nn.Module):
         
         return prompt_embeds
 
-    def forward(self, audio=None, video=None, prompt=None, labels=None, text=None, return_loss=True):
+    def forward(self, audio=None, video=None, prompt=None, labels=None, return_loss=True):
         """Forward pass for the model."""
         if self.use_fp16:
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
@@ -408,26 +408,24 @@ class ClipWhisperModel(nn.Module):
                 if not hasattr(self, '_current_batch_idx'):
                     self._current_batch_idx = 0
                 
+                # Only log audio conversion once
+                if self._current_batch_idx == 0 and audio is not None:
+                    logging.info(f"Audio input dtype: {audio.dtype} -> float16")
+                
                 # Reduce logging frequency
                 if self._current_batch_idx % 100 == 0:
-                    self._log_memory_usage("Before encoding")
-                    if audio is not None:  # Add safety check
-                        logging.info(f"[Batch {self._current_batch_idx}] AUDIO SEQ MONITOR: Raw input shape = {audio.shape}")
-                    
+                    if audio is not None:
+                        logging.debug(f"[Batch {self._current_batch_idx}] Audio shape: {audio.shape}")
+                
                 encoder_output, attention_mask = self.encode(audio, video, prompt)
                 
                 if self._current_batch_idx % 100 == 0:
-                    self._log_memory_usage("After encoding")
-                    logging.info(f"[Batch {self._current_batch_idx}] AUDIO SEQ MONITOR: Projected features shape = {encoder_output.shape}")
+                    logging.debug(f"[Batch {self._current_batch_idx}] Features shape: {encoder_output.shape}")
                 
                 # Update batch index
                 self._current_batch_idx += 1
                 
-                # If text is provided but labels aren't, use text as labels
-                if labels is None and text is not None:
-                    labels = text
-                
-                # Mask padding tokens in labels (if any)
+                # Remove the fallback to text
                 if labels is not None:
                     labels[labels == self.tokenizer.pad_token_id] = -100
                     
@@ -466,10 +464,6 @@ class ClipWhisperModel(nn.Module):
                 else:
                     return {"logits": outputs.logits}
         else:
-            # If text is provided but labels aren't, use text as labels
-            if labels is None and text is not None:
-                labels = text
-            
             # Encode inputs
             encoder_output, attention_mask = self.encode(audio, video, prompt)
             

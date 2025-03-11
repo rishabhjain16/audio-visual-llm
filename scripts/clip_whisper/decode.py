@@ -440,11 +440,9 @@ def main():
                 if "video" in batch and args.modality in ["video", "both"]:
                     inputs_for_model["video"] = batch["video"].to(args.device)
 
-                # Add text input if available (use 'labels' or 'text' as in training)
+                # Add labels if available
                 if "labels" in batch:
                     inputs_for_model["labels"] = batch["labels"].to(args.device)
-                elif "text" in batch:
-                    inputs_for_model["text"] = batch["text"].to(args.device)
                 
                 # Special check for video format seen in the logs
                 if args.verbose and batch_idx < 5:
@@ -516,12 +514,11 @@ def main():
                 with torch.no_grad():
                     outputs = model(**inputs_for_model, return_loss=True)
 
-                # Calculate loss if text/labels are available
-                if "labels" in inputs_for_model or "text" in inputs_for_model:
+                # Calculate loss if labels are available
+                if "labels" in inputs_for_model:
                     if hasattr(outputs, 'logits'):
                         logits = outputs.logits
-                        labels = inputs_for_model.get("labels", inputs_for_model.get("text"))
-                        loss = model.calculate_loss(logits, labels)
+                        loss = model.calculate_loss(logits, inputs_for_model["labels"])
                         logging.info(f"Batch {batch_idx} - Loss: {loss.item():.4f}")
                 
                 # Process outputs

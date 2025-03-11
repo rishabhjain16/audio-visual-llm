@@ -73,12 +73,6 @@ def parse_args():
                         help="Resume training from checkpoint")
     parser.add_argument("--max_seq_len", type=int, default=None,
                         help="Maximum sequence length for encoder output (overrides config)")
-    parser.add_argument("--log_level", type=str.lower, default="info",
-                        choices=["debug", "info", "warning", "error", "critical"],
-                        help="Logging level for file output")
-    parser.add_argument("--console_level", type=str.lower, default=None,
-                        choices=["debug", "info", "warning", "error", "critical"],
-                        help="Logging level for console output (defaults to log_level if not set)")
     parser.add_argument("--connector_type", type=str, default="simple",
                         choices=["simple", "deep", "conv", "attention", "adaptive", "cross_modal", "qformer", "perceiver"],
                         help="Type of connector to use for modality projection")
@@ -94,60 +88,47 @@ def load_config(config_path):
     return config
 
 
-def setup_dual_logging(log_level, console_level=None, log_file=None):
-    """Set up logging with different levels for console and file."""
-    if console_level is None:
-        console_level = log_level
-    
-    log_level = log_level.upper()
-    console_level = console_level.upper()
-    
+def setup_default_logging(output_dir):
+    """Set up default logging configuration"""
     # Create root logger
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)  # Capture everything, then filter at handlers
+    root_logger.setLevel(logging.INFO)  # Default to INFO level
     
     # Clear any existing handlers
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
     
-    # Create formatters
-    file_formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s', 
-                                      datefmt='%Y-%m-%d %H:%M:%S')
-    console_formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s', 
-                                         datefmt='%Y-%m-%d %H:%M:%S')
+    # Create formatter
+    formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s', 
+                                 datefmt='%Y-%m-%d %H:%M:%S')
     
-    # Create console handler with specified level
+    # Create console handler
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(getattr(logging, console_level))
-    console_handler.setFormatter(console_formatter)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
     root_logger.addHandler(console_handler)
     
-    # Create file handler if a log file is specified
-    if log_file:
-        os.makedirs(os.path.dirname(log_file), exist_ok=True)
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setLevel(getattr(logging, log_level))
-        file_handler.setFormatter(file_formatter)
-        root_logger.addHandler(file_handler)
+    # Create file handler
+    log_file = os.path.join(output_dir, "training.log")
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
     
-    # Silence external libraries (but still log according to console/file levels)
+    # Silence external libraries
     for logger_name in logging.root.manager.loggerDict:
         if logger_name not in ['root', 'clip_whisper']:
             logging.getLogger(logger_name).setLevel(logging.WARNING)
     
-    logging.info(f"Logging configured with level {log_level} (file) and {console_level} (console)")
+    logging.info("Default logging configured")
 
 
 def main():
     args = parse_args()
     
-    # Set console level to log_level if not specified
-    if args.console_level is None:
-        args.console_level = args.log_level
-    
-    # Setup logging with dual levels
-    log_file = os.path.join(args.output_dir, "training.log") if args.output_dir else None
-    setup_dual_logging(args.log_level, args.console_level, log_file)
+    # Set up default logging
+    setup_default_logging(args.output_dir)
     
     config_path = args.config if args.config else None
     config = load_config(config_path) if config_path else {}
