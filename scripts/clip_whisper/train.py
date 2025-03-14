@@ -229,7 +229,7 @@ def main():
     
     # Add gradient clipping to stabilize training
     max_grad_norm = config.get("max_grad_norm", 1.0)
-    logging.info(f"Using gradient clipping with max_grad_norm={max_grad_norm}")
+    logging.info(f"Using gradient clipping with grad_clip={max_grad_norm}")
     
     # Create dataloaders - with robust error handling
     try:
@@ -261,7 +261,7 @@ def main():
         log_interval=config.get("log_every", 10),
         save_every=config.get("save_every", 0),
         save_steps=config.get("save_steps", None),
-        max_grad_norm=max_grad_norm,  # Pass max_grad_norm to trainer
+        grad_clip=max_grad_norm,
         warmup_steps=config.get("warmup_steps", 0),
         log_param_updates=config.get("log_param_updates", False),
     )

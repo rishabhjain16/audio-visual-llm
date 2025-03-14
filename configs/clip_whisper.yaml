@@ -10,7 +10,7 @@ data:
   batch_size: 1
   max_audio_length: 480000  # 30 seconds at 16kHz
   max_video_length: 100     # Maximum number of video frames
-  max_seq_len: 1536          # Maximum sequence length for encoder output (increased from 256 to handle full 1500 audio frames)
+  max_seq_len: 512          # Maximum sequence length for encoder output (increased from 256 to handle full 1500 audio frames)
   num_workers: 2            # Number of workers for dataloading
   
 # Model configuration

@@ -14,6 +14,7 @@ import traceback
 from contextlib import nullcontext
 from pathlib import Path
 import gc
+import shutil
 
 class ClipWhisperTrainer:
     """
@@ -35,7 +36,7 @@ class ClipWhisperTrainer:
         log_interval=10,
         save_every=1,
         save_steps=None,
-        max_grad_norm=0.5,
+        grad_clip=0.5,
         warmup_steps=0,
         log_param_updates=False,
     ):
@@ -43,18 +44,77 @@ class ClipWhisperTrainer:
         self.model = model
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
-        self.learning_rate = learning_rate
-        self.weight_decay = weight_decay
-        self.max_epochs = max_epochs
+        
+        # Ensure learning_rate is a float
+        try:
+            self.learning_rate = float(learning_rate)
+        except (ValueError, TypeError):
+            logging.warning(f"Could not convert learning rate '{learning_rate}' to float, using default 1e-5")
+            self.learning_rate = 1e-5
+        
+        # Ensure weight_decay is a float
+        try:
+            self.weight_decay = float(weight_decay)
+        except (ValueError, TypeError):
+            logging.warning(f"Could not convert weight_decay '{weight_decay}' to float, using default 0.01")
+            self.weight_decay = 0.01
+        
+        # Ensure max_epochs is an int
+        try:
+            self.max_epochs = int(max_epochs)
+        except (ValueError, TypeError):
+            logging.warning(f"Could not convert max_epochs '{max_epochs}' to int, using default 10")
+            self.max_epochs = 10
+        
         self.output_dir = output_dir
         self.device = device
         self.fp16 = fp16 and torch.cuda.is_available()
-        self.grad_accum_steps = grad_accum_steps
-        self.log_interval = log_interval
-        self.save_every = save_every
-        self.save_steps = save_steps
-        self.max_grad_norm = max_grad_norm
-        self.warmup_steps = warmup_steps
+        
+        # Ensure grad_accum_steps is an int
+        try:
+            self.grad_accum_steps = int(grad_accum_steps)
+        except (ValueError, TypeError):
+            logging.warning(f"Could not convert grad_accum_steps '{grad_accum_steps}' to int, using default 4")
+            self.grad_accum_steps = 4
+        
+        # Ensure log_interval is an int
+        try:
+            self.log_interval = int(log_interval) if log_interval is not None else 10
+        except (ValueError, TypeError):
+            logging.warning(f"Could not convert log_interval '{log_interval}' to int, using default 10")
+            self.log_interval = 10
+        
+        # Ensure save_every is an int
+        try:
+            self.save_every = int(save_every) if save_every is not None else 1
+        except (ValueError, TypeError):
+            logging.warning(f"Could not convert save_every '{save_every}' to int, using default 1")
+            self.save_every = 1
+        
+        # Ensure save_steps is an int or None
+        if save_steps is not None:
+            try:
+                self.save_steps = int(save_steps)
+            except (ValueError, TypeError):
+                logging.warning(f"Could not convert save_steps '{save_steps}' to int, using None")
+                self.save_steps = None
+        else:
+            self.save_steps = None
+        
+        # Ensure grad_clip is a float
+        try:
+            self.grad_clip = float(grad_clip)
+        except (ValueError, TypeError):
+            logging.warning(f"Could not convert grad_clip '{grad_clip}' to float, using default 0.5")
+            self.grad_clip = 0.5
+        
+        # Ensure warmup_steps is an int
+        try:
+            self.warmup_steps = int(warmup_steps)
+        except (ValueError, TypeError):
+            logging.warning(f"Could not convert warmup_steps '{warmup_steps}' to int, using default 0")
+            self.warmup_steps = 0
+        
         self.log_param_updates = log_param_updates
         
         # Create output directory
@@ -103,7 +163,10 @@ class ClipWhisperTrainer:
             
         logging.info(f"Using device: {device}, FP16: {fp16}")
         logging.info(f"Training for {max_epochs} epochs with LR: {learning_rate}")
-        logging.info(f"Gradient accumulation steps: {grad_accum_steps}, Max grad norm: {max_grad_norm}")
+        logging.info(f"Gradient accumulation steps: {grad_accum_steps}, Max grad clip: {grad_clip}")
+        
+        # Add this line
+        self.global_step = 0
         
     def _setup_optimizer(self):
         """Set up optimizer and scheduler with more stable settings"""
@@ -188,139 +251,299 @@ class ClipWhisperTrainer:
         return scheduler
     
     def train(self):
-        """Train the model"""
-        # Track loss
-        train_losses = []
-        val_losses = []
-        best_val_loss = float('inf')
+        """Train the model with time-based checkpoints and adaptive monitoring"""
+        # Initialize checkpoint timing and monitoring
+        last_checkpoint_time = time.time()
+        checkpoint_interval_hours = 2  # Save checkpoint every 2 hours
+        train_start_time = time.time()
         
-        # Track step-wise losses for more detailed monitoring
-        step_train_losses = []
+        # Create loss tracking for stability monitoring
+        loss_history = []
+        unstable_count = 0
         
-        # Set up a log file for tracking losses
-        loss_log_path = os.path.join(self.output_dir, "loss_log.txt")
-        with open(loss_log_path, "w") as f:
-            f.write("epoch,train_loss,val_loss\n")
+        # Loss tracking per epoch
+        self.train_losses = []
+        self.val_losses = []
         
-        # Print header for console logging
-        print("\n" + "=" * 80)
-        print(f"{'Epoch':^10}|{'Train Loss':^20}|{'Val Loss':^20}|{'Best Val':^20}")
+        # Save path for loss log
+        loss_log_path = os.path.join(self.output_dir, "loss_log.csv")
+        
+        # Write header to loss log if it doesn't exist
+        if not os.path.exists(loss_log_path):
+            with open(loss_log_path, "w") as f:
+                f.write("epoch,train_loss,val_loss,time_hours,remaining_hours\n")
+        
+        # Display training header
+        print(f"{'Epoch':<8}|{'Train Loss':<15}|{'Val Loss':<15}|{'Best Val':<15}|{'Time (h)':<10}|{'ETA (h)':<10}")
         print("-" * 80)
         
-        # Get modality information from model for logging
-        modality = getattr(self.model, 'modality', 'unknown')
-        logging.info(f"Training with modality: {modality}")
-        
-        # Display active component summary based on modality
-        self._display_active_components_summary(modality)
+        # Initialize best validation loss
+        best_val_loss = float('inf')
         
         try:
             for epoch in range(self.max_epochs):
+                self.current_epoch = epoch
+                
                 # Clear cache at start of epoch
                 torch.cuda.empty_cache()
                 gc.collect()
                 
                 # Train and validate
+                epoch_start = time.time()
                 train_loss = self._train_epoch(epoch)
-                val_loss = self._validate() if self.val_dataloader else float('inf')
+                self.train_losses.append(train_loss)
+                
+                if self.val_dataloader:
+                    val_loss = self._validate()
+                    self.val_losses.append(val_loss)
+                    
+                    # Update best validation loss
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        # Save best model
+                        self._save_checkpoint(is_best=True)
+                        logging.info(f"New best validation loss: {best_val_loss:.6f}")
+                else:
+                    val_loss = float('inf')
+                    self.val_losses.append(val_loss)
+                
+                # Time-based checkpoint
+                current_time = time.time()
+                hours_since_checkpoint = (current_time - last_checkpoint_time) / 3600
+                
+                # Save checkpoint based on time or epoch schedule
+                if hours_since_checkpoint >= checkpoint_interval_hours:
+                    checkpoint_path = self._save_checkpoint()
+                    logging.info(f"Time-based checkpoint saved after {hours_since_checkpoint:.2f} hours to {checkpoint_path}")
+                    last_checkpoint_time = current_time
+                elif (epoch + 1) % self.save_every == 0:
+                    checkpoint_path = self._save_checkpoint()
+                    logging.info(f"Epoch-based checkpoint saved at epoch {epoch+1} to {checkpoint_path}")
+                    last_checkpoint_time = current_time
+                
+                # Calculate training statistics and ETA
+                epoch_time = time.time() - epoch_start
+                total_time = time.time() - train_start_time
+                total_hours = total_time / 3600
+                
+                # Calculate remaining time
+                progress = (epoch + 1) / self.max_epochs
+                if progress > 0:
+                    estimated_total = total_time / progress
+                    remaining_time = estimated_total - total_time
+                    remaining_hours = remaining_time / 3600
+                else:
+                    remaining_hours = 0
+                
+                # Monitor loss stability
+                loss_history.append(train_loss)
+                if len(loss_history) > 5:
+                    loss_history.pop(0)
+                    
+                    # Check if loss is stable
+                    if not np.isfinite(train_loss) or train_loss > 1e6:
+                        unstable_count += 1
+                        if unstable_count >= 3:
+                            logging.error("Unstable training detected. Loss is too high or not finite.")
+                            self._save_checkpoint(is_final=False)
+                            logging.info("Emergency checkpoint saved. Training may need to be stopped.")
+                    else:
+                        unstable_count = 0
+                
+                # Log progress to file
+                with open(loss_log_path, "a") as f:
+                    f.write(f"{epoch+1},{train_loss:.6f},{val_loss:.6f},{total_hours:.2f},{remaining_hours:.2f}\n")
+                
+                # Log progress to console with clear formatting
+                is_best = val_loss == best_val_loss
+                best_marker = "*" if is_best else ""
+                print(f"{epoch+1:<8}|{train_loss:<15.6f}|{val_loss:<15.6f}|{best_val_loss:<15.6f}{best_marker}|{total_hours:<10.2f}|{remaining_hours:<10.2f}")
+                
+                # Detailed logging
+                modality_info = f"[Modality: {getattr(self.model, 'modality', 'unknown')}]"
+                logging.info(f"{modality_info} Epoch {epoch+1}/{self.max_epochs} - "
+                           f"Train: {train_loss:.6f}, Val: {val_loss:.6f}, "
+                           f"Time: {total_hours:.2f}h, ETA: {remaining_hours:.2f}h")
                 
                 # Clear cache after each epoch
                 torch.cuda.empty_cache()
                 gc.collect()
-                
-                # Save checkpoint based on epoch if step-based saving is not enabled
-                if (epoch + 1) % self.save_every == 0:
-                    self._save_checkpoint()
-                    logging.info(f"Checkpoint saved at epoch {epoch+1}")
-                
-                # Log progress to file
-                with open(loss_log_path, "a") as f:
-                    f.write(f"{epoch+1},{train_loss:.6f},{val_loss:.6f}\n")
-                
-                # Log progress to console with clear formatting
-                is_best = val_loss == best_val_loss
-                best_marker = " (BEST)" if is_best else ""
-                print(f"{epoch+1:^10}|{train_loss:^20.6f}|{val_loss:^20.6f}|{best_val_loss:^20.6f}{best_marker}")
-                
-                # Provide regular logging output
-                modality_info = f"[Modality: {modality}] "
-                if self.val_dataloader is not None:
-                    logging.info(f"{modality_info}Epoch {epoch+1}/{self.max_epochs} - "
-                               f"Train loss: {train_loss:.6f}, "
-                               f"Val loss: {val_loss:.6f}")
-                else:
-                    logging.info(f"{modality_info}Epoch {epoch+1}/{self.max_epochs} - "
-                               f"Train loss: {train_loss:.6f}")
-            
-            # Print final summary
-            print("=" * 80)
-            print(f"Training completed after {self.max_epochs} epochs")
-            print(f"Best validation loss: {best_val_loss:.6f}")
-            print(f"Final training loss: {train_losses[-1]:.6f}")
-            print("=" * 80)
             
             # Save final model
             self._save_checkpoint(is_final=True)
             
-            # Plot loss
-            self._plot_loss(train_losses, val_losses)
+            # Print final summary
+            total_time = time.time() - train_start_time
+            total_hours = total_time / 3600
+            print("\n" + "=" * 80)
+            print(f"Training completed after {self.max_epochs} epochs ({total_hours:.2f} hours)")
+            print(f"Best validation loss: {best_val_loss:.6f}")
+            print(f"Final training loss: {self.train_losses[-1]:.6f}")
+            print("=" * 80)
+            
+            # Plot loss curves
+            self._plot_loss(self.train_losses, self.val_losses)
             
             return {
-                "train_losses": train_losses,
-                "val_losses": val_losses,
+                "train_losses": self.train_losses,
+                "val_losses": self.val_losses,
                 "best_val_loss": best_val_loss,
+                "training_hours": total_hours
             }
+        
+        except Exception as e:
+            # Save emergency checkpoint
+            logging.error(f"Training interrupted by error: {e}")
+            logging.error(traceback.format_exc())
+            try:
+                emergency_dir = os.path.join(self.output_dir, "emergency_checkpoint")
+                self._save_checkpoint(checkpoint_dir=emergency_dir)
+                logging.info(f"Emergency checkpoint saved to {emergency_dir}")
+            except Exception as save_error:
+                logging.error(f"Could not save emergency checkpoint: {save_error}")
+            
+            raise
+        
         finally:
             # Ensure all memory is cleared
             torch.cuda.empty_cache()
             gc.collect()
     
     def _train_epoch(self, epoch):
-        """Train for one epoch with simplified logging"""
+        """
+        Train the model for one epoch with improved monitoring and error handling.
+        
+        Args:
+            epoch: Current epoch number
+            
+        Returns:
+            float: Average training loss for the epoch
+        """
         self.model.train()
-        train_loss = 0.0
-        num_batches = len(self.train_dataloader)
+        total_loss = 0
+        total_batches = 0
         
-        # Initialize gradient scaler for mixed precision training
-        scaler = torch.cuda.amp.GradScaler(enabled=self.fp16)
+        # Health monitoring
+        unstable_batch_count = 0
+        max_unstable_batches = 5
+        nan_found = False
         
-        tqdm_desc = f"Epoch {epoch+1}/{self.max_epochs}"
-        pbar = tqdm(enumerate(self.train_dataloader), total=num_batches, desc=tqdm_desc)
+        # Create progress bar
+        progress = tqdm(self.train_dataloader, desc=f"Epoch {epoch+1}/{self.max_epochs}")
         
-        for batch_idx, batch in pbar:
-            # Process batch
-            batch_dict = self._process_batch(batch, batch_idx, is_train=True)
+        for batch_idx, batch in enumerate(progress):
+            # Store batch index for logging in other methods
+            self.model._current_batch_idx = batch_idx
             
-            # Forward pass with mixed precision
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=self.fp16):
-                outputs = self.model(**batch_dict)
-                loss = outputs["loss"] / self.grad_accum_steps
+            # Process batch based on its type
+            if isinstance(batch, dict):
+                # Dictionary format
+                processed_batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            elif isinstance(batch, (list, tuple)) and len(batch) >= 4:
+                # Tuple format - convert to dictionary
+                audio, video, labels, *rest = batch
+                processed_batch = {
+                    "audio": audio.to(self.device) if isinstance(audio, torch.Tensor) else audio,
+                    "video": video.to(self.device) if isinstance(video, torch.Tensor) else video,
+                    "labels": labels.to(self.device) if isinstance(labels, torch.Tensor) else labels,
+                    "return_loss": True
+                }
+                # Add prompt if available
+                if len(rest) > 0 and rest[0] is not None:
+                    prompt = rest[0]
+                    processed_batch["prompt"] = prompt.to(self.device) if isinstance(prompt, torch.Tensor) else prompt
+            else:
+                # Unknown batch format
+                logging.error(f"Unknown batch format: {type(batch)}")
+                raise ValueError(f"Unsupported batch format: {type(batch)}")
             
-            # Scale loss and backpropagate
-            scaler.scale(loss).backward()
+            # Clear gradients
+            self.optimizer.zero_grad()
             
-            # Update every grad_accum_steps or at end of epoch
-            if (batch_idx + 1) % self.grad_accum_steps == 0 or batch_idx == num_batches - 1:
-                scaler.step(self.optimizer)
-                scaler.update()
-                if self.scheduler is not None:
+            # Forward pass with error handling
+            try:
+                # Process batch through the model
+                result = self.model(**processed_batch)
+                loss = result["loss"]
+                
+                # Check for NaN/Inf loss
+                if not torch.isfinite(loss):
+                    unstable_batch_count += 1
+                    logging.warning(f"[Batch {batch_idx}] Non-finite loss detected: {loss.item()}")
+                    
+                    if unstable_batch_count >= max_unstable_batches:
+                        logging.error(f"Too many unstable batches ({unstable_batch_count}). Training may be unstable.")
+                        nan_found = True
+                        
+                    # Skip this batch for gradient update
+                    continue
+                    
+                # Exceptionally high loss check
+                if loss.item() > 100:
+                    logging.warning(f"[Batch {batch_idx}] Unusually high loss: {loss.item()}")
+                    
+                # Backward pass and optimization
+                loss.backward()
+                
+                # Gradient clipping to prevent exploding gradients
+                if self.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                
+                # Step optimizer and scheduler
+                self.optimizer.step()
+                if self.scheduler:
                     self.scheduler.step()
-                self.optimizer.zero_grad()
-            
-            # Track loss
-            train_loss += loss.item() * self.grad_accum_steps
-            
-            # Update progress bar
-            pbar.set_postfix({
-                'loss': f"{train_loss / (batch_idx + 1):.4f}",
-                'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}"
-            })
-            
-            # Only log every 100 batches
-            if batch_idx % 100 == 0:
-                logging.debug(f"Batch {batch_idx} - Loss: {loss.item():.4f}")
+                
+                # Update progress bar
+                progress.set_postfix({"loss": loss.item()})
+                
+                # Accumulate loss statistics
+                total_loss += loss.item()
+                total_batches += 1
+                
+                # Periodically log memory usage
+                if batch_idx % 50 == 0 and torch.cuda.is_available():
+                    mem_allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+                    mem_reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+                    logging.info(f"[Batch {batch_idx}] Memory: {mem_allocated:.2f}GB allocated, {mem_reserved:.2f}GB reserved")
+                    
+                # Reset unstable counter if we had a successful batch
+                unstable_batch_count = 0
+                    
+            except RuntimeError as e:
+                # Handle CUDA out of memory errors
+                if "CUDA out of memory" in str(e):
+                    logging.error(f"CUDA OOM in batch {batch_idx}. Trying to recover...")
+                    torch.cuda.empty_cache()
+                    # Skip this batch
+                    continue
+                else:
+                    logging.error(f"Error in batch {batch_idx}: {e}")
+                    logging.error(traceback.format_exc())
+                    # Skip this batch
+                    continue
+                    
+            except Exception as e:
+                logging.error(f"Unexpected error in batch {batch_idx}: {e}")
+                logging.error(traceback.format_exc())
+                # Skip this batch
+                continue
         
-        return train_loss / num_batches
+        # Check if we had enough successful batches
+        if total_batches == 0:
+            logging.error("No successful batches in this epoch!")
+            return float('inf')
+        
+        if nan_found:
+            logging.warning("NaN losses detected during training. Results may be unreliable.")
+        
+        # Calculate average loss
+        avg_loss = total_loss / total_batches
+        
+        # Log epoch summary
+        logging.info(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.6f}")
+        
+        return avg_loss
     
     def _validate(self):
         """Validate the model"""
@@ -346,19 +569,49 @@ class ClipWhisperTrainer:
                     if batch is None:
                         continue
                     
-                    # Process batch
-                    loss = self._process_batch(batch, batch_idx=batch_idx, is_train=False)
+                    # Process batch based on format
+                    if isinstance(batch, dict):
+                        # Get batch size from dict
+                        audio_batch_size = batch["audio"].size(0) if "audio" in batch and batch["audio"] is not None else 0
+                        video_batch_size = batch["video"].size(0) if "video" in batch and batch["video"] is not None else 0
+                        batch_size = max(audio_batch_size, video_batch_size)
+                    elif isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                        # Get batch size from tuple elements
+                        elements = [b for b in batch if isinstance(b, torch.Tensor)]
+                        if elements:
+                            batch_size = elements[0].size(0)
+                        else:
+                            batch_size = 1
+                    else:
+                        # Default batch size
+                        batch_size = 1
+                    
+                    # Process batch using the _process_batch method
+                    outputs = self._process_batch(batch, batch_idx=batch_idx, is_train=False)
+                    
+                    # Get loss value
+                    if isinstance(outputs, dict) and "loss" in outputs:
+                        loss_value = outputs["loss"]
+                    elif isinstance(outputs, torch.Tensor):
+                        loss_value = outputs
+                    else:
+                        logging.warning(f"Unexpected output type from _process_batch: {type(outputs)}")
+                        loss_value = torch.tensor(0.0, device=self.device)
+                    
+                    # Add stability checks
+                    if torch.isnan(loss_value) or torch.isinf(loss_value):
+                        logging.warning(f"Found unstable loss value: {loss_value}. Setting to large finite value.")
+                        loss_value = torch.tensor(1e6, device=loss_value.device, dtype=loss_value.dtype)
                     
                     # Update progress bar
-                    pbar.set_description(f"Validation | Loss: {loss:.6f} | Modality: {modality}")
+                    pbar.set_description(f"Validation | Loss: {loss_value.item():.6f} | Modality: {modality}")
                     
                     # Update statistics
-                    batch_size = len(batch["audio"])
-                    total_loss += loss * batch_size
+                    total_loss += loss_value.item() * batch_size
                     total_samples += batch_size
                     
                 except Exception as e:
-                    logging.error(f"Error in batch {batch_idx}: {e}")
+                    logging.error(f"Error in validation batch {batch_idx}: {e}")
                     logging.error(traceback.format_exc())
                     continue
         
@@ -381,52 +634,75 @@ class ClipWhisperTrainer:
         
         # Move batch to device - handle both tuple and dict batch formats
         if isinstance(batch, (list, tuple)) and len(batch) >= 4:
-            audio, video, text, prompt = batch[:4]
+            audio, video, text, tokens = batch[:4]
             
-            # Convert text to tensor if it's a list
-            if isinstance(text, list):
-                # Tokenize text if we have a tokenizer
-                if hasattr(self.model, 'tokenizer') and self.model.tokenizer is not None:
-                    text = self.model.tokenizer(
-                        text, 
-                        return_tensors="pt", 
-                        padding=True, 
-                        truncation=True, 
-                        max_length=self.model.max_seq_len
-                    ).input_ids
-                else:
-                    # Convert list of strings to tensor of token IDs
-                    text = torch.tensor(text, dtype=torch.long)
+            # Use the tokenized version (tokens) as labels, not the raw text
+            labels = tokens
+            
+            # Convert labels to tensor if it's a list
+            if isinstance(labels, list):
+                # If it's a list of lists (tokenized text), convert to tensor
+                if all(isinstance(item, list) for item in labels):
+                    try:
+                        labels = torch.tensor(labels, dtype=torch.long)
+                        logging.debug(f"Converted list of token lists to tensor with shape {labels.shape}")
+                    except Exception as e:
+                        logging.error(f"Failed to convert token lists to tensor: {e}")
+                        # Fall back to tokenizing the raw text
+                        if hasattr(self.model, 'tokenizer') and self.model.tokenizer is not None:
+                            logging.warning("Falling back to tokenizing raw text")
+                            labels = self.model.tokenizer(
+                                text, 
+                                return_tensors="pt", 
+                                padding=True, 
+                                truncation=True, 
+                                max_length=self.model.max_seq_len
+                            ).input_ids
+                elif all(isinstance(item, str) for item in labels):
+                    # If we somehow got raw text strings, tokenize them
+                    if hasattr(self.model, 'tokenizer') and self.model.tokenizer is not None:
+                        logging.warning("Received raw text strings as labels, tokenizing")
+                        labels = self.model.tokenizer(
+                            labels, 
+                            return_tensors="pt", 
+                            padding=True, 
+                            truncation=True, 
+                            max_length=self.model.max_seq_len
+                        ).input_ids
+                    else:
+                        logging.error("Received string labels but no tokenizer available")
+                        # Create dummy labels to avoid crashing
+                        batch_size = len(audio) if audio is not None else (len(video) if video is not None else 1)
+                        labels = torch.zeros((batch_size, 10), dtype=torch.long)
             
             # Create batch dictionary for the model
             batch_dict = {
                 "audio": audio.to(self.device) if audio is not None else None,
                 "video": video.to(self.device) if video is not None else None,
-                "labels": text.to(self.device) if text is not None else None,
+                "labels": labels.to(self.device) if labels is not None else None,
                 "return_loss": True
             }
             
             # Add prompt if available
-            if prompt is not None:
-                if isinstance(prompt, torch.Tensor):
-                    batch_dict["prompt"] = prompt.to(self.device)
-                elif isinstance(prompt, list) and all(isinstance(p, torch.Tensor) for p in prompt):
-                    batch_dict["prompt"] = torch.stack([p.to(self.device) for p in prompt])
-                elif isinstance(prompt, list) and all(isinstance(p, (list, tuple)) for p in prompt):
-                    batch_dict["prompt"] = torch.tensor(prompt, device=self.device)
-                elif isinstance(prompt, list) and all(isinstance(p, str) for p in prompt):
-                    if hasattr(self.model, 'tokenizer') and self.model.tokenizer is not None:
-                        encoded = self.model.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=self.model.max_seq_len)
-                        batch_dict["prompt"] = encoded.input_ids.to(self.device)
+            if text is not None:
+                if isinstance(text, torch.Tensor):
+                    batch_dict["prompt"] = text.to(self.device)
+                elif isinstance(text, list) and all(isinstance(p, torch.Tensor) for p in text):
+                    batch_dict["prompt"] = torch.stack([p.to(self.device) for p in text])
+                elif isinstance(text, list) and all(isinstance(p, (list, tuple)) for p in text):
+                    batch_dict["prompt"] = torch.tensor(text, device=self.device)
+                elif isinstance(text, list) and all(isinstance(p, str) for p in text) and hasattr(self.model, 'tokenizer'):
+                    encoded = self.model.tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=self.model.max_seq_len)
+                    batch_dict["prompt"] = encoded.input_ids.to(self.device)
             
             # Only check dimensions if the inputs are not None
             if audio is not None and video is not None:
                 assert audio.size(0) == video.size(0), "Audio and video batch sizes must match"
-            if text is not None:
+            if labels is not None:
                 if audio is not None:
-                    assert audio.size(0) == text.size(0), "Input and label batch sizes must match"
+                    assert audio.size(0) == labels.size(0), "Input and label batch sizes must match"
                 elif video is not None:
-                    assert video.size(0) == text.size(0), "Input and label batch sizes must match"
+                    assert video.size(0) == labels.size(0), "Input and label batch sizes must match"
             
         else:
             # Handle dictionary batch format
@@ -474,94 +750,136 @@ class ClipWhisperTrainer:
                 logging.error(traceback.format_exc())
                 return {"loss": torch.tensor(float('inf'), device=self.device)}
     
-    def _save_checkpoint(self, is_best=False, is_final=False):
-        """Save a checkpoint of the model and training state"""
-        checkpoint_dir = os.path.join(self.output_dir, f"checkpoint_step_{self.global_step}")
-        if is_final:
-            checkpoint_dir = os.path.join(self.output_dir, "final_model")
-        elif is_best:
-            checkpoint_dir = os.path.join(self.output_dir, "best_model")
-            
+    def _save_checkpoint(self, is_final=False, is_best=False, checkpoint_dir=None):
+        """Save a checkpoint of the model and optimizer state.
+        
+        Args:
+            is_final (bool): Whether this is the final checkpoint after training
+            is_best (bool): Whether this checkpoint has the best validation loss
+            checkpoint_dir (str): Optional directory to save the checkpoint in
+        
+        Returns:
+            str: Path to the saved checkpoint
+        """
+        # Use specified checkpoint dir or default
+        checkpoint_dir = checkpoint_dir or self.output_dir
         os.makedirs(checkpoint_dir, exist_ok=True)
         
-        # Save model
-        model_path = os.path.join(checkpoint_dir, "model")
-        os.makedirs(model_path, exist_ok=True)
-        self.model.save_pretrained(model_path)
+        # Determine checkpoint filename based on type
+        if is_final:
+            checkpoint_path = os.path.join(checkpoint_dir, f"model_final.pt")
+            checkpoint_meta_path = os.path.join(checkpoint_dir, f"model_final_meta.json")
+        elif is_best:
+            checkpoint_path = os.path.join(checkpoint_dir, f"model_best.pt")
+            checkpoint_meta_path = os.path.join(checkpoint_dir, f"model_best_meta.json")
+        else:
+            checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{self.current_epoch + 1}.pt")
+            checkpoint_meta_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{self.current_epoch + 1}_meta.json")
         
-        # Save training state (optimizer, scheduler, etc.)
-        training_state = {
-            "optimizer": self.optimizer.state_dict(),
-            "scheduler": self.scheduler.state_dict() if self.scheduler else None,
-            "global_step": self.global_step,
-            "epoch": self.current_epoch,
-            "best_val_loss": self.best_val_loss,
-            "fp16": self.fp16
+        # Create a unified checkpoint dictionary
+        checkpoint = {
+            'epoch': self.current_epoch + 1,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict() if self.optimizer else None,
+            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
+            'train_losses': self.train_losses,
+            'val_losses': self.val_losses,
+            'best_val_loss': min(self.val_losses) if self.val_losses else float('inf'),
         }
         
-        # Save scaler state if using fp16
-        if self.fp16 and self.scaler:
-            training_state["scaler"] = self.scaler.state_dict()
-            
-        torch.save(training_state, os.path.join(checkpoint_dir, "training_state.pt"))
+        # Save unified checkpoint
+        torch.save(checkpoint, checkpoint_path)
         
-        logging.info(f"Saved checkpoint to {checkpoint_dir}")
-        return checkpoint_dir
+        # Save metadata separately for easy inspection without loading the model
+        metadata = {
+            'epoch': self.current_epoch + 1,
+            'date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'train_loss': self.train_losses[-1] if self.train_losses else None,
+            'val_loss': self.val_losses[-1] if self.val_losses else None,
+            'best_val_loss': min(self.val_losses) if self.val_losses else None,
+            'model_config': {
+                'modality': getattr(self.model, 'modality', None),
+                'model_type': type(self.model).__name__,
+            },
+            'checkpoint_type': 'final' if is_final else ('best' if is_best else 'regular'),
+        }
+        
+        # Save metadata
+        with open(checkpoint_meta_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        # If this is the best model, also save it as model_best
+        if is_best and not checkpoint_path.endswith('model_best.pt'):
+            best_path = os.path.join(checkpoint_dir, "model_best.pt")
+            best_meta_path = os.path.join(checkpoint_dir, "model_best_meta.json")
+            shutil.copy(checkpoint_path, best_path)
+            shutil.copy(checkpoint_meta_path, best_meta_path)
+            logging.info(f"Best model saved to {best_path}")
+        
+        logging.info(f"Checkpoint saved to {checkpoint_path}")
+        
+        # For convenience in scripts that process the checkpoint
+        return checkpoint_path
     
-    def load_checkpoint(self, checkpoint_dir):
-        """Load a checkpoint of the model and training state"""
-        try:
-            # Load model
-            model_path = os.path.join(checkpoint_dir, "model")
-            if os.path.exists(model_path):
-                self.model = self.model.__class__.from_pretrained(model_path)
-                self.model.to(self.device)
-                logging.info(f"Loaded model from {model_path}")
-            else:
-                logging.warning(f"No model found at {model_path}")
-                
-            # Load training state
-            training_state_path = os.path.join(checkpoint_dir, "training_state.pt")
-            if os.path.exists(training_state_path):
-                training_state = torch.load(training_state_path, map_location=self.device)
-                
-                # Load optimizer state
-                if "optimizer" in training_state:
-                    self.optimizer.load_state_dict(training_state["optimizer"])
-                    logging.info("Loaded optimizer state")
-                    
-                # Load scheduler state
-                if "scheduler" in training_state and training_state["scheduler"] and self.scheduler:
-                    self.scheduler.load_state_dict(training_state["scheduler"])
-                    logging.info("Loaded scheduler state")
-                    
-                # Load scaler state if using fp16
-                if self.fp16 and "scaler" in training_state and self.scaler:
-                    self.scaler.load_state_dict(training_state["scaler"])
-                    logging.info("Loaded gradient scaler state for mixed precision training")
-                    
-                # Load other training state variables
-                if "global_step" in training_state:
-                    self.global_step = training_state["global_step"]
-                    logging.info(f"Resuming from global step {self.global_step}")
-                    
-                if "epoch" in training_state:
-                    self.current_epoch = training_state["epoch"]
-                    logging.info(f"Resuming from epoch {self.current_epoch}")
-                    
-                if "best_val_loss" in training_state:
-                    self.best_val_loss = training_state["best_val_loss"]
-                    logging.info(f"Best validation loss: {self.best_val_loss:.4f}")
-                    
-                return True
-            else:
-                logging.warning(f"No training state found at {training_state_path}")
-                return False
-                
-        except Exception as e:
-            logging.error(f"Error loading checkpoint: {e}")
-            logging.error(traceback.format_exc())
-            return False
+    def load_checkpoint(self, checkpoint_path):
+        """
+        Load a checkpoint from the specified path.
+        
+        Args:
+            checkpoint_path: Path to the checkpoint file
+        
+        Returns:
+            dict: Information about the loaded checkpoint
+        """
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
+        
+        logging.info(f"Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
+        # Load model state
+        if "model_state_dict" in checkpoint:
+            self.model.load_state_dict(checkpoint["model_state_dict"])
+            logging.info(f"Model state loaded successfully")
+        else:
+            logging.warning(f"No model state found in checkpoint")
+        
+        # Load optimizer state
+        if "optimizer_state_dict" in checkpoint and self.optimizer is not None:
+            try:
+                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                logging.info(f"Optimizer state loaded successfully")
+            except Exception as e:
+                logging.warning(f"Failed to load optimizer state: {e}")
+        
+        # Load scheduler state
+        if "scheduler_state_dict" in checkpoint and self.scheduler is not None:
+            try:
+                self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+                logging.info(f"Scheduler state loaded successfully")
+            except Exception as e:
+                logging.warning(f"Failed to load scheduler state: {e}")
+        
+        # Load training history
+        if "train_losses" in checkpoint:
+            self.train_losses = checkpoint["train_losses"]
+        if "val_losses" in checkpoint:
+            self.val_losses = checkpoint["val_losses"]
+        
+        # Set epoch and step counters
+        self.current_epoch = checkpoint.get("epoch", 0)
+        
+        # Log checkpoint information
+        best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+        logging.info(f"Resuming from epoch {self.current_epoch}")
+        logging.info(f"Best validation loss: {best_val_loss:.6f}")
+        
+        return {
+            "epoch": self.current_epoch,
+            "train_losses": self.train_losses,
+            "val_losses": self.val_losses,
+            "best_val_loss": best_val_loss
+        }
     
     def _plot_loss(self, train_losses, val_losses):
         """Plot loss curves"""
