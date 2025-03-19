@@ -285,8 +285,8 @@ class ClipWhisperTrainer:
                 self.current_epoch = epoch
                 
                 # Clear cache at start of epoch
-                torch.cuda.empty_cache()
-                gc.collect()
+                # torch.cuda.empty_cache()
+                # gc.collect()
                 
                 # Train and validate
                 epoch_start = time.time()
@@ -404,132 +404,113 @@ class ClipWhisperTrainer:
             
             raise
         
-        finally:
-            # Ensure all memory is cleared
-            torch.cuda.empty_cache()
-            gc.collect()
+        # finally:
+        #     # Ensure all memory is cleared
+        #     torch.cuda.empty_cache()
+        #     gc.collect()
     
     def _train_epoch(self, epoch):
-        """
-        Train the model for one epoch with improved monitoring and error handling.
-        
-        Args:
-            epoch: Current epoch number
-            
-        Returns:
-            float: Average training loss for the epoch
-        """
+        """Train for one epoch"""
         self.model.train()
         total_loss = 0
         total_batches = 0
-        
-        # Health monitoring
-        unstable_batch_count = 0
-        max_unstable_batches = 5
         nan_found = False
+        unstable_batch_count = 0
+        
+        # Reserve memory at the start of epoch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            reserve_size = 1024 * 1024 * 1024  # 1GB
+            self._memory_reserve = torch.empty(reserve_size, dtype=torch.uint8, device='cuda')
         
         # Create progress bar
-        progress = tqdm(self.train_dataloader, desc=f"Epoch {epoch+1}/{self.max_epochs}")
+        pbar = tqdm(
+            enumerate(self.train_dataloader),
+            total=len(self.train_dataloader),
+            desc=f"Epoch {epoch+1}/{self.max_epochs}"
+        )
         
-        for batch_idx, batch in enumerate(progress):
-            # Store batch index for logging in other methods
-            self.model._current_batch_idx = batch_idx
-            
-            # Process batch based on its type
-            if isinstance(batch, dict):
-                # Dictionary format
-                processed_batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-            elif isinstance(batch, (list, tuple)) and len(batch) >= 4:
-                # Tuple format - convert to dictionary
-                audio, video, labels, *rest = batch
-                processed_batch = {
-                    "audio": audio.to(self.device) if isinstance(audio, torch.Tensor) else audio,
-                    "video": video.to(self.device) if isinstance(video, torch.Tensor) else video,
-                    "labels": labels.to(self.device) if isinstance(labels, torch.Tensor) else labels,
-                    "return_loss": True
-                }
-                # Add prompt if available
-                if len(rest) > 0 and rest[0] is not None:
-                    prompt = rest[0]
-                    processed_batch["prompt"] = prompt.to(self.device) if isinstance(prompt, torch.Tensor) else prompt
-            else:
-                # Unknown batch format
-                logging.error(f"Unknown batch format: {type(batch)}")
-                raise ValueError(f"Unsupported batch format: {type(batch)}")
-            
-            # Clear gradients
-            self.optimizer.zero_grad()
-            
-            # Forward pass with error handling
+        for batch_idx, batch in pbar:
             try:
-                # Process batch through the model
-                result = self.model(**processed_batch)
-                loss = result["loss"]
+                # Process batch
+                outputs = self._process_batch(batch, batch_idx)
                 
-                # Check for NaN/Inf loss
-                if not torch.isfinite(loss):
+                # Extract loss from outputs dictionary
+                if isinstance(outputs, dict):
+                    loss = outputs["loss"]
+                else:
+                    loss = outputs
+                
+                if torch.isnan(loss):
+                    logging.warning(f"NaN loss detected in batch {batch_idx}")
+                    nan_found = True
                     unstable_batch_count += 1
-                    logging.warning(f"[Batch {batch_idx}] Non-finite loss detected: {loss.item()}")
-                    
-                    if unstable_batch_count >= max_unstable_batches:
-                        logging.error(f"Too many unstable batches ({unstable_batch_count}). Training may be unstable.")
-                        nan_found = True
-                        
-                    # Skip this batch for gradient update
+                    if unstable_batch_count > 5:
+                        logging.error("Too many unstable batches. Stopping epoch.")
+                        break
                     continue
-                    
-                # Exceptionally high loss check
-                if loss.item() > 100:
-                    logging.warning(f"[Batch {batch_idx}] Unusually high loss: {loss.item()}")
-                    
+                
                 # Backward pass and optimization
                 loss.backward()
                 
-                # Gradient clipping to prevent exploding gradients
+                # Gradient clipping
                 if self.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
                 
                 # Step optimizer and scheduler
                 self.optimizer.step()
+                self.optimizer.zero_grad()
                 if self.scheduler:
                     self.scheduler.step()
                 
-                # Update progress bar
-                progress.set_postfix({"loss": loss.item()})
-                
-                # Accumulate loss statistics
+                # Update totals
                 total_loss += loss.item()
                 total_batches += 1
                 
-                # Periodically log memory usage
-                if batch_idx % 50 == 0 and torch.cuda.is_available():
+                # Update progress bar
+                current_lr = self.optimizer.param_groups[0]['lr']
+                avg_loss = total_loss / total_batches
+                progress = (batch_idx + 1) / len(self.train_dataloader) * 100
+                
+                # Update progress bar description
+                pbar.set_description(
+                    f"Epoch {epoch+1}/{self.max_epochs} | "
+                    f"Loss: {loss.item():.6f} | "
+                    f"Avg: {avg_loss:.6f} | "
+                    f"LR: {current_lr:.6f}"
+                )
+                
+                # Periodically log memory usage (less frequently)
+                if batch_idx % 100 == 0 and torch.cuda.is_available():
                     mem_allocated = torch.cuda.memory_allocated() / (1024 ** 3)
                     mem_reserved = torch.cuda.memory_reserved() / (1024 ** 3)
-                    logging.info(f"[Batch {batch_idx}] Memory: {mem_allocated:.2f}GB allocated, {mem_reserved:.2f}GB reserved")
-                    
+                    logging.info(f"Memory [Batch {batch_idx}] {mem_allocated:.2f}GB allocated, {mem_reserved:.2f}GB reserved")
+                
                 # Reset unstable counter if we had a successful batch
                 unstable_batch_count = 0
                     
             except RuntimeError as e:
-                # Handle CUDA out of memory errors
                 if "CUDA out of memory" in str(e):
                     logging.error(f"CUDA OOM in batch {batch_idx}. Trying to recover...")
+                    if hasattr(self, '_memory_reserve'):
+                        del self._memory_reserve  # Free the reserved memory
                     torch.cuda.empty_cache()
-                    # Skip this batch
                     continue
                 else:
                     logging.error(f"Error in batch {batch_idx}: {e}")
                     logging.error(traceback.format_exc())
-                    # Skip this batch
                     continue
                     
             except Exception as e:
                 logging.error(f"Unexpected error in batch {batch_idx}: {e}")
                 logging.error(traceback.format_exc())
-                # Skip this batch
                 continue
         
-        # Check if we had enough successful batches
+        # Clean up memory reservation
+        if hasattr(self, '_memory_reserve'):
+            del self._memory_reserve
+        
+        # Calculate average loss
         if total_batches == 0:
             logging.error("No successful batches in this epoch!")
             return float('inf')
@@ -537,11 +518,8 @@ class ClipWhisperTrainer:
         if nan_found:
             logging.warning("NaN losses detected during training. Results may be unreliable.")
         
-        # Calculate average loss
         avg_loss = total_loss / total_batches
-        
-        # Log epoch summary
-        logging.info(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.6f}")
+        logging.info(f"\nEpoch {epoch+1} completed. Average loss: {avg_loss:.6f}")
         
         return avg_loss
     
@@ -627,10 +605,7 @@ class ClipWhisperTrainer:
         """Process a batch of data"""
         # Skip None batches (from collate_fn)
         if batch is None:
-            if is_train:
-                return {"loss": torch.tensor(0.0, device=self.device)}
-            else:
-                return {"loss": torch.tensor(0.0, device=self.device)}
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
         
         # Move batch to device - handle both tuple and dict batch formats
         if isinstance(batch, (list, tuple)) and len(batch) >= 4:
@@ -726,19 +701,16 @@ class ClipWhisperTrainer:
             batch_dict["return_loss"] = True
         
         if is_train:
-            # In training mode, ensure tokenizer has a pad token
-            if hasattr(self.model, 'tokenizer') and self.model.tokenizer is not None:
-                if self.model.tokenizer.pad_token is None:
-                    self.model.tokenizer.pad_token = self.model.tokenizer.eos_token
-                    # Add the pad token to the vocabulary if needed
-                    if self.model.tokenizer.pad_token not in self.model.tokenizer.get_vocab():
-                        self.model.tokenizer.add_special_tokens({'pad_token': self.model.tokenizer.pad_token})
-                    
-            # Add gradient checkpointing
-            if self.grad_accum_steps > 1:
-                torch.utils.checkpoint.checkpoint(self.model, **batch_dict)
+            # Forward pass through the model
+            outputs = self.model(**batch_dict)
             
-            return batch_dict
+            # Extract loss from outputs
+            if isinstance(outputs, dict):
+                loss = outputs["loss"]
+            else:
+                loss = outputs
+                
+            return loss
         else:
             # In validation mode, compute loss manually
             try:
@@ -748,7 +720,7 @@ class ClipWhisperTrainer:
             except Exception as e:
                 logging.error(f"Error during validation batch {batch_idx}: {e}")
                 logging.error(traceback.format_exc())
-                return {"loss": torch.tensor(float('inf'), device=self.device)}
+                return torch.tensor(float('inf'), device=self.device)
     
     def _save_checkpoint(self, is_final=False, is_best=False, checkpoint_dir=None):
         """Save a checkpoint of the model and optimizer state.

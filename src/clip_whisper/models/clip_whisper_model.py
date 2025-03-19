@@ -102,6 +102,9 @@ class ClipWhisperModel(nn.Module):
         fusion_scale: float = 0.5,
         connector_type: str = "simple",
         _provided_tokenizer=None,
+        _provided_llm=None,
+        _provided_whisper=None, 
+        _provided_clip=None,
     ):
         """
         Initialize the ClipWhisper model
@@ -132,6 +135,9 @@ class ClipWhisperModel(nn.Module):
                 - "qformer": Query-based transformer for multimodal fusion
                 - "perceiver": Perceiver-IO architecture for efficient multimodal processing
             _provided_tokenizer: Optional pre-loaded tokenizer
+            _provided_llm: Optional pre-loaded LLM model
+            _provided_whisper: Optional pre-loaded Whisper model
+            _provided_clip: Optional pre-loaded CLIP model
         """
         super().__init__()
         
@@ -174,8 +180,13 @@ class ClipWhisperModel(nn.Module):
         base_memory = self._get_gpu_memory_usage()["allocated"]
         
         # Always load the LLM regardless of modality
-        self.llm, self.tokenizer = self._track_component_memory("LLM",
-                    lambda: self._load_llm(llm_path, use_lora, lora_r, lora_alpha, lora_dropout, freeze_llm, use_4bit))
+        if _provided_llm is not None and _provided_tokenizer is not None:
+            logging.info("Using provided LLM and tokenizer")
+            self.llm = _provided_llm
+            self.tokenizer = _provided_tokenizer
+        else:
+            self.llm, self.tokenizer = self._track_component_memory("LLM",
+                        lambda: self._load_llm(llm_path, use_lora, lora_r, lora_alpha, lora_dropout, freeze_llm, use_4bit))
         
         # Get LLM memory footprint
         llm_memory = self._get_gpu_memory_usage()["allocated"] - base_memory
@@ -184,8 +195,21 @@ class ClipWhisperModel(nn.Module):
         # Load Whisper if needed for audio
         if self.modality in ["audio", "both"]:
             whisper_base_memory = self._get_gpu_memory_usage()["allocated"]
-            self.whisper, self.whisper_processor = self._track_component_memory("Whisper",
-                            lambda: self._load_whisper_model(whisper_model, freeze_encoders))
+            if _provided_whisper is not None:
+                logging.info("Using provided Whisper model")
+                self.whisper = _provided_whisper
+                # Load processor separately if not provided
+                if whisper_model is not None:
+                    if os.path.exists(whisper_model):
+                        self.whisper_processor = WhisperProcessor.from_pretrained(whisper_model)
+                    else:
+                        self.whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-medium")
+                else:
+                    self.whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-medium")
+            else:
+                self.whisper, self.whisper_processor = self._track_component_memory("Whisper",
+                                lambda: self._load_whisper_model(whisper_model, freeze_encoders))
+            
             whisper_memory = self._get_gpu_memory_usage()["allocated"] - whisper_base_memory
             logging.info(f"Whisper model memory usage: {whisper_memory:.2f} MB")
             
@@ -202,8 +226,21 @@ class ClipWhisperModel(nn.Module):
         # Load CLIP if needed for video
         if self.modality in ["video", "both"]:
             clip_base_memory = self._get_gpu_memory_usage()["allocated"]
-            self.clip, self.clip_processor = self._track_component_memory("CLIP",
-                        lambda: self._load_clip_model(clip_model, freeze_encoders))
+            if _provided_clip is not None:
+                logging.info("Using provided CLIP model")
+                self.clip = _provided_clip
+                # Load processor separately if not provided
+                if clip_model is not None:
+                    if os.path.exists(clip_model):
+                        self.clip_processor = CLIPProcessor.from_pretrained(clip_model)
+                    else:
+                        self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+                else:
+                    self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+            else:
+                self.clip, self.clip_processor = self._track_component_memory("CLIP",
+                            lambda: self._load_clip_model(clip_model, freeze_encoders))
+            
             clip_memory = self._get_gpu_memory_usage()["allocated"] - clip_base_memory
             logging.info(f"CLIP model memory usage: {clip_memory:.2f} MB")
             
@@ -372,38 +409,54 @@ class ClipWhisperModel(nn.Module):
         # Encode audio if available
         audio_features = None
         if self.modality in ["audio", "both"] and audio is not None:
-            # encode_audio returns features directly (not a tuple)
+            # Use the audio encoder to get features
             audio_features = self.encode_audio(audio)
+            logging.info(f"Encoded audio features shape: {audio_features.shape}")
         
         # Encode video if available
         video_features = None
         if self.modality in ["video", "both"] and video is not None:
+            # Use the video encoder to get features
             video_features = self.encode_video(video)
+            logging.info(f"Encoded video features shape: {video_features.shape}")
         
-        # Fuse features if both modalities are used
+        # Combine features based on available modalities
         if audio_features is not None and video_features is not None:
-            max_len = min(self.max_seq_len, max(audio_features.size(1), video_features.size(1)))
+            # Both modalities available - use fusion
+            max_len = max(audio_features.size(1), video_features.size(1))
+            max_len = min(self.max_seq_len, max_len)  # Cap to max sequence length
+            
+            # Make sure sequences are the same length
             audio_features = self._pad_or_truncate(audio_features, max_len)
             video_features = self._pad_or_truncate(video_features, max_len)
+            
+            # Simple weighted fusion of features
             encoder_output = self.fusion_scale * audio_features + (1 - self.fusion_scale) * video_features
+            logging.info(f"Using both audio and video features with fusion_scale={self.fusion_scale}")
         elif audio_features is not None:
+            # Audio-only mode
             encoder_output = audio_features
+            logging.info("Using audio features only")
         elif video_features is not None:
+            # Video-only mode
             encoder_output = video_features
+            logging.info("Using video features only")
         else:
-            raise ValueError("Both audio and video inputs cannot be None")
+            raise ValueError("No valid inputs provided - both audio and video are None")
         
         # Handle prompt if provided
         if prompt is not None:
             prompt_embeds = self._embed_prompt(prompt)
             encoder_output = torch.cat([prompt_embeds, encoder_output], dim=1)
+            logging.info(f"Added prompt embeddings, new shape: {encoder_output.shape}")
         
         # Ensure encoder output matches LLM's expected dtype
-        llm_input_dtype = next(self.llm.parameters()).dtype
-        if encoder_output.dtype != llm_input_dtype:
-            encoder_output = encoder_output.to(llm_input_dtype)
+        llm_dtype = next(self.llm.parameters()).dtype
+        if encoder_output.dtype != llm_dtype:
+            logging.info(f"Converting encoder output from {encoder_output.dtype} to {llm_dtype}")
+            encoder_output = encoder_output.to(llm_dtype)
         
-        # Create attention mask
+        # Create attention mask for the encoder output
         attention_mask = torch.ones((encoder_output.size(0), encoder_output.size(1)), dtype=torch.long, device=self.device)
         
         return encoder_output, attention_mask
@@ -438,6 +491,14 @@ class ClipWhisperModel(nn.Module):
         # Encode inputs
         encoder_output, attention_mask = self.encode(audio, video, prompt)
         
+        # Get LLM expected dtype
+        llm_dtype = next(self.llm.parameters()).dtype
+        
+        # Ensure encoder_output has the correct dtype
+        if encoder_output.dtype != llm_dtype:
+            logging.info(f"Converting encoder output from {encoder_output.dtype} to {llm_dtype} in forward pass")
+            encoder_output = encoder_output.to(llm_dtype)
+            
         # If labels provided, handle sequence length compatibility
         if labels is not None and return_loss:
             # Convert labels to tensor if it's a list
@@ -1003,142 +1064,86 @@ class ClipWhisperModel(nn.Module):
         logging.info(f"{'Frozen':<20} {fmt_count(total_params-trainable_params):<15} {(total_params-trainable_params)/total_params*100:.2f}%")
         logging.info("=" * 80 + "\n")
     
-    def encode_audio(self, audio, attention_mask=None, batch_idx=0):
-        """Encode audio input using Whisper with improved memory management"""
+    def encode_audio(self, audio, attention_mask=None):
+        """Encode audio using Whisper and the audio connector."""
+        # Check if we have a valid audio input
+        if audio is None:
+            raise ValueError("Audio input cannot be None")
+        
+        # Check audio tensor shape
+        if len(audio.shape) != 2 and (len(audio.shape) != 3 or audio.shape[1] != 80):
+            raise ValueError(f"Audio input should have shape [batch_size, sequence_length] or [batch_size, 80, time_steps], but got {audio.shape}")
+        
+        # Handle the [batch_size, n_mels, time_steps] format (already processed mel spectrogram)
+        if len(audio.shape) == 3 and audio.shape[1] == 80:
+            logging.info(f"Received mel features with shape {audio.shape}")
+            
+            # Extract dimensions
+            batch_size, n_mels, time_steps = audio.shape
+            
+            # Create attention mask if not provided
+            if attention_mask is None:
+                attention_mask = torch.ones((batch_size, time_steps), dtype=torch.long, device=audio.device)
+        
+        # Get Whisper's expected dtype
+        whisper_dtype = next(self.whisper.parameters()).dtype
+        
+        # Ensure audio has the correct dtype before processing
+        if audio.dtype != whisper_dtype:
+            audio = audio.to(whisper_dtype)
+            
         with torch.cuda.amp.autocast(enabled=self.use_fp16):
             with torch.set_grad_enabled(not self.freeze_encoders):
-                # Explicitly free memory after forward pass
-                torch.cuda.empty_cache()
-                
-                # Process in smaller chunks if the batch is large and we have memory issues
-                if audio.size(0) > 8 and torch.cuda.is_available():  # Only for large batches on GPU
-                    # Split into chunks of 8
-                    chunks = []
-                    chunk_size = 8
-                    for i in range(0, audio.size(0), chunk_size):
-                        end_idx = min(i + chunk_size, audio.size(0))
-                        audio_chunk = audio[i:end_idx]
-                        mask_chunk = attention_mask[i:end_idx] if attention_mask is not None else None
-                        
-                        # Process chunk
-                        with torch.cuda.amp.autocast(enabled=self.use_fp16):
-                            encoder_outputs = self.whisper.encoder(
-                                audio_chunk,
-                                attention_mask=mask_chunk,
-                                output_hidden_states=True,
-                                return_dict=True
-                            )
-                        
-                        # Project to LLM dimension
-                        last_hidden_state = encoder_outputs.last_hidden_state
-                        features = self.audio_connector(last_hidden_state)
-                        chunks.append(features)
-                        
-                        # Free memory
-                        del encoder_outputs, last_hidden_state
-                        torch.cuda.empty_cache()
-                    
-                    # Combine chunks
-                    features = torch.cat(chunks, dim=0)
-                else:
-                    # Standard processing for smaller batches
-                    encoder_outputs = self.whisper.encoder(
-                        audio,
-                        attention_mask=attention_mask,
-                        output_hidden_states=True,
-                        return_dict=True
-                    )
-                    
-                    # Get the last hidden state
-                    last_hidden_state = encoder_outputs.last_hidden_state
-                    
-                    # Project to LLM dimension
-                    features = self.audio_connector(last_hidden_state)
-                
-                # Track audio sequence length statistics
-                audio_seq_len = features.size(1)
-                
-                # Create or update audio sequence length stats
-                if not hasattr(self, '_audio_seq_len_stats'):
-                    self._audio_seq_len_stats = {
-                        'min': audio_seq_len,
-                        'max': audio_seq_len,
-                        'sum': audio_seq_len,
-                        'count': 1,
-                        'lengths': [audio_seq_len],
-                    }
-                else:
-                    self._audio_seq_len_stats['min'] = min(self._audio_seq_len_stats['min'], audio_seq_len)
-                    self._audio_seq_len_stats['max'] = max(self._audio_seq_len_stats['max'], audio_seq_len)
-                    self._audio_seq_len_stats['sum'] += audio_seq_len
-                    self._audio_seq_len_stats['count'] += 1
-                    self._audio_seq_len_stats['lengths'].append(audio_seq_len)
-                    # Keep only the most recent 100 lengths to avoid memory growth
-                    if len(self._audio_seq_len_stats['lengths']) > 100:
-                        self._audio_seq_len_stats['lengths'] = self._audio_seq_len_stats['lengths'][-100:]
-                
-                # Compute average sequence length
-                avg_len = self._audio_seq_len_stats['sum'] / self._audio_seq_len_stats['count']
-                
-                # Log detailed audio sequence length info
-                if batch_idx % 10 == 0:  # More frequent logging
-                    logging.info(f"[Batch {batch_idx}] AUDIO SEQ MONITOR: Whisper encoder output length = {audio_seq_len}")
-                    logging.info(f"[Batch {batch_idx}] AUDIO SEQ STATS: min={self._audio_seq_len_stats['min']}, "
-                                f"max={self._audio_seq_len_stats['max']}, avg={avg_len:.1f}")
-            
+                # Process the audio with Whisper encoder
+                encoder_outputs = self.whisper.encoder(
+                    audio,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    return_dict=True
+                )
+                # Process through audio connector
+                features = self.audio_connector(encoder_outputs.last_hidden_state)
                 return features
     
     def encode_video(self, video, attention_mask=None):
         """Encode video input using CLIP"""
         if self.clip is None:
-            # For compatibility, return a dummy tensor with the right shape
-            logging.warning("Video encoding attempted but CLIP model not loaded - returning dummy tensor")
+            logging.warning("Video encoding attempted but CLIP model not loaded")
             return torch.zeros((video.size(0), 1, self.video_dim), device=self.device, dtype=self.dtype)
         
-        # Log input shape and device for debugging
-        if self.log_param_updates:
-            logging.info(f"Video input - shape: {video.shape}, device: {video.device}, dtype: {video.dtype}")
+        # Check video tensor shape
+        if len(video.shape) != 5 or video.shape[2] != 3:
+            raise ValueError(f"Video input should have shape [batch_size, frames, 3, height, width], but got {video.shape}")
+            
+        # Log video shape for debugging
+        logging.info(f"Processing video with shape: {video.shape}")
         
-        # Process all frames together
-        batch_size, seq_len = video.size(0), video.size(1)
+        # Process all frames at once
+        batch_size, num_frames = video.shape[0], video.shape[1]
         
-        # Log original video size if in debug mode
-        batch_idx = getattr(self, '_current_batch_idx', 0)
-        if batch_idx % 50 == 0:
-            logging.debug(f"[Batch {batch_idx}] Video encoder input: {batch_size} batches x {seq_len} frames")
+        # Reshape for CLIP processing [batch_size*frames, 3, height, width]
+        flat_video = video.view(batch_size * num_frames, 3, video.shape[3], video.shape[4])
         
-        # Reshape to process all frames at once
-        # CLIP expects input shape [batch_size, channels, height, width]
-        # Our video is [batch_size, seq_len, channels, height, width]
-        video_reshaped = video.view(batch_size * seq_len, video.size(2), video.size(3), video.size(4))
+        # Get CLIP's expected dtype
+        clip_dtype = next(self.clip.parameters()).dtype
         
-        with torch.set_grad_enabled(not self.freeze_encoders):
-            # Get CLIP vision encoder output
-            vision_outputs = self.clip(
-                video_reshaped,
-                output_hidden_states=True,
-                return_dict=True
-            )
-            
-            # Get the pooler output (or last hidden state)
-            if hasattr(vision_outputs, 'pooler_output') and vision_outputs.pooler_output is not None:
-                pooled_output = vision_outputs.pooler_output
-            else:
-                # Use the [CLS] token embedding or the last hidden state if pooler not available
-                pooled_output = vision_outputs.last_hidden_state[:, 0]
-            
-            # Reshape back to sequence form [batch_size, seq_len, feature_dim]
-            features = pooled_output.view(batch_size, seq_len, -1)
-            
-            # Project to LLM dimension
-            features = self.video_connector(features)
-            
-            # Log video features after projection if in debug mode
-            if batch_idx % 50 == 0:
-                logging.debug(f"[Batch {batch_idx}] Projected video features shape: {features.shape}")
-            
-            # We don't truncate here - preserve full sequence for fusion
-            return features
+        # Ensure video has the correct dtype before processing
+        if flat_video.dtype != clip_dtype:
+            logging.info(f"Converting video from {flat_video.dtype} to {clip_dtype}")
+            flat_video = flat_video.to(clip_dtype)
+        
+        with torch.cuda.amp.autocast(enabled=self.use_fp16):
+            with torch.set_grad_enabled(not self.freeze_encoders):
+                # Process through CLIP vision encoder
+                outputs = self.clip(flat_video, return_dict=True)
+                
+                # Get the embeddings and reshape back to [batch_size, frames, hidden_dim]
+                embeddings = outputs.last_hidden_state[:, 0]  # Use CLS token
+                embeddings = embeddings.view(batch_size, num_frames, -1)
+                
+                # Process through video connector
+                features = self.video_connector(embeddings)
+                return features
 
     def _get_llm_dim(self):
         """Get the input dimension of the LLM"""
@@ -1232,162 +1237,115 @@ class ClipWhisperModel(nn.Module):
         
         logging.info("=" * 80 + "\n")
 
-    def generate(
-        self,
-        audio=None,
-        video=None,
-        prompt=None,
-        max_length=100,
-        temperature=0.7,
-        do_sample=True,
-        **kwargs
-    ):
-        """Generate text from audio/video embeddings"""
+    def generate(self, audio=None, video=None, prompt=None, pixel_values=None, max_new_tokens=100, do_sample=False, temperature=1.0, top_p=0.9, max_length=None):
+        """
+        Generate text based on audio and/or video inputs.
+        
+        Args:
+            audio: Audio input tensor
+            video: Video input tensor
+            prompt: Optional text prompt to condition generation
+            max_new_tokens: Maximum number of new tokens to generate
+            max_length: Alternative to max_new_tokens (for compatibility)
+            do_sample: Whether to use sampling for generation
+            temperature: Sampling temperature (higher = more random)
+            top_p: Nucleus sampling probability threshold
+            
+        Returns:
+            Generated token ids
+        """
+        # Handle either video or pixel_values for video input (for backward compatibility)
+        if video is None and pixel_values is not None:
+            video = pixel_values
+        
+        # Log inputs for debugging
+        logging.info(f"Generate called with: audio={audio is not None}, video={video is not None}, prompt={prompt is not None}")
+        if audio is not None:
+            logging.info(f"Audio shape: {audio.shape}")
+        if video is not None:
+            logging.info(f"Video shape: {video.shape}")
+        
+        # Default max_length if not provided
+        if max_length is None and max_new_tokens is not None:
+            max_length = max_new_tokens
+        elif max_length is not None and max_new_tokens is None:
+            max_new_tokens = max_length
+        elif max_length is None and max_new_tokens is None:
+            max_new_tokens = 100
+            max_length = 100
+            
+        # Encode inputs to get embeddings
         try:
-            logging.info("Starting generation process")
-            
-            # Create inputs_embeds and attention_mask using our encoders
-            if self.modality == "audio":
-                if audio is None:
-                    raise ValueError("Audio modality selected but no audio input provided")
-                encoder_output = self.encode_audio(audio)
-            elif self.modality == "video":
-                if video is None:
-                    raise ValueError("Video modality selected but no video input provided")
-                encoder_output = self.encode_video(video)
-            else:  # both modalities
-                if audio is None or video is None:
-                    raise ValueError("Both modalities selected but inputs are missing")
-                
-                audio_features = self.encode_audio(audio)
-                video_features = self.encode_video(video)
-                
-                # Ensure both features have the same sequence length
-                max_len = min(
-                    self.max_seq_len,
-                    max(audio_features.size(1), video_features.size(1))
-                )
-                audio_features = self._pad_or_truncate(audio_features, max_len)
-                video_features = self._pad_or_truncate(video_features, max_len)
-                
-                # Weighted sum of features
-                encoder_output = (
-                    self.fusion_scale * audio_features +
-                    (1 - self.fusion_scale) * video_features
-                )
-            
-            # Track batch dimension for inputs to LLM
-            batch_size = encoder_output.size(0)
-            
-            # Create attention mask (all 1s for the encoder output)
-            attention_mask = torch.ones(
-                (batch_size, encoder_output.size(1)),
-                dtype=torch.long,
-                device=self.device
-            )
-            
-            # Handle prompt for LLM input
-            if prompt is not None:
-                # Process the provided prompt
-                if isinstance(prompt, str):
-                    # Convert text prompt to token IDs
-                    prompt_ids = self.tokenizer(
-                        prompt,
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=self.max_seq_len
-                    ).input_ids.to(self.device)
-                else:
-                    # Assume it's already tokenized
-                    prompt_ids = prompt.to(self.device)
-                
-                # Convert tokens to embeddings
-                embedding_layer = self.llm.get_input_embeddings()
-                prompt_embeds = embedding_layer(prompt_ids)
-                
-                # Ensure batch dimension matches
-                if prompt_embeds.size(0) == 1 and batch_size > 1:
-                    prompt_embeds = prompt_embeds.expand(batch_size, -1, -1)
-                
-                # Concatenate prompt and encoder output
-                inputs_embeds = torch.cat([prompt_embeds, encoder_output], dim=1)
-                
-                # Update attention mask
-                prompt_attention = torch.ones(
-                    (batch_size, prompt_embeds.size(1)),
-                    dtype=torch.long,
-                    device=self.device
-                )
-                attention_mask = torch.cat([prompt_attention, attention_mask], dim=1)
-                
-                logging.info(f"Using provided prompt. Input shape: {inputs_embeds.shape}")
+            # Ensure modality is set correctly based on available inputs
+            original_modality = self.modality
+            if audio is not None and video is not None:
+                temp_modality = "both"
+            elif audio is not None and video is None:
+                temp_modality = "audio"
+            elif audio is None and video is not None:
+                temp_modality = "video"
             else:
-                # Add a default transcription prompt for consistent behavior
-                default_prompt = "Transcribe the speech from this audio and video input: "
+                # No inputs provided, use original modality setting
+                temp_modality = original_modality
+            
+            # Temporarily set modality based on available inputs
+            if temp_modality != original_modality:
+                logging.info(f"Temporarily changing modality from {original_modality} to {temp_modality} based on available inputs")
+                self.modality = temp_modality
+            
+            # Explicitly clear CUDA cache before encoding
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
                 
-                if hasattr(self, 'tokenizer'):
-                    # Ensure pad token is set
-                    if not hasattr(self.tokenizer, 'pad_token') or self.tokenizer.pad_token is None:
-                        self.tokenizer.pad_token = self.tokenizer.eos_token
-                    
-                    # Convert prompt to token IDs
-                    prompt_ids = self.tokenizer(
-                        default_prompt,
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=self.max_seq_len
-                    ).input_ids.to(self.device)
-                    
-                    # Get embeddings
-                    embedding_layer = self.llm.get_input_embeddings()
-                    prompt_embeds = embedding_layer(prompt_ids)
-                    
-                    # Ensure batch dimension matches
-                    if prompt_embeds.size(0) == 1 and batch_size > 1:
-                        prompt_embeds = prompt_embeds.expand(batch_size, -1, -1)
-                    
-                    # Concatenate prompt and encoder output
-                    inputs_embeds = torch.cat([prompt_embeds, encoder_output], dim=1)
-                    
-                    # Update attention mask
-                    prompt_attention = torch.ones(
-                        (batch_size, prompt_embeds.size(1)),
-                        dtype=torch.long,
-                        device=self.device
-                    )
-                    attention_mask = torch.cat([prompt_attention, attention_mask], dim=1)
-                    
-                    logging.info(f"Using default prompt. Input shape: {inputs_embeds.shape}")
-                else:
-                    # No tokenizer available, use encoder output directly
-                    inputs_embeds = encoder_output
-                    logging.warning("No tokenizer available, cannot add default prompt")
+            # Encode with the appropriate modality
+            encoder_output, attention_mask = self.encode(audio, video, prompt)
             
-            # Log the final input shape before generation
-            if 'inputs_embeds' in locals():
-                logging.info(f"Generating with inputs shape: {inputs_embeds.shape}")
-            else:
-                inputs_embeds = encoder_output
-                logging.info(f"Generating with inputs shape: {encoder_output.shape}")
+            # Clean up input tensors to free memory
+            if audio is not None:
+                del audio
+            if video is not None:
+                del video
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
-            # Generate text using the LLM
+            # Restore original modality
+            if temp_modality != original_modality:
+                self.modality = original_modality
+            
+            # Get LLM expected dtype
+            llm_dtype = next(self.llm.parameters()).dtype
+            
+            # Ensure encoder_output has the correct dtype
+            if encoder_output.dtype != llm_dtype:
+                logging.info(f"Converting encoder output from {encoder_output.dtype} to {llm_dtype} before generation")
+                encoder_output = encoder_output.to(llm_dtype)
+            
+            # Configure generation parameters
+            gen_kwargs = {
+                "max_new_tokens": max_new_tokens,
+                "do_sample": do_sample,
+                "temperature": temperature,
+                "top_p": top_p,
+                "attention_mask": attention_mask,
+            }
+            
+            # Log generation parameters
+            logging.info(f"Generating with parameters: max_new_tokens={max_new_tokens}, do_sample={do_sample}")
+            logging.info(f"Encoder output shape: {encoder_output.shape}")
+            
+            # Generate using the LLM
             outputs = self.llm.generate(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                max_length=max_length,
-                do_sample=do_sample,
-                temperature=temperature,
-                **kwargs
+                inputs_embeds=encoder_output,
+                **gen_kwargs
             )
             
+            logging.info(f"Generated output shape: {outputs.shape}")
             return outputs
-            
+                
         except Exception as e:
-            logging.error(f"Error in generate method: {e}")
+            logging.error(f"Error during generation: {e}")
             logging.error(traceback.format_exc())
-            raise 
+            raise
 
     def save_unified_checkpoint(self, save_path):
         """

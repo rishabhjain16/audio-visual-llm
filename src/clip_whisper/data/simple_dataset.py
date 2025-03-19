@@ -130,137 +130,163 @@ class AVSRDataset(Dataset):
         audio_exists = os.path.exists(audio_path)
         video_exists = os.path.exists(video_path)
         
-        if not audio_exists and not video_exists:
-            logging.warning(f"Both audio and video files missing: {audio_path}, {video_path}")
-            # Try another sample
-            return self.__getitem__((idx + 1) % len(self))
+        # Instead of recursively calling __getitem__, we'll implement a non-recursive approach
+        # with a maximum number of attempts to find a valid sample
+        max_attempts = 10
+        current_idx = idx
         
-        # Load audio if it exists and if we need audio features
-        audio_features = None
-        if audio_exists and (self.modality == "audio" or self.modality == "both"):
-            try:
-                # Load audio
-                audio, sr = sf.read(audio_path)
-                
-                # Handle mono/stereo
-                if len(audio.shape) > 1:
-                    audio = audio.mean(axis=1)  # Convert to mono
-                
-                # Handle normalization
-                if self.normalize:
-                    if np.abs(audio).max() > 1.0:
-                        # Assume 16-bit audio
-                        audio = audio.astype(np.float32) / 32768.0
-                    else:
-                        # Already normalized
-                        audio = audio.astype(np.float32)
-                
-                # Process with whisper
-                audio_features = self.whisper_processor(
-                    audio, 
-                    sampling_rate=self.sampling_rate,
-                    return_tensors="pt"
-                ).input_features.squeeze(0)
-                
-                # Normalize if needed
-                if self.normalize:
-                    with torch.no_grad():
-                        audio_features = F.layer_norm(audio_features, audio_features.shape)
-                
-            except Exception as e:
-                logging.error(f"Error loading audio {audio_path}: {e}")
-                audio_features = None
-        
-        # Load video if it exists and if we need video features
-        video_features = None
-        if video_exists and (self.modality == "video" or self.modality == "both"):
-            try:
-                # Open video file
-                video = cv2.VideoCapture(video_path)
-                frames = []
-                
-                # Read frames
-                while len(frames) < self.max_video_length:
-                    ret, frame = video.read()
-                    if not ret:
-                        break
-                    # Convert BGR to RGB
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    frames.append(frame)
-                
-                video.release()
-                
-                if len(frames) == 0:
-                    logging.warning(f"No frames found in video: {video_path}")
-                    video_features = None
-                else:
-                    # Process with CLIP
-                    processed_frames = []
-                    for i in range(min(len(frames), self.max_video_length)):
-                        # Use the CLIP processor to ensure proper formatting
-                        try:
-                            # Ensure the frame is in the correct format for CLIP
-                            frame = frames[i]
-                            
-                            # Convert to RGB if not already
-                            if frame.shape[-1] != 3:
-                                logging.warning(f"Frame doesn't have 3 channels: {frame.shape}")
-                                # Try to fix by assuming it's grayscale
-                                if len(frame.shape) == 2:
-                                    # Convert grayscale to RGB
-                                    frame = np.stack([frame] * 3, axis=-1)
-                            
-                            # Ensure frame has proper dimensions
-                            if len(frame.shape) != 3 or frame.shape[-1] != 3:
-                                logging.warning(f"Skipping frame with invalid shape: {frame.shape}")
-                                continue
-                                
-                            # Process with CLIP processor
-                            with torch.no_grad():
-                                processed = self.clip_processor(
-                                    images=frame, 
-                                    return_tensors="pt"
-                                )
-                                # CLIP expects pixel values in [B, C, H, W] format
-                                pixel_values = processed["pixel_values"]
-                                
-                                # Verify shape is correct for CLIP
-                                if pixel_values.dim() != 4 or pixel_values.size(1) != 3:
-                                    logging.warning(f"Processed frame has unexpected shape: {pixel_values.shape}, expected [1, 3, H, W]")
-                                
-                                processed_frames.append(pixel_values)
-                        except Exception as e:
-                            logging.error(f"Error processing frame {i}: {e}")
-                            continue
-                    
-                    if not processed_frames:
-                        raise ValueError(f"Failed to process any video frames for {video_path}")
-                        
-                    # Stack frames properly (already in CLIP format)
-                    # Each frame is [1, 3, 224, 224], we want [frames, 3, 224, 224]
-                    video_features = torch.cat(processed_frames, dim=0)
-                    
-                    # Log the shape less frequently to reduce log spam
-                    if random.random() < 0.05:  # Only log about 5% of the time
-                        logging.info(f"Processed video shape: {video_features.shape}")
+        for attempt in range(max_attempts):
+            if attempt > 0:
+                # On subsequent attempts, try a different index
+                current_idx = (idx + attempt) % len(self)
+                video_path, audio_path, audio_id = self.names[current_idx]
+                video_path = os.path.join(self.root_dir, video_path)
+                audio_path = os.path.join(self.root_dir, audio_path)
+                audio_exists = os.path.exists(audio_path)
+                video_exists = os.path.exists(video_path)
             
-            except Exception as e:
-                logging.error(f"Error loading video {video_path}: {e}")
-                video_features = None
+            # If both missing, try next sample
+            if not audio_exists and not video_exists:
+                logging.warning(f"Both audio and video files missing: {audio_path}, {video_path}")
+                continue
+            
+            # Load audio if it exists and if we need audio features
+            audio_features = None
+            if audio_exists and (self.modality == "audio" or self.modality == "both"):
+                try:
+                    # Load audio
+                    audio, sr = sf.read(audio_path)
+                    
+                    # Handle mono/stereo
+                    if len(audio.shape) > 1:
+                        audio = audio.mean(axis=1)  # Convert to mono
+                    
+                    # Handle normalization
+                    if self.normalize:
+                        if np.abs(audio).max() > 1.0:
+                            # Assume 16-bit audio
+                            audio = audio.astype(np.float32) / 32768.0
+                        else:
+                            # Already normalized
+                            audio = audio.astype(np.float32)
+                    
+                    # Process with whisper
+                    audio_features = self.whisper_processor(
+                        audio, 
+                        sampling_rate=self.sampling_rate,
+                        return_tensors="pt"
+                    ).input_features.squeeze(0)
+                    
+                    # Normalize if needed
+                    if self.normalize:
+                        with torch.no_grad():
+                            audio_features = F.layer_norm(audio_features, audio_features.shape)
+                    
+                except Exception as e:
+                    logging.error(f"Error loading audio {audio_path}: {e}")
+                    audio_features = None
+            
+            # Load video if it exists and if we need video features
+            video_features = None
+            if video_exists and (self.modality == "video" or self.modality == "both"):
+                try:
+                    # Open video file
+                    video = cv2.VideoCapture(video_path)
+                    frames = []
+                    
+                    # Read frames
+                    while len(frames) < self.max_video_length:
+                        ret, frame = video.read()
+                        if not ret:
+                            break
+                        # Convert BGR to RGB
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        frames.append(frame)
+                    
+                    video.release()
+                    
+                    if len(frames) == 0:
+                        logging.warning(f"No frames found in video: {video_path}")
+                        video_features = None
+                    else:
+                        # Process with CLIP
+                        processed_frames = []
+                        for i in range(min(len(frames), self.max_video_length)):
+                            # Use the CLIP processor to ensure proper formatting
+                            try:
+                                # Ensure the frame is in the correct format for CLIP
+                                frame = frames[i]
+                                
+                                # Convert to RGB if not already
+                                if frame.shape[-1] != 3:
+                                    logging.warning(f"Frame doesn't have 3 channels: {frame.shape}")
+                                    # Try to fix by assuming it's grayscale
+                                    if len(frame.shape) == 2:
+                                        # Convert grayscale to RGB
+                                        frame = np.stack([frame] * 3, axis=-1)
+                                
+                                # Ensure frame has proper dimensions
+                                if len(frame.shape) != 3 or frame.shape[-1] != 3:
+                                    logging.warning(f"Skipping frame with invalid shape: {frame.shape}")
+                                    continue
+                                    
+                                # Process with CLIP processor
+                                with torch.no_grad():
+                                    processed = self.clip_processor(
+                                        images=frame, 
+                                        return_tensors="pt"
+                                    )
+                                    # CLIP expects pixel values in [B, C, H, W] format
+                                    pixel_values = processed["pixel_values"]
+                                    
+                                    # Verify shape is correct for CLIP
+                                    if pixel_values.dim() != 4 or pixel_values.size(1) != 3:
+                                        logging.warning(f"Processed frame has unexpected shape: {pixel_values.shape}, expected [1, 3, H, W]")
+                                    
+                                    processed_frames.append(pixel_values)
+                            except Exception as e:
+                                logging.error(f"Error processing frame {i}: {e}")
+                                continue
+                        
+                        if not processed_frames:
+                            raise ValueError(f"Failed to process any video frames for {video_path}")
+                            
+                        # Stack frames properly (already in CLIP format)
+                        # Each frame is [1, 3, 224, 224], we want [frames, 3, 224, 224]
+                        video_features = torch.cat(processed_frames, dim=0)
+                        
+                        # Log the shape less frequently to reduce log spam
+                        if random.random() < 0.05:  # Only log about 5% of the time
+                            logging.info(f"Processed video shape: {video_features.shape}")
+                
+                except Exception as e:
+                    logging.error(f"Error loading video {video_path}: {e}")
+                    video_features = None
+            
+            # Check if we have the required modalities
+            modality_requirements_met = False
+            if self.modality == "audio" and audio_features is not None:
+                modality_requirements_met = True
+            elif self.modality == "video" and video_features is not None:
+                modality_requirements_met = True
+            elif self.modality == "both" and audio_features is not None and video_features is not None:
+                modality_requirements_met = True
+            
+            # If we have what we need, break out of the loop
+            if modality_requirements_met:
+                break
         
-        # Handle required modalities not being available
-        if self.modality == "audio" and audio_features is None:
-            logging.warning(f"Audio required but not available for {audio_path}")
-            return self.__getitem__((idx + 1) % len(self))
-        elif self.modality == "video" and video_features is None:
-            logging.warning(f"Video required but not available for {video_path}")
-            return self.__getitem__((idx + 1) % len(self))
-        elif self.modality == "both" and (audio_features is None or video_features is None):
-            logging.warning(f"Both modalities required but not available for {audio_path}, {video_path}")
-            return self.__getitem__((idx + 1) % len(self))
+        # If we've exhausted our attempts and still don't have valid features, log a warning
+        if not modality_requirements_met:
+            logging.warning(f"Failed to find valid sample after {max_attempts} attempts, returning dummy features")
+            # Create dummy features to prevent crashes
+            if self.modality in ["audio", "both"]:
+                audio_features = torch.zeros((80, 3000), dtype=torch.float32)
+            if self.modality in ["video", "both"]:
+                video_features = torch.zeros((10, 3, 224, 224), dtype=torch.float32)
         
-        # Get text labels
-        text = self.labels[idx]
+        # Get text labels - make sure to use the current_idx that worked
+        text = self.labels[current_idx]
         
         # Create tokens for model input
         # Ensure tokenizer has a pad token before tokenizing
@@ -280,6 +306,10 @@ class AVSRDataset(Dataset):
         
         # Convert text to model tokens (for labels during training)
         tokens = self.tokenizer(text, **tokenizer_kwargs).input_ids[0].tolist()
+        
+        # Log which sample we're actually returning
+        if current_idx != idx:
+            logging.info(f"Returning sample {current_idx} (audio_id: {audio_id}) instead of requested {idx}")
         
         # Return data structured for the collate_fn
         return audio_features, video_features, text, tokens

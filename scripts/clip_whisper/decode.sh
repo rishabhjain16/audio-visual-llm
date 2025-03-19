@@ -1,27 +1,32 @@
 #!/bin/bash
 # Decoding script for the ClipWhisperModel
 
+# Activate conda environment
+echo "Activating avsr-llm conda environment..."
+eval "$(conda shell.bash hook)"
+conda activate avsr-llm
+
 # Default values
-MODEL_PATH="outputs/test_clip_whisper/best_model/model"
+MODEL_PATH="/home/rishabh/Desktop/Experiments/G_AVSR/AVSR-LLM/outputs/clip_whisper_new_adaptive/model_best.pt"
 TEST_DATA="/home/rishabh/Desktop/Datasets/lrs3/433h_data/test.tsv"
 TEST_WRD="/home/rishabh/Desktop/Datasets/lrs3/433h_data/test.wrd"
-OUTPUT_DIR="outputs/clip_whisper_decoding_infer"
-MODALITY="video"
+OUTPUT_DIR="outputs/clip_whisper_decoding_adaptive"
+MODALITY="both"
 BATCH_SIZE=1
 MAX_NEW_TOKENS=100
 DEVICE="cuda"
 CONFIG="configs/clip_whisper.yaml"
 SINGLE_FILE=""
-VERBOSE=false
+VERBOSE=true
 WHISPER_MODEL="checkpoints/whisper-medium"
 CLIP_MODEL="checkpoints/clip-vit-base-patch32"
-LLM_MODEL="checkpoints/Llama-3.2-1B"
+LLM_MODEL="checkpoints/Llama-2-7b-hf"
 
 # Display help
 show_help() {
     echo "Usage: $0 [options]"
     echo "Options:"
-    echo "  --model_path PATH       Path to the trained model directory (required)"
+    echo "  --model_path PATH       Path to the trained model checkpoint .pt file (required)"
     echo "  --test_data PATH        Path to test data TSV file (required unless --single_file is specified)"
     echo "  --test_wrd PATH         Path to test word reference file (required unless --single_file is specified)"
     echo "  --output_dir DIR        Directory to save decoding results (default: outputs/clip_whisper_decoding)"
@@ -33,7 +38,7 @@ show_help() {
     echo "  --single_file PATH      Path to a single audio/video file for testing"
     echo "  --whisper_model PATH    Path to pre-trained Whisper model (default: checkpoints/whisper-medium)"
     echo "  --clip_model PATH       Path to pre-trained CLIP model (default: checkpoints/clip-vit-base-patch32)"
-    echo "  --llm_model PATH        Path to pre-trained LLM model (default: checkpoints/Llama-3.2-1B)"
+    echo "  --llm_model PATH        Path to pre-trained LLM model (default: checkpoints/Llama-2-7b-hf)"
     echo "  --verbose               Enable verbose output"
     echo "  -h, --help              Display this help message and exit"
 }
@@ -123,23 +128,26 @@ if [ -z "$SINGLE_FILE" ] && ([ -z "$TEST_DATA" ] || [ -z "$TEST_WRD" ]); then
 fi
 
 # Construct the command to run the Python script
-CMD="python scripts/clip_whisper/decode.py --model_path $MODEL_PATH"
+CMD="python scripts/clip_whisper/decode.py"
 
-if [ -n "$SINGLE_FILE" ]; then
-    CMD+=" --single_file $SINGLE_FILE"
-else
-    CMD+=" --test_data $TEST_DATA --test_wrd $TEST_WRD"
-fi
+# Add model checkpoint path
+CMD+=" --model_path $MODEL_PATH"
 
+# Add tokenizer and model paths
+CMD+=" --whisper_model $WHISPER_MODEL"
+CMD+=" --clip_model $CLIP_MODEL"
+CMD+=" --llm_model $LLM_MODEL"
+
+# Add data paths
+CMD+=" --test_data $TEST_DATA --test_wrd $TEST_WRD"
+
+# Add other parameters
 CMD+=" --output_dir $OUTPUT_DIR"
 CMD+=" --modality $MODALITY"
 CMD+=" --batch_size $BATCH_SIZE"
 CMD+=" --max_new_tokens $MAX_NEW_TOKENS"
 CMD+=" --device $DEVICE"
 CMD+=" --config $CONFIG"
-CMD+=" --whisper_model $WHISPER_MODEL"
-CMD+=" --clip_model $CLIP_MODEL"
-CMD+=" --llm_model $LLM_MODEL"
 CMD+=" --text_key text"
 CMD+=" --calculate_loss"
 
@@ -149,13 +157,12 @@ fi
 
 # Print command summary
 echo "=== ClipWhisper Decoding ==="
-echo "Model path: $MODEL_PATH"
-if [ -n "$SINGLE_FILE" ]; then
-    echo "Single file: $SINGLE_FILE"
-else
-    echo "Test data: $TEST_DATA"
-    echo "Test WRD: $TEST_WRD"
-fi
+echo "Model checkpoint: $MODEL_PATH"
+echo "Whisper model: $WHISPER_MODEL"
+echo "CLIP model: $CLIP_MODEL"
+echo "LLM model: $LLM_MODEL"
+echo "Test data: $TEST_DATA"
+echo "Test WRD: $TEST_WRD"
 echo "Modality: $MODALITY"
 echo "Output directory: $OUTPUT_DIR"
 

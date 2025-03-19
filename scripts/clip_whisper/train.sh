@@ -4,21 +4,21 @@
 # Training Configuration
 DATA_PATH="/home/rishabh/Desktop/Datasets/lrs3/433h_data"
 CONFIG="configs/clip_whisper.yaml"
-OUTPUT_DIR="outputs/clip_whisper"
+OUTPUT_DIR="outputs/clip_whisper_new_adaptive_test_ran"
 LLM_PATH="checkpoints/Llama-2-7b-hf"
 WHISPER_MODEL="openai/whisper-medium"
 CLIP_MODEL="openai/clip-vit-base-patch32"
 BATCH_SIZE=2
 MAX_EPOCHS=10
 MODALITY="both"  # audio, video, or both
-SAVE_EVERY=2
+SAVE_EVERY=1
 FP16=true
 USE_4BIT=true
 NO_LORA=false
-MAX_SEQ_LEN=1024
+MAX_SEQ_LEN=1536
 CONNECTOR_TYPE="simple"
 MAX_GRAD_NORM=0.5
-LEARNING_RATE="5e-6"
+LEARNING_RATE="1e-4"
 
 # Print configuration
 echo "Starting training with the following configuration:"
